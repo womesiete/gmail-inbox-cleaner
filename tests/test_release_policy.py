@@ -22,3 +22,25 @@ def test_ci_pins_actions_audits_dependencies_checks_types_and_builds_windows():
 	assert "pip_audit" in workflow and "mypy" in workflow
 	assert "scripts/package_windows.ps1" in workflow
 	assert (ROOT / "constraints.txt").is_file()
+
+
+def test_repository_metadata_and_historical_plans_are_complete():
+	config = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+	assert config["license"] == "MIT"
+	assert config["authors"][0]["name"] == "Wilson Omesiete"
+	assert config["urls"]["Repository"] == "https://github.com/womesiete/gmail-inbox-cleaner"
+	assert (ROOT / "LICENSE").is_file() and (ROOT / "CHANGELOG.md").is_file()
+	for name in ("implementation-plan.txt", "reliability-plan.txt", "reported-issues.txt", "reliability-plan-2.txt"):
+		assert (ROOT / "docs/history" / name).is_file()
+		assert not (ROOT / "docs" / name).exists()
+
+
+def test_generated_validation_excludes_test_failure_content(tmp_path):
+	from scripts.validation_report import render
+	junit = tmp_path / "results.xml"
+	junit.write_text('<testsuites><testsuite tests="4" failures="1" errors="0" skipped="0" time="1.25"><testcase><failure>PRIVATE EMAIL CONTENT</failure></testcase></testsuite></testsuites>')
+	coverage = tmp_path / "coverage.xml"
+	coverage.write_text('<coverage line-rate="0.82"/>')
+	text = render(junit, coverage, status="failure", revision="abc123")
+	assert "82.00%" in text and "4" in text and "failure" in text
+	assert "PRIVATE EMAIL CONTENT" not in text

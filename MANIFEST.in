@@ -1,4 +1,4 @@
-include README.md pyproject.toml .gitignore
+include README.md pyproject.toml .gitignore LICENSE CHANGELOG.md constraints.txt
 recursive-include docs *.md *.txt
 recursive-include scripts *.py *.pyw *.ps1
 recursive-include tests *.py

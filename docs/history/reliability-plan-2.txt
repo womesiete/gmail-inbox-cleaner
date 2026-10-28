@@ -1,0 +1,101 @@
+Plan
+Ground rules: indent with tabs, and preserve all existing comments and docstrings. Update a comment only when the code under it changes. Write a failing test before each fix. Keep pytest and ruff green after every item. Never touch a real mailbox. Do one commit per item. Any schema change must be a numbered migration with a pre-migration backup.
+Safety and correctness (do first)
+1. Going live discards the plan the user just reviewed. Reproduced: with 40 proposed actions, setting dry_run=False turned all 40 into stale, because Config.revision includes dry_run and update_config stales every pending action. This contradicts the documented "inspect, then switch off simulation" flow. Exclude dry_run from the revision, or convert proposed to queued instead. Then add an explicit "Execute this plan" step that shows the count and a plan hash, and have the executor refuse to run if the set changed. Update docs/user-guide.md to match.
+2. A mid-batch failure in JobRunner.classify re-queues items that already finished. Reproduced: when the third save in a group of 4 raised, all 4 went to retry, including the 2 already completed. That means repeated and billed AI calls. Give each item its own try/except and call fail() only on unresolved rows.
+3. JobRunner.fail() ignores most error kinds.
+auth, permission and account errors mark items failed permanently, so they are skipped even after the user reconnects. 
+quota (daily limit) burns all retries within minutes. 
+A batch-wide 429 consumes the retry budget of every item in the batch. 
+HTTP 400 (data) errors are retried pointlessly. 
+Any transient failure overwrites an existing archive decision with review. 
+Make it kind-aware:
+Auth, permission and account errors leave items pending and block the job with a reason. 
+Quota errors pause the job until reset. 
+Rate limits trigger a job-level backoff that honors Retry-After, with an adaptive smaller batch size, and consume no per-item attempts. 
+Data errors are terminal. 
+Existing decisions are preserved. 
+4. Error-paused jobs never resume. JobRunner.run sets paused on any exception, and _resume_due_retry deliberately never resumes paused. A network blip during discovery therefore blocks all future maintenance, because _maintenance_tick refuses to start while a paused job exists. Separate user-pause from system-pause with a stored reason. Auto-resume system pauses with bounded backoff, and surface auth or quota blocks in the UI. Give the headless runner the same bounded retry.
+5. AppService.retry_errors is too blunt. It resets failed and retry items across all jobs, resumes user-paused jobs, and does not reset attempts, so one more failure re-fails the item immediately. Scope it to a job or selection, reset attempts, and leave user-paused jobs alone.
+6. Write failures are all treated as "uncertain". In ActionExecutor._apply, any modify exception marks every action uncertain, and recover() then reads back one message at a time.
+Treat definite 4xx responses as not applied, after a cheap batched readback. 
+Bisect a failed batch so one deleted message ID doesn't stall 99 others. 
+Batch recover() with get_messages. 
+7. Add a blast-radius guard. There is no cap on writes per run. Add max_actions_per_run with an explicit confirmation above it. Require --max-actions or --yes for headless --live. Make CLI overrides such as --live ephemeral: today update_config persists dry_run=False, and only a finally block restores it.
+8. Undo is fragile and slow. preflight_undo rescans history from the receipt checkpoint (up to 100 pages) for every action, and it duplicates the logic in _history_interval. Gmail only retains history for a limited time, so older undos always conflict.
+Share one indexed history scan per batch and merge the duplicate code. 
+Add an explicit "undo anyway, ownership unverified" path. It is allowed only when current labels equal the recorded after-state, and it requires confirmation. 
+Explain the retention limit in the UI. 
+Auth and security
+9. AuthManager.restore() re-saves credentials on every call. The saved payload holds only the refresh token, so this is pointless, and a save failure (locked keyring, non-Windows) makes a valid refresh fail. In TokenStore.save, any keyring error falls through to DPAPI, which raises a generic "unavailable" and hides the real cause. Save only when the payload changed, make that save non-fatal, preserve the original exception, and keep a single source of truth. Today load() prefers a stale DPAPI file over the keyring.
+10. Disconnect never revokes consent. The revoke=True path exists in AuthManager.disconnect, but nothing calls it. Add "Disconnect and revoke". Detect invalid_grant and tell the user that test-mode grants expire (about 7 days).
+11. Harden the external AI module trust boundary. The configured .py file is executed as code.
+Record its SHA-256 at configuration time and warn when it changes. 
+Warn if the path is writable by other users. 
+Add SECURITY.md covering the threat model and the fact that the database and body cache are unencrypted at rest. 
+Optionally add "never auto-archive correspondents I've replied to", using SENT metadata only, with no bodies shared. 
+Persistence and performance (benchmark before and after)
+12. Leases can wedge. acquire_lease ignores expires_at and relies on PID liveness only. Windows PID reuse or a hung process can block execution forever. 
+Store process start time alongside the PID. 
+Run a background heartbeat thread so lease expiry can be honored safely. 
+Add a confirmed "break lease" action in the GUI and CLI. 
+13. Excess commits and lock contention. 
+The connection is autocommit with default synchronous, and loops like queue_local_transitions, done() and per-message upsert_message commit one statement at a time. 
+_account_triggers runs 15 CREATE TRIGGER scripts on every worker open. 
+Fix by:
+Wrapping each batch in one transaction. 
+Gating trigger creation by user_version. 
+Considering synchronous=NORMAL for discovery work only, while keeping FULL around action-attempt records. 
+Adding periodic wal_checkpoint(TRUNCATE). 
+Adding a 50,000-message job benchmark beyond the existing --benchmark. 
+14. Storage bloat and retention gaps. 
+Message bodies are stored twice, in body and again inside payload_json. 
+prune_cache loads every payload into memory and clears only messages, not examples.body. 
+Nothing vacuums or secure-deletes after pruning. 
+updated_at is bumped on every refresh, so active messages never expire. 
+work_items, errors and invalid predictions grow forever. 
+Add a migration that strips $.body from payload_json, and switch the "preserve cached body" logic in upsert_message to use the body column. Stream the prune in chunks, cover examples.body, enable secure_delete or vacuum, and add housekeeping for old rows.
+15. Store.backup leaks a connection. The with sqlite3.connect() block commits but never closes, which locks the file on Windows. Use contextlib.closing. Also add integrity_check after backup, a restore path, and a startup quick_check with corruption handling.
+16. SQLite variable limit. IN (?,…) lists in actions.py and service.py can exceed the limit for large selections. Add one chunking helper and use it everywhere. Also add one placeholders() helper plus justified noqa comments for the 27 S608 hits, so the security rule can be enabled.
+17. Hot-path waste.
+AppService.mailbox reads and parses account.json on every access. 
+refresh_labels() makes a Gmail call per chunk and per worker. 
+rules() and override() are queried per message. 
+replan() has N+1 job and message lookups. 
+Cache by file mtime, add a label TTL that refreshes on label errors, and cache rules by rules_revision.
+18. Sequential network calls. manual() makes 2 calls per message, download_bodies makes 3, and context_messages makes up to 9. Reuse the batched get_messages and thread caches. Add a client-side rate limiter based on Gmail quota units (check Google's current numbers). Add jittered backoff for idempotent reads in GmailMailbox._execute, which currently uses num_retries=0. Narrow PageTokenExpired, which currently masks any HTTP 400 with a page token.
+19. Full reconciliation re-fetches the whole inbox. When history is still valid, diff the listed IDs against the local inbox set and fetch metadata only for new IDs. Re-fetch everything only when history has expired.
+20. Enforce AI spending. The GUI shows a cost estimate, but nothing enforces it. Add per-job and daily caps on AI calls and estimated cost, with a pause and an explanation. Also measure whether the INBOX flag in thread_context_hash causes re-assessment of sibling messages after the app archives one message in a thread.
+Observability and robustness
+21. log_level does nothing. The setting is stored, but the logging module is never used anywhere in the package. Add rotating file logs under the data dir that honor log_level, redact via runtime.redact, include job and stage IDs, and never include mail content. Add "Open logs" and "Export diagnostics" in the GUI.
+22. MIME and config details.
+Charset failures are flagged missing even though text was decoded. Add a cp1252/latin-1 fallback. 
+Unclosed script, style or head tags silently drop the rest of the body with no flag. Set truncated if the parser ends while blocked. 
+Strip zero-width and preheader padding to save tokens. 
+Config.timezone defaults to America/New_York for everyone. Default to the system zone. 
+Testing and release hygiene
+23. Crash-recovery tests. Spawn a subprocess and os._exit at each durable boundary: before the attempt row, after modify, and before the receipt. Then assert recovery.
+24. Raise coverage where it is thin.
+Add fakes for keyring, DPAPI and refresh failures. 
+Add Mailbox-protocol contract tests that run the same suite against DemoMailbox and a recorded-fixture GmailMailbox (HttpMockSequence). 
+Add property or fuzz tests for parse_response, decode_base64url and the MIME walker. 
+Add a coverage gate. 
+25. CI and supply chain. 
+Pin GitHub Actions to commit SHAs. 
+Add a lockfile or constraints file and a pip-audit step. 
+Add type checking with pyright, or mypy with the Qt modules excluded. 
+Phase in ruff B, BLE, S and PERF, and review each of the 30 blind excepts. 
+Smoke-test scripts/package_windows.ps1 on a Windows runner. 
+26. Docs and metadata. 
+There is no LICENSE file, and pyproject.toml has no license, authors or URLs. 
+The README says "Windows desktop application" while the code is cross-platform. 
+Move the planning files (implementation-plan.txt, reliability-plan.txt, reported-issues.txt) to docs/history/. 
+Add a CHANGELOG, and generate docs/validation.md from CI. 
+Add a new table to docs/reliability-fixes.md for these fixes. 
+27. Refactor last, behavior-preserving. 
+Split gui.py (1,578 lines) into modules. 
+Split jobs.py's long process_stage and classify into per-stage handlers. 
+Deduplicate the newer_excluded computation, which appears three times in jobs.py. 
+Deduplicate the history-scan logic. 
+Add characterization tests before moving anything. 
+28. Final verification. Run pytest, ruff, python -m build, --demo --headless --count 3000, and the 50,000-message benchmark. Record before and after timings in the docs. 

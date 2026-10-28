@@ -26,3 +26,40 @@ This change follows the supplied issue list and implementation plan. The table m
 The 1,000-action request-count regression uses messages in one conversation and an injectable transport: 21 bulk metadata facade calls, 11 thread reads, 32 profile/identity calls, ten history interval reads, and no individual message reads. Distinct conversations still require their own context checks. Multipart request parts continue to consume Gmail quota; these figures are not production latency measurements.
 
 Date windows, protections, explicit message-ID scope, uncertain-write reconciliation, and ownership-aware undo remain enforced. Stage-boundary metadata checks are retained because a paused job can encounter new inbox, label, or conversation state. Performance improvements do not make Gmail reads/writes atomic.
+
+## Second reliability review: 28-item plan
+
+The supplied [second plan](history/reliability-plan-2.txt) is retained verbatim. Each numbered item has its own implementation commit. Optional replied-correspondent protection is not required by this pass; SENT context remains governed by the configured privacy controls. Regression checks use synthetic mail only.
+
+| Item | Behavior / deliverable | Verification |
+| --- | --- | --- |
+| 1 | Switching simulation preserves reviewed proposals; explicit execution binds count and plan hash. | Action, service and GUI execution regressions. |
+| 2 | Classification acknowledges each saved item independently; later failure does not requeue completed rows. | Mid-batch save failure regression. |
+| 3 | Error kinds choose auth/account blocks, quota pause, job backoff, or terminal data failure; prior decisions survive transient errors. | Kind-specific job regressions. |
+| 4 | Stored system pause reasons and bounded recovery distinguish temporary failures from user pause. | Discovery recovery and headless/GUI resume regressions. |
+| 5 | Retry targets a job/selection, resets attempts, and preserves user pause. | Scoped retry regressions. |
+| 6 | Definite write rejection uses readback and batch isolation; recovery reads messages in batches. | Definite/uncertain outcome and missing-ID regressions. |
+| 7 | Per-run write caps and explicit over-limit approval bound execution; live CLI settings stay ephemeral. | CLI and execution cap regressions. |
+| 8 | Undo shares indexed history evidence and offers separately confirmed unverified ownership only for an exact current after-state. | History-count, retention and label conflict regressions. |
+| 9 | Unchanged credentials avoid saves; rotated refresh persistence is non-fatal and backend selection has one source of truth. | Fake keyring, DPAPI and refresh tests. |
+| 10 | Disconnect-and-revoke is explicit; invalid grants explain test-mode grant expiration. | Offline revocation/error tests. |
+| 11 | External Python configuration records source hashes and surfaces changed/writable code; threat model documents unencrypted local data. | Module trust regressions and `SECURITY.md`. |
+| 12 | Process identity, expiry and heartbeat protect leases; break-lease requires confirmation. | Process/lease and explicit-control regressions. |
+| 13 | Batch transactions and version-gated trigger creation reduce commits; checkpointing and full-job scale measurement cover persistence overhead. | Transaction counts and 50,000-message job benchmark. |
+| 14 | Numbered backed-up migration removes duplicate body JSON; bounded retention includes example bodies and old queue/error/prediction rows. | Migration and chunked retention tests. |
+| 15 | Backup closes and verifies its connection; restore and startup integrity checks report corruption safely. | Backup, restore and corrupt-database tests. |
+| 16 | Shared bound-placeholder/chunk helpers keep large selections within SQLite limits; interpolated internal SQL has reviewed explanations. | Large-selection regressions and security lint. |
+| 17 | Identity mtime, labels TTL and rules revisions avoid repeated hot-path work; replanning batches local reads. | Cache invalidation and lookup-count tests. |
+| 18 | Batched target/context retrieval, quota-unit pacing and bounded jittered idempotent retries reduce network waste; page expiry matching is narrow. | Fake transport counts and error/backoff tests; [quota sources](network-performance.md). |
+| 19 | Reconciliation with valid history fetches metadata for newly listed IDs; expired history triggers a complete refresh. | Unchanged inbox and expired-history regressions. |
+| 20 | Per-job/daily AI call and estimated-cost caps pause before exceeding limits; sibling context reuse is measured. | AI spending and context-hash regressions. |
+| 21 | Rotating level-aware logs contain structural IDs only; safe diagnostic ZIPs omit mail, settings and credentials. | `test_diagnostics.py` and GUI controls. |
+| 22 | Legacy charset fallback preserves decoded text, blocked unfinished HTML is truncated, padding is stripped, and new preferences use the system zone. | `test_mime.py`, explicit DST boundaries and timezone defaults. |
+| 23 | Subprocess exits exercise the durable write boundaries and recovery outcomes. | Crash-recovery subprocess tests. |
+| 24 | The same protocol contract runs against demo and Google HttpMockSequence; seeded parser fuzzing and protected-storage fakes complement a 75% coverage gate. | `test_mailbox_contract.py`, `test_fuzz_contracts.py`, `test_auth_fakes.py`, coverage XML. |
+| 25 | Actions are SHA-pinned; constraints, dependency audit, typed-core checks, expanded Ruff rules and Windows frozen smoke run in CI. | `test_release_policy.py`, [boundary review](integration-boundaries.md), CI checks. |
+| 26 | MIT license/author/URLs, cross-platform README, changelog, historical plans and generated CI validation records complete release metadata. | Metadata/report-generation regression and source/wheel inspection. |
+| 27 | GUI modules and per-stage job handlers are split after characterization; shared exclusion/history helpers retain behavior. | Characterization and full-suite regressions. |
+| 28 | Final suite, lint, package build, fresh 3,000-message demo and 50,000-message measurements record implementation evidence. | Final validation artifacts and benchmark records. |
+
+CI-generated [validation](validation.md) reports counts/status without failure payloads. Earlier manual measurements remain in [history](history/validation-2026-10-28.md). Synthetic timings and request/query counts are not live Gmail performance or AI-billing guarantees. Native frozen packaging results are claimed only when the corresponding hosted job passes.

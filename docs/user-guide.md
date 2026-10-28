@@ -38,7 +38,7 @@ Ordinary feedback defaults to this message or the currently displayed selection.
 | Latest mode | Rolling | Exclusive endpoint is the job's UTC anchor minus a configured number of exact 24-hour days. |
 | Latest rolling days | 14 | Excludes the latest two weeks; zero is allowed. |
 | Fixed latest date | Unset | In fixed mode, the entire selected local date is included; the following local midnight is the exclusive endpoint. |
-| Calendar/display timezone | America/New_York | Determines calendar endpoints and month arithmetic; stored timestamps remain UTC. |
+| Calendar/display timezone | System IANA zone (UTC if unavailable) | Determines calendar endpoints and month arithmetic; stored timestamps remain UTC. |
 | Age archival enabled | Yes | Applies to assessed eligible mail with established no outstanding action, subject to protections and uncertainty rules. |
 | Global age | 2 calendar months | Subtract months in the configured timezone, clamp the day to the month's end, preserve local time, then convert to UTC. This is not 60 days. |
 | Category age overrides | None | Inherit the global policy, use a category-specific month/day threshold, or disable age-based archival for that category. Conflicting applicable overrides require review. |

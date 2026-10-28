@@ -1,6 +1,6 @@
 # Gmail Inbox Cleaner
 
-A Windows desktop application for turning a personal Gmail inbox into a list of unfinished work. It keeps lasting importance separate from the need for inbox attention: a completed insurance record can be important and still be archived, while an ordinary request awaiting a reply needs attention.
+A cross-platform desktop application for Windows, macOS, and Linux for turning a personal Gmail inbox into a list of unfinished work. It keeps lasting importance separate from the need for inbox attention: a completed insurance record can be important and still be archived, while an ordinary request awaiting a reply needs attention.
 
 The first run is a **simulation**. The application records proposals for inspection before live execution is enabled. Its only forward Gmail writes are removing `INBOX` from explicit eligible message IDs and adding approved, existing user labels. Keeping and deferring are local decisions. Archiving retains email in Gmail and does not free storage.
 
@@ -10,7 +10,7 @@ Install Python 3.11 or later. In PowerShell from this directory:
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m pip install -c constraints.txt -e '.[dev]'
 .\.venv\Scripts\python.exe -m gmail_clean --demo
 ```
 
@@ -46,17 +46,21 @@ The application runs when you launch it; it does not install a background servic
 - [Architecture, persistence, recovery, and security](docs/architecture.md)
 - [Acceptance coverage and validation commands](docs/acceptance.md)
 - [Recorded test and scale-check results](docs/validation.md)
-- [Reliability and performance fixes: all 18 reported issues](docs/reliability-fixes.md)
-- [Original implementation requirements](docs/implementation-plan.txt)
+- [Reliability and performance fixes: both review rounds](docs/reliability-fixes.md)
+- [Integration boundary and phased lint/type review](docs/integration-boundaries.md)
+- [Changelog](CHANGELOG.md)
+- [Original implementation requirements](docs/history/implementation-plan.txt)
 
 ## Development checks
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m pip install -c constraints.txt -e '.[dev]'
 $env:QT_QPA_PLATFORM = 'offscreen'
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe scripts/ci_tests.py
 .\.venv\Scripts\python.exe -m ruff check gmail_clean tests scripts
 .\.venv\Scripts\python.exe -m compileall -q gmail_clean scripts
+.\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe -m pip_audit --requirement constraints.txt --no-deps --disable-pip
 .\.venv\Scripts\python.exe -m build
 ```
 

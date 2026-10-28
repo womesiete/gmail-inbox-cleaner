@@ -63,3 +63,17 @@ jobs:
           $SmokeRoot = Join-Path $env:RUNNER_TEMP 'gmail-clean-frozen-smoke'
           $Process = Start-Process -FilePath './dist/GmailInboxCleaner/GmailInboxCleaner.exe' -ArgumentList @('--demo', '--headless', '--count', '20', '--data-dir', $SmokeRoot) -Wait -PassThru
           if ($Process.ExitCode -ne 0) { throw "Frozen offline smoke test failed: $($Process.ExitCode)" }
+      - name: Generate validation record
+        if: always()
+        env:
+          VALIDATION_STATUS: ${{ job.status }}
+        run: python scripts/validation_report.py
+      - name: Publish validation record
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: validation-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            docs/validation.md
+            coverage.xml
+          retention-days: 30
