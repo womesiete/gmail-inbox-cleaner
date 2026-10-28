@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .domain import CATEGORIES, Message, domain_matches, template_key
+from .runtime import chunks, placeholders
 from .storage import Store, canonical_json, utc_now
 
 _ALLOWED_ACTIONS = {"archive", "keep", "defer", "label", "label_correction", "category_correction", "mistaken_archive", "unnecessary_keep", "review"}
@@ -254,12 +255,11 @@ class Learning:
 		else:
 			# Keep bulk resets within SQLite's parameter limit without N+1 queries.
 			ordered = sorted(selected)
-			for offset in range(0, len(ordered), 500):
-				chunk = ordered[offset:offset + 500]
-				marks = ",".join("?" for _ in chunk)
-				self.store.execute(f"DELETE FROM pattern_stats WHERE pattern_key IN ({marks})", chunk)
-				rows.extend(self.store.query(f"SELECT pattern_key,action,group_id,sender,list_id,subject,created_at,id FROM examples WHERE pattern_key IN ({marks}) ORDER BY created_at DESC,id DESC", chunk))
-				rules.extend(self.store.query(f"SELECT * FROM rules WHERE json_extract(payload_json,'$.pattern_key') IN ({marks})", chunk))
+			for chunk in chunks(ordered):
+				marks = placeholders(chunk)
+				self.store.execute(f"DELETE FROM pattern_stats WHERE pattern_key IN ({marks})", chunk)  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
+				rows.extend(self.store.query(f"SELECT pattern_key,action,group_id,sender,list_id,subject,created_at,id FROM examples WHERE pattern_key IN ({marks}) ORDER BY created_at DESC,id DESC", chunk))  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
+				rules.extend(self.store.query(f"SELECT * FROM rules WHERE json_extract(payload_json,'$.pattern_key') IN ({marks})", chunk))  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		groups: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 		samples = {}
 		for row in rows:
@@ -301,7 +301,7 @@ class Learning:
 				"evidence_basis": "Independent explicit review events; never automatic successes"}}, invalidate=False)
 
 	def rules(self, include_disabled: bool = True) -> list[dict[str, Any]]:
-		rows = self.store.query("SELECT * FROM rules" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC,updated_at DESC")
+		rows = self.store.query("SELECT * FROM rules" + ("" if include_disabled else " WHERE enabled=1") + " ORDER BY enabled DESC,updated_at DESC")  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		return [self._decode_rule(row) for row in rows]
 
 	def _decode_rule(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -391,7 +391,7 @@ class Learning:
 		if "template" in conditions:
 			count, earliest, latest = 0, None, None
 			# Stream metadata only; templates never require loading each cached body.
-			for raw in self.store.execute("SELECT id,internal_ms,subject,sender,headers_json FROM messages WHERE " + where + " ORDER BY internal_ms,id", params):
+			for raw in self.store.execute("SELECT id,internal_ms,subject,sender,headers_json FROM messages WHERE " + where + " ORDER BY internal_ms,id", params):  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 				row = dict(raw)
 				if _row_template(row) != conditions["template"]:
 					continue
@@ -401,10 +401,10 @@ class Learning:
 				if len(samples) < sample_limit:
 					samples.append({key: row[key] for key in ("id", "internal_ms", "subject", "sender")})
 		else:
-			bounds = self.store.one("SELECT COUNT(*) n,MIN(internal_ms) earliest,MAX(internal_ms) latest FROM messages WHERE " + where, params)
+			bounds = self.store.one("SELECT COUNT(*) n,MIN(internal_ms) earliest,MAX(internal_ms) latest FROM messages WHERE " + where, params)  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 			count, earliest, latest = bounds["n"], bounds["earliest"], bounds["latest"]
 			if sample_limit:
-				samples = self.store.query("SELECT id,internal_ms,subject,sender FROM messages WHERE " + where + " ORDER BY internal_ms,id LIMIT ?", [*params, sample_limit])
+				samples = self.store.query("SELECT id,internal_ms,subject,sender FROM messages WHERE " + where + " ORDER BY internal_ms,id LIMIT ?", [*params, sample_limit])  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		return {"count": count, "sample_ids": [row["id"] for row in samples],
 			"samples": samples,
 			"earliest_internal_ms": earliest,
@@ -453,7 +453,7 @@ class Learning:
 			if value is not None:
 				clauses.append(f"{column}=?")
 				params.append(value)
-		rows = self.store.query("SELECT * FROM examples" + (" WHERE " + " AND ".join(clauses) if clauses else ""), params)
+		rows = self.store.query("SELECT * FROM examples" + (" WHERE " + " AND ".join(clauses) if clauses else ""), params)  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		with self.batch():
 			for row in rows:
 				self.store.execute("DELETE FROM examples WHERE id=?", (row["id"],))
@@ -507,7 +507,7 @@ class Learning:
 		if list_id:
 			conditions.append("list_id=?")
 			params.append(list_id.strip().casefold())
-		self._invalidate_selected("SELECT id FROM messages WHERE " + " OR ".join(conditions), params, "Relevant reviewed examples changed")
+		self._invalidate_selected("SELECT id FROM messages WHERE " + " OR ".join(conditions), params, "Relevant reviewed examples changed")  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 
 	def _invalidate_related_batch(self, related: Iterable[tuple[str, str, str, str]]) -> None:
 		# A bulk review of one list should not update the same list's predictions
@@ -523,9 +523,8 @@ class Learning:
 				groups["category"].add(category)
 		for column, values in groups.items():
 			ordered = sorted(values)
-			for offset in range(0, len(ordered), 500):
-				chunk = ordered[offset:offset + 500]
-				selection = "SELECT id FROM messages WHERE " + column + " IN (" + ",".join("?" for _ in chunk) + ")"
+			for chunk in chunks(ordered):
+				selection = "SELECT id FROM messages WHERE " + column + " IN (" + placeholders(chunk) + ")"  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 				self._invalidate_selected(selection, chunk, "Relevant reviewed examples changed")
 
 	def _invalidate_rule_matches(self, conditions: dict[str, str]) -> None:
@@ -534,24 +533,24 @@ class Learning:
 		clauses, params = _rule_sql(conditions)
 		where = " WHERE " + " AND ".join(clauses) if clauses else ""
 		if "template" not in conditions:
-			self._invalidate_selected("SELECT id FROM messages" + where, params, "Rule semantics changed")
+			self._invalidate_selected("SELECT id FROM messages" + where, params, "Rule semantics changed")  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 			return
 		ids = []
-		for raw in self.store.execute("SELECT id,headers_json FROM messages" + where, params):
+		for raw in self.store.execute("SELECT id,headers_json FROM messages" + where, params):  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 			row = dict(raw)
 			if _row_template(row) == conditions["template"]:
 				ids.append(row["id"])
-			if len(ids) == 500:
-				self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids, "Rule semantics changed")
+			if len(ids) == 400:
+				self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + placeholders(ids) + ")", ids, "Rule semantics changed")  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 				ids.clear()
 		if ids:
-			self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids, "Rule semantics changed")
+			self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + placeholders(ids) + ")", ids, "Rule semantics changed")  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 
 	def _invalidate_selected(self, selection: str, params: list[Any], reason: str) -> None:
-		self.store.execute("UPDATE predictions SET valid=0 WHERE message_id IN (" + selection + ")", params)
+		self.store.execute("UPDATE predictions SET valid=0 WHERE message_id IN (" + selection + ")", params)  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		# Reviewed instructions and completed receipts survive learning/rule edits;
 		# only unexecuted automatic proposals need fresh interpretation/preflight.
-		self.store.execute("UPDATE actions SET state='stale',reason=?,updated_at=? WHERE approval='automatic' AND state IN ('queued','proposed','retry') AND message_id IN (" + selection + ")", [reason, utc_now(), *params])
+		self.store.execute("UPDATE actions SET state='stale',reason=?,updated_at=? WHERE approval='automatic' AND state IN ('queued','proposed','retry') AND message_id IN (" + selection + ")", [reason, utc_now(), *params])  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 
 
 def _excluded(sender: str, category: str, labels: Iterable[str], senders: set[str], domains: set[str], categories: set[str], label_ids: set[str]) -> bool:

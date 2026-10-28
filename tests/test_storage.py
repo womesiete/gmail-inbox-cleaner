@@ -383,3 +383,23 @@ def test_corrupt_database_is_reported_without_modifying_original(tmp_path):
 	with pytest.raises(StorageCorruptionError, match='restore'):
 		Store(path, 'me@example.invalid')
 	assert path.read_bytes() == data
+
+
+def test_sql_chunks_cover_large_selection_under_portable_variable_limit(tmp_path):
+	from gmail_clean.runtime import chunks, placeholders
+	from gmail_clean.service import AppService
+	assert list(chunks(range(5), 2)) == [[0, 1], [2, 3], [4]]
+	assert placeholders(['x', 'y']) == '?,?'
+	with pytest.raises(ValueError):
+		placeholders([])
+	service = AppService(data_dir=tmp_path / 'selection', demo=True, count=1)
+	try:
+		service.config.dry_run = False
+		service.store.set_checkpoint('effective_preferences', service.config.to_dict())
+		ids = [f'a{index:04}' for index in range(1200)]
+		with service.store.transaction():
+			service.store.conn.executemany("INSERT INTO actions(id,message_id) VALUES(?,?)", [(aid, 'missing') for aid in ids])
+		service.store.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 900)
+		assert service.apply_actions(ids, allow_over_limit=True)['applied'] == 0
+	finally:
+		service.close()

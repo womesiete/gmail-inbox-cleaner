@@ -904,3 +904,15 @@ def test_confirmation_error_keeps_content_free_ui_explanation(app):
 	with pytest.raises(ValueError) as caught:
 		app.actions.apply()
 	assert "exceeds the write cap" in safe_error(caught.value)
+
+
+def test_large_reviewed_snapshot_stays_below_sqlite_variable_limit(app):
+	import sqlite3
+	ids = [f"selected-{index:05}" for index in range(1200)]
+	with app.store.transaction():
+		app.store.conn.executemany("INSERT INTO actions(id,message_id,state) VALUES(?,?,'queued')", ((aid, aid) for aid in ids))
+	app.store.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 900)
+	forward = app.actions.plan_snapshot(ids)
+	reverse = app.actions.plan_snapshot(list(reversed(ids)))
+	assert forward["count"] == 1200
+	assert forward["hash"] == reverse["hash"]

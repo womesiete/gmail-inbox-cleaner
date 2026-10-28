@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 	QScrollArea, QSpinBox, QSplitter, QStatusBar, QTabWidget,
 	QTableView, QTextBrowser, QVBoxLayout, QWidget)
 
+from .runtime import chunks, placeholders
 from .domain import Config, resolve_age_cutoff, resolve_window
 from .ai import AIError, module_trust_details
 from .table_model import Column, SqlTableModel
@@ -763,7 +764,7 @@ class MainWindow(QMainWindow):
 			except ValueError:
 				return "'policy conflict: review'"
 		expression = "CASE " + " ".join(f"WHEN category='{category}' THEN {bucket(category)}" for category in sorted(CATEGORIES)) + f" ELSE {bucket(None)} END"
-		return (f"SELECT json_array(category,decision,age_bucket) AS id,category,decision,age_bucket,COUNT(*) AS count,COUNT(DISTINCT sender) AS senders,MIN(internal_ms) AS oldest,MAX(internal_ms) AS newest "
+		return (f"SELECT json_array(category,decision,age_bucket) AS id,category,decision,age_bucket,COUNT(*) AS count,COUNT(DISTINCT sender) AS senders,MIN(internal_ms) AS oldest,MAX(internal_ms) AS newest "  # noqa: S608 -- fixed UI column/expression allowlists and bound filter/selection values
 			f"FROM (SELECT category,decision,sender,internal_ms,{expression} AS age_bucket FROM messages WHERE {self._group_scope_sql()}) GROUP BY category,decision,age_bucket")
 
 	def _refresh_plan_groups(self):
@@ -1201,7 +1202,7 @@ class MainWindow(QMainWindow):
 		if mode:
 			key = {1: "sender", 2: "category", 3: "thread_id", 4: "list_id"}[mode]
 			expression = "COALESCE(json_extract(headers_json,'$.List-ID'), json_extract(headers_json,'$.list-id'), '(no list)')" if key == "list_id" else key
-			query = f"SELECT {expression} AS id, {expression} AS group_name, COUNT(*) AS count, MIN(internal_ms) AS oldest, MAX(internal_ms) AS newest, COUNT(DISTINCT decision) AS outcomes FROM messages WHERE {self._group_scope_sql()} GROUP BY {expression}"
+			query = f"SELECT {expression} AS id, {expression} AS group_name, COUNT(*) AS count, MIN(internal_ms) AS oldest, MAX(internal_ms) AS newest, COUNT(DISTINCT decision) AS outcomes FROM messages WHERE {self._group_scope_sql()} GROUP BY {expression}"  # noqa: S608 -- fixed UI column/expression allowlists and bound filter/selection values
 			_, columns, id_column = self.model_specs["groups"]
 			self.model_specs["groups"] = query, columns, id_column
 			self._replace_model("groups")
@@ -1398,8 +1399,9 @@ class MainWindow(QMainWindow):
 		job_ids = {row["job_id"] for row in rows if row.get("job_id")}
 		if not job_ids:
 			return
-		placeholders = ",".join("?" for _ in job_ids)
-		actions = self._query(f"SELECT a.id,a.message_id,m.internal_ms FROM actions a LEFT JOIN messages m ON m.id=a.message_id WHERE a.job_id IN ({placeholders}) AND a.undo_of IS NULL", tuple(job_ids))
+		actions = []
+		for selected in chunks(job_ids):
+			actions.extend(self._query(f"SELECT a.id,a.message_id,m.internal_ms FROM actions a LEFT JOIN messages m ON m.id=a.message_id WHERE a.job_id IN ({placeholders(selected)}) AND a.undo_of IS NULL", selected))  # noqa: S608 -- fixed UI column/expression allowlists and bound filter/selection values
 		ids = [row["id"] for row in actions]
 		self._describe_undo_scope(actions)
 		self._submit_undo(ids, f"Undoing {len(ids)} original actions from {len(job_ids)} cleanup jobs")

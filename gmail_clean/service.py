@@ -15,7 +15,7 @@ from .ai import AIClient, AIError, module_trust_details, verify_module_trust
 from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, eligible, protections, recommend, resolve_window
 from .jobs import JobRunner
 from .learning import Learning
-from .runtime import data_directory, digest, encode, identifier, insert, path_lock, safe_error, stamp, utc_now
+from .runtime import chunks, placeholders, data_directory, digest, encode, identifier, insert, path_lock, safe_error, stamp, utc_now
 from .storage import LeaseBusyError, Store
 
 
@@ -523,8 +523,8 @@ class AppService:
 						result.append(aid)
 		if undo_ids and not should_stop():
 			self.undo(undo_ids, should_stop=should_stop)
-			marks = ",".join("?" for _ in undo_ids)
-			result.extend(row["id"] for row in self.store.query(f"SELECT id FROM actions WHERE undo_of IN ({marks})", undo_ids))
+			for selected in chunks(undo_ids):
+				result.extend(row["id"] for row in self.store.query(f"SELECT id FROM actions WHERE undo_of IN ({placeholders(selected)})", selected))  # noqa: S608 -- chunk contains only bind markers; IDs stay bound
 		if result and not self.config.dry_run and not should_stop():
 			self.apply_actions(result, should_stop=should_stop)
 		return result

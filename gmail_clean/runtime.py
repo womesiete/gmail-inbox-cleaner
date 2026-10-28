@@ -77,6 +77,23 @@ def redact(text: str) -> str:
 def insert(store: Any, table: str, values: dict[str, Any], *, replace: bool = False) -> None:
 	"""Internal column names only; all values remain bound SQL parameters."""
 	columns = ",".join(values)
-	marks = ",".join("?" for _ in values)
+	marks = placeholders(values)
 	verb = "INSERT OR REPLACE" if replace else "INSERT"
 	store.execute(f"{verb} INTO {table} ({columns}) VALUES ({marks})", tuple(values.values()))
+
+
+def chunks(values, size: int = 400):
+	"""Yield bounded lists, leaving room below SQLite's portable 999-bind limit."""
+	from itertools import islice
+	if size < 1 or size > 900:
+		raise ValueError("SQL chunk size must be between 1 and 900")
+	iterator = iter(values)
+	while batch := list(islice(iterator, size)):
+		yield batch
+
+
+def placeholders(values) -> str:
+	"""Generate bind markers only; identifiers and values never enter SQL here."""
+	if not values:
+		raise ValueError("SQL placeholders require a nonempty selection")
+	return ','.join('?' for _ in values)

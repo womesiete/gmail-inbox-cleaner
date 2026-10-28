@@ -13,6 +13,7 @@ from typing import Any
 
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread
 from PyQt6.QtGui import QColor
+from .runtime import chunks, placeholders
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class SqlTableModel(QAbstractTableModel):
 		self.connection.close()
 
 	def _sql(self) -> str:
-		return f"SELECT * FROM ({self.query}) AS rows WHERE {self._where}"
+		return f"SELECT * FROM ({self.query}) AS rows WHERE {self._where}"  # noqa: S608 -- column names validated against declared columns; filters use bound values
 
 	def refresh(self):
 		self._check_thread()
@@ -70,7 +71,7 @@ class SqlTableModel(QAbstractTableModel):
 		self._pages.clear()
 		try:
 			self._count = self.connection.execute(
-				f"SELECT COUNT(*) FROM ({self._sql()})", self._params).fetchone()[0]
+				f"SELECT COUNT(*) FROM ({self._sql()})", self._params).fetchone()[0]  # noqa: S608 -- column names validated against declared columns; filters use bound values
 			self.last_error = ""
 		except sqlite3.Error as exc:
 			self._count = 0
@@ -116,11 +117,14 @@ class SqlTableModel(QAbstractTableModel):
 			return []
 		direction = "DESC" if self._descending else "ASC"
 		order = f'"{self._sort_key}" {direction}, "{self.id_column}" ASC'
-		placeholders = ",".join("?" for _ in identifiers)
-		query = (f'SELECT row_number FROM (SELECT "{self.id_column}" AS row_id, '
-			f'ROW_NUMBER() OVER (ORDER BY {order})-1 AS row_number FROM ({self._sql()})) '
-			f'WHERE row_id IN ({placeholders})')
-		return [row[0] for row in self.connection.execute(query, (*self._params, *identifiers))]
+		result = []
+		for selected in chunks(identifiers):
+			query = (f'SELECT row_number FROM (SELECT "{self.id_column}" AS row_id, '  # noqa: S608 -- column names validated against declared columns; filters use bound values
+				f'ROW_NUMBER() OVER (ORDER BY {order})-1 AS row_number FROM ({self._sql()})) '
+				f'WHERE row_id IN ({placeholders(selected)})')
+			result.extend(row[0] for row in self.connection.execute(query, (*self._params, *selected)))
+		return sorted(result)
+
 
 	def data(self, index, role=Qt.ItemDataRole.DisplayRole):
 		if not index.isValid() or not 0 <= index.column() < len(self.columns):

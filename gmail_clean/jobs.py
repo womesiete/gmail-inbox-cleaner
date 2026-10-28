@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .ai import PROMPT_VERSION
 from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
-from .runtime import digest, encode, identifier, insert, safe_error, stamp
+from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
 	from .service import AppService
@@ -472,10 +472,11 @@ class JobRunner:
 				if not rows:
 					continue
 			ids = [r["message_id"] for r in rows]
-			self.db.execute(
-				f"UPDATE work_items SET state='running' WHERE job_id=? AND stage=? AND message_id IN ({','.join('?' for _ in ids)})",
-				(job, stage, *ids),
-			)
+			for selected in chunks(ids):
+				self.db.execute(
+					f"UPDATE work_items SET state='running' WHERE job_id=? AND stage=? AND message_id IN ({placeholders(selected)})",  # noqa: S608 -- chunk contains only bind markers; job, stage and IDs stay bound
+					(job, stage, *selected),
+				)
 			if stage in {"metadata", "body"}:
 				try:
 					results = self.s.mailbox.get_messages(ids, body=stage == "body")

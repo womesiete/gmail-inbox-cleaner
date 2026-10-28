@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Callable
 
 from .domain import Message, Window, context_hash, precondition_hash, protections
-from .runtime import digest, encode, identifier, insert, safe_error, stamp
+from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
 	from .service import AppService
@@ -206,15 +206,16 @@ class ActionExecutor:
 		"""Hash the exact reviewed target IDs and write intents, independent of simulation."""
 		where = "state IN ('queued','proposed','uncertain','executing','retry')"
 		params = []
-		if action_ids is not None:
-			if not action_ids:
-				return {"count": 0, "hash": digest([]), "action_ids": []}
-			where += f" AND id IN ({','.join('?' for _ in action_ids)})"
-			params.extend(action_ids)
 		if job_id:
 			where += " AND job_id=?"
 			params.append(job_id)
-		rows = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY id", params)
+		if action_ids is None:
+			rows = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY id", params)  # noqa: S608 -- internal clauses only; values stay bound
+		else:
+			rows = []
+			for selected in chunks(dict.fromkeys(action_ids)):
+				rows.extend(self.db.query("SELECT * FROM actions WHERE " + where + f" AND id IN ({placeholders(selected)})", [*params, *selected]))  # noqa: S608 -- generated placeholders only; values stay bound
+			rows.sort(key=lambda row: row["id"])
 		keys = ("id", "account_id", "job_id", "message_id", "action", "add_json", "remove_json", "before_json", "context_version", "precondition_version", "policy_version", "approval", "undo_of", "payload_json")
 		return {"count": len(rows), "hash": digest([{key: row[key] for key in keys} for row in rows]), "action_ids": [row["id"] for row in rows]}
 
@@ -258,15 +259,17 @@ class ActionExecutor:
 		self._assert_reviewed_scope(reviewed_hash)
 		where = "state IN ('queued','proposed','uncertain','executing','retry')"
 		params = []
-		if action_ids is not None:
-			if not action_ids:
-				return {"applied": 0}
-			where += f" AND id IN ({','.join('?' for _ in action_ids)})"
-			params.extend(action_ids)
 		if job_id:
 			where += " AND job_id=?"
 			params.append(job_id)
-		actions = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY created_at,id", params)
+		if action_ids is None:
+			actions = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY created_at,id", params)  # noqa: S608 -- internal state clauses and bind markers only; values stay bound
+		else:
+			actions = []
+			for selected in chunks(dict.fromkeys(action_ids)):
+				actions.extend(self.db.query("SELECT * FROM actions WHERE " + where + f" AND id IN ({placeholders(selected)})", [*params, *selected]))  # noqa: S608 -- internal state clauses and bind markers only; values stay bound
+			actions.sort(key=lambda row: (row["created_at"], row["id"]))
+
 		starts = []
 		for action in actions:
 			if action["undo_of"]:

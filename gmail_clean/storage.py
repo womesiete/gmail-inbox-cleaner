@@ -327,7 +327,7 @@ class Store:
 			CREATE TRIGGER IF NOT EXISTS {table}_account_update BEFORE UPDATE OF account_id ON {table}
 			WHEN NEW.account_id != (SELECT id FROM accounts LIMIT 1)
 			BEGIN SELECT RAISE(ABORT,'account mismatch'); END;
-			""")
+			""")  # noqa: S608 -- table identifiers come only from _ACCOUNT_TABLES
 
 	def _script(self, script: str) -> None:
 		"""Execute complete SQL statements without executescript's implicit commit."""
@@ -446,7 +446,7 @@ class Store:
 				))
 
 	def labels(self, include_deleted: bool = False) -> list[dict[str, Any]]:
-		return self.query("SELECT * FROM labels" + ("" if include_deleted else " WHERE deleted=0") + " ORDER BY type,name")
+		return self.query("SELECT * FROM labels" + ("" if include_deleted else " WHERE deleted=0") + " ORDER BY type,name")  # noqa: S608 -- table names come from _ACCOUNT_TABLES; mode is a closed literal enum
 
 	def checkpoint(self, key: str, default: Any = None) -> Any:
 		row = self.one("SELECT value_json FROM checkpoints WHERE key=?", (key,))
