@@ -285,6 +285,7 @@ class Learning:
 			unsafe_archive = rule["action"] == "archive" and not _safe_archive_pattern(samples.get(pattern))
 			if not stats or stats["support"] < 3 or unsafe_archive:
 				self.store.execute("DELETE FROM rules WHERE id=?", (rule["id"],))
+				self.store.set_checkpoint("rules_revision", uuid.uuid4().hex)
 			else:
 				self.store.execute("UPDATE rules SET support=?,counterexamples=?,updated_at=? WHERE id=?", (stats["support"], stats["counterexamples"], utc_now(), rule["id"]))
 				existing.add(key)
@@ -354,6 +355,7 @@ class Learning:
 				if old and json.loads(old["conditions_json"]) != conditions:
 					self._invalidate_rule_matches(json.loads(old["conditions_json"]))
 				self._invalidate_rule_matches(conditions)
+			self.store.set_checkpoint("rules_revision", uuid.uuid4().hex)
 		return rule_id
 
 	def set_rule_enabled(self, rule_id: str, enabled: bool) -> None:
@@ -369,6 +371,7 @@ class Learning:
 		if row:
 			with self.store.transaction():
 				self.store.execute("DELETE FROM rules WHERE id=?", (rule_id,))
+				self.store.set_checkpoint("rules_revision", uuid.uuid4().hex)
 				self._invalidate_rule_matches(json.loads(row["conditions_json"]))
 
 	def pattern_suggestions(self) -> list[dict[str, Any]]:

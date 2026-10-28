@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import warnings
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -28,6 +29,12 @@ class AppService:
 		self.data_dir = Path(data_dir) if data_dir else data_directory(demo)
 		self.data_dir.mkdir(parents=True, exist_ok=True)
 		self._identity_lock = path_lock(self.data_dir / "account.json")
+		self._identity_signature = None
+		self._identity_cache = {}
+		self._rules_cache_revision = None
+		self._rules_cache = []
+		self._policy_depth = 0
+		self._override_cache = {}
 		if os.name != "nt":
 			os.chmod(self.data_dir, 0o700)
 		self._mailbox = mailbox
@@ -43,6 +50,8 @@ class AppService:
 			self._active_workers = set()
 			self._workers_lock = threading.RLock()
 			self._abort_event = threading.Event()
+			self._label_cache = {}
+			self._label_cache_lock = threading.RLock()
 		else:
 			self._clients = self._resource_owner._clients
 			self._clients_lock = self._resource_owner._clients_lock
@@ -106,8 +115,16 @@ class AppService:
 	def _connection_state(self):
 		with self._identity_lock:
 			try:
-				return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))
+				path = self.data_dir / "account.json"
+				stat = path.stat()
+				signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+				if signature != self._identity_signature:
+					self._identity_cache = json.loads(path.read_text(encoding="utf-8"))
+					self._identity_signature = signature
+				return dict(self._identity_cache)
 			except (FileNotFoundError, ValueError):
+				self._identity_signature = None
+				self._identity_cache = {}
 				return {}
 
 	def _write_identity(self, connected=True):
@@ -124,6 +141,7 @@ class AppService:
 			finally:
 				temporary.unlink(missing_ok=True)
 			self._connection_generation = generation
+			self._identity_signature = None
 
 	def refresh_connection(self) -> bool:
 		account = self._identity_from_disk()
@@ -390,11 +408,17 @@ class AppService:
 			or bool(row and row["category"] in config.excluded_categories))
 
 	def override(self, message):
-		override = self.learning.manual_override(message)
+		if self._policy_depth and message.id in self._override_cache:
+			override = self._override_cache[message.id]
+			if override and override["context_version"] != message.context_version:
+				override = None
+		else:
+			override = self.learning.manual_override(message)
 		if override and override["action"] == "defer" and override.get("defer_until_utc"):
 			if datetime.fromisoformat(override["defer_until_utc"].replace("Z", "+00:00")) <= self.clock():
 				self.store.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
 				self.store.execute("UPDATE messages SET defer_until_utc=NULL WHERE id=?", (message.id,))
+				self._override_cache[message.id] = None
 				return None
 		return override
 
@@ -409,14 +433,55 @@ class AppService:
 		return self.learning.examples_for(message, excluded_senders=self.config.excluded_senders, excluded_domains=self.config.excluded_domains, excluded_categories=self.config.excluded_categories, excluded_label_ids=self.config.excluded_label_ids)
 
 	def rules(self):
-		return self.learning.rules(include_disabled=False)
+		if not self._policy_depth:
+			revision = self.store.checkpoint("rules_revision", 0)
+			if revision != self._rules_cache_revision:
+				self._rules_cache = self.learning.rules(include_disabled=False)
+				self._rules_cache_revision = revision
+		return self._rules_cache
 
-	def refresh_labels(self):
-		labels = self.mailbox.labels()
+	@contextlib.contextmanager
+	def policy_batch(self, ids):
+		"""Read one policy snapshot per local batch; action preflight stays fresh."""
+		if self._policy_depth:
+			yield
+			return
+		self.rules()
+		ids = list(dict.fromkeys(ids))
+		self._override_cache = dict.fromkeys(ids)
+		for chunk in chunks(ids):
+			marks = placeholders(chunk)
+			for row in self.store.query(f"SELECT * FROM manual_overrides WHERE message_id IN ({marks})", chunk):
+				self._override_cache[row["message_id"]] = {**json.loads(row["payload_json"]), **row}
+		self._policy_depth += 1
+		try:
+			yield
+		finally:
+			self._policy_depth -= 1
+			self._override_cache.clear()
+
+	def refresh_labels(self, force=False):
+		owner = self._resource_owner
+		with owner._label_cache_lock:
+			cached = owner._label_cache.get(self.account_id)
+			if force or cached is None or time.monotonic() - cached[0] >= 60:
+				labels = self.mailbox.labels()
+				owner._label_cache[self.account_id] = (time.monotonic(), [dict(label) for label in labels])
+			else:
+				labels = [dict(label) for label in cached[1]]
 		for label in labels:
 			label["meaning"] = self.config.label_meanings.get(label["id"], "neutral")
-		self.store.replace_labels(labels)
+		current = self.store.labels()
+		keys = ("id", "name", "type", "meaning")
+		if sorted(tuple(row.get(key) for key in keys) for row in current) != sorted(tuple(row.get(key) for key in keys) for row in labels):
+			self.store.replace_labels(labels)
 		return labels
+
+	def invalidate_labels(self):
+		"""Invalidate shared catalog state after Gmail rejects a label reference."""
+		owner = self._resource_owner
+		with owner._label_cache_lock:
+			owner._label_cache.pop(self.account_id, None)
 
 	def context_messages(self, message, window, config=None):
 		"""Optional context obeys the same body privacy bounds; never action targets."""
@@ -547,26 +612,27 @@ class AppService:
 		count = 0
 		# Keep each original job's frozen target bounds. Replanning never restores
 		# earlier archives; only current inbox items receive new proposals.
-		rows = self.store.query("SELECT p.* FROM predictions p JOIN messages m ON p.message_id=m.id WHERE p.valid=1 AND m.in_inbox=1 ORDER BY p.created_at DESC")
+		rows = self.store.query("SELECT p.*,j.window_json AS job_window_json,j.config_json AS job_config_json FROM predictions p JOIN messages m ON p.message_id=m.id LEFT JOIN jobs j ON p.job_id=j.id WHERE p.valid=1 AND m.in_inbox=1 ORDER BY p.created_at DESC")
 		seen = set()
-		for row in rows:
-			if should_stop():
-				break
-			if row["message_id"] in seen:
-				continue
-			seen.add(row["message_id"])
-			job = self.store.one("SELECT window_json,config_json FROM jobs WHERE id=?", (row["job_id"],))
-			window = Window.from_dict(json.loads(job["window_json"])) if job else resolve_window(self.config, self.clock())
-			message = self.store.get_message(row["message_id"])
-			if not self.eligible(message, window):
-				continue
-			assessment = Assessment.from_dict(json.loads(row["assessment_json"]))
-			frozen = Config.from_dict(json.loads(job["config_json"])) if job else self.config
-			effective = self.jobs.effective_config(frozen)
-			override = self.override(message)
-			decision = recommend(message, assessment, effective, window, override, self.rules())
-			self.jobs.save_recommendation(row["job_id"], message, assessment, decision.action, decision.reason, window, row["model_version"], label_ids=decision.label_ids, approval="manual" if override and decision.evidence_source == "manual" else "automatic")
-			count += 1
+		messages = self.store.get_messages([row["message_id"] for row in rows])
+		with self.policy_batch(messages):
+			for row in rows:
+				if should_stop():
+					break
+				if row["message_id"] in seen:
+					continue
+				seen.add(row["message_id"])
+				window = Window.from_dict(json.loads(row["job_window_json"])) if row["job_window_json"] else resolve_window(self.config, self.clock())
+				message = messages.get(row["message_id"])
+				if not self.eligible(message, window):
+					continue
+				assessment = Assessment.from_dict(json.loads(row["assessment_json"]))
+				frozen = Config.from_dict(json.loads(row["job_config_json"])) if row["job_config_json"] else self.config
+				effective = self.jobs.effective_config(frozen)
+				override = self.override(message)
+				decision = recommend(message, assessment, effective, window, override, self.rules())
+				self.jobs.save_recommendation(row["job_id"], message, assessment, decision.action, decision.reason, window, row["model_version"], label_ids=decision.label_ids, approval="manual" if override and decision.evidence_source == "manual" else "automatic")
+				count += 1
 		return {"replanned": count, "ai_calls": 0}
 
 	def connect(self, credentials_path):

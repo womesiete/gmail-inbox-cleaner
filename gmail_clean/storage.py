@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from .runtime import chunks, placeholders
+
 SCHEMA_VERSION = 7
 _PROCESS_FALLBACK = uuid.uuid4().hex
 
@@ -420,10 +422,21 @@ class Store:
 		))
 
 	def get_message(self, message_id: str) -> Any | None:
-		from .domain import Message
 		row = self.one("SELECT * FROM messages WHERE id=?", (message_id,))
-		if row is None:
-			return None
+		return self.message_from_row(row) if row else None
+
+	def get_messages(self, ids: Sequence[str]) -> dict[str, Any]:
+		result = {}
+		ids = list(dict.fromkeys(ids))
+		for chunk in chunks(ids):
+			marks = placeholders(chunk)
+			for row in self.query(f"SELECT * FROM messages WHERE id IN ({marks})", chunk):
+				result[row["id"]] = self.message_from_row(row)
+		return result
+
+	@staticmethod
+	def message_from_row(row: Mapping[str, Any]) -> Any:
+		from .domain import Message
 		data = json.loads(row["payload_json"] or "{}")
 		data.update({
 			"id": row["id"], "account_id": row["account_id"], "thread_id": row["thread_id"],

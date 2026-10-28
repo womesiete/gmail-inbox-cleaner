@@ -293,6 +293,33 @@ def test_retry_errors_scopes_work_resets_attempts_and_preserves_user_pause(tmp_p
 		service.close()
 
 
+def test_connection_state_cache_reuses_unchanged_file_and_detects_replace(tmp_path, monkeypatch):
+	from pathlib import Path
+	service = make_service(tmp_path, mailbox=FakeLive())
+	service._write_identity()
+	reads = []
+	original = Path.read_text
+	def tracked(path, *args, **kwargs):
+		if path.name == "account.json":
+			reads.append(path)
+		return original(path, *args, **kwargs)
+	monkeypatch.setattr(Path, "read_text", tracked)
+	try:
+		for _ in range(10):
+			assert service.mailbox is service._mailbox
+		assert len(reads) <= 1
+		path = tmp_path / "account.json"
+		state = json.loads(original(path))
+		state["connected"] = False
+		replacement = tmp_path / "replacement.json"
+		replacement.write_text(json.dumps(state))
+		replacement.replace(path)
+		with pytest.raises(AuthenticationError):
+			_ = service.mailbox
+	finally:
+		service.close()
+
+
 def test_retry_errors_selection_does_not_reset_other_rows(tmp_path):
 	service = make_service(tmp_path)
 	try:
@@ -413,6 +440,27 @@ def test_first_worker_checkpoint_does_not_include_inherited_session_overrides(tm
 		service.close()
 
 
+def test_label_catalog_ttl_is_shared_by_workers_and_force_refreshes(tmp_path, monkeypatch):
+	mailbox = DemoMailbox(count=40, anchor=ANCHOR)
+	calls = []
+	original = mailbox.labels
+	def counted():
+		calls.append(True)
+		return original()
+	monkeypatch.setattr(mailbox, "labels", counted)
+	service = make_service(tmp_path, mailbox=mailbox)
+	try:
+		for _ in range(5):
+			service.refresh_labels()
+		with service.worker() as worker:
+			worker.refresh_labels()
+		assert len(calls) == 1
+		service.refresh_labels(force=True)
+		assert len(calls) == 2
+	finally:
+		service.close()
+
+
 def test_unrelated_session_override_keeps_connected_accounts_own_ai_approval(tmp_path, monkeypatch):
 	from gmail_clean.ai import module_trust_details
 	from gmail_clean.auth import AuthManager
@@ -431,5 +479,33 @@ def test_unrelated_session_override_keeps_connected_accounts_own_ai_approval(tmp
 		service.connect("synthetic-not-read.json")
 		assert service.config.ai_module == str(module)
 		assert service.config.ai_module_sha256 == preferences.ai_module_sha256
+	finally:
+		service.close()
+
+
+def test_rules_revision_cache_and_phase_override_prefetch(tmp_path, monkeypatch):
+	service = make_service(tmp_path)
+	try:
+		message = cache(service, f"d{7:015x}")
+		calls = []
+		original = service.learning.rules
+		def counted(*args, **kwargs):
+			calls.append(True)
+			return original(*args, **kwargs)
+		monkeypatch.setattr(service.learning, "rules", counted)
+		assert service.rules() == []
+		assert service.rules() == []
+		assert len(calls) == 1
+		service.learning.save_rule({"conditions": {"sender": message.sender}, "action": "keep", "enabled": True})
+		assert len(service.rules()) == 1
+		assert len(calls) == 2
+		service.learning.record(message, "keep")
+		queries = []
+		service.store.conn.set_trace_callback(queries.append)
+		with service.policy_batch([message.id]):
+			for _ in range(10):
+				assert service.override(message)["action"] == "keep"
+				assert service.rules()
+		assert sum("SELECT * FROM manual_overrides" in sql for sql in queries) == 1
 	finally:
 		service.close()
