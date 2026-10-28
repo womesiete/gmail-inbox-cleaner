@@ -225,7 +225,7 @@ class AuthManager:
 	def restore(self) -> Any | None:
 		from google.oauth2.credentials import Credentials
 		from google.auth.transport.requests import Request
-		from google.auth.exceptions import TransportError
+		from google.auth.exceptions import RefreshError, TransportError
 		payload = self.tokens.load()
 		if not payload:
 			return None
@@ -245,6 +245,11 @@ class AuthManager:
 		except TransportError:
 			from .gmail import GmailError
 			raise GmailError("network", "The network is unavailable while refreshing Gmail authorization.") from None
+		except RefreshError as exc:
+			if any((isinstance(value, dict) and value.get("error") == "invalid_grant")
+				or (isinstance(value, str) and "invalid_grant" in value) for value in exc.args):
+				raise AuthenticationError("Google rejected authorization (invalid_grant). Reconnect this account. External OAuth apps in Testing normally issue Gmail grants that expire after 7 days; revocation or account changes can also invalidate them.") from exc
+			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect and check your OAuth app configuration.") from exc
 		except Exception as exc:
 			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect; test-mode grants may expire.") from exc
 

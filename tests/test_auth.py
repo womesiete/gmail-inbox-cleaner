@@ -90,3 +90,18 @@ def test_disconnect_tombstone_does_not_restore_stale_unavailable_backend(tmp_pat
 	store.delete()
 	assert backend.value is not None
 	assert store.load() is None
+
+
+def test_invalid_grant_explains_testing_expiry_without_exposing_response(tmp_path, monkeypatch):
+	from google.auth.exceptions import RefreshError
+	from google.oauth2.credentials import Credentials
+	manager = AuthManager(tmp_path)
+	current = credential()
+	current.refresh = lambda request: (_ for _ in ()).throw(RefreshError("invalid_grant: private-response", {"error": "invalid_grant"}))
+	monkeypatch.setattr(manager.tokens, "load", lambda: {"refresh_token": "stored"})
+	monkeypatch.setattr(Credentials, "from_authorized_user_info", lambda payload, scopes: current)
+	with pytest.raises(AuthenticationError) as caught:
+		manager.restore()
+	assert "invalid_grant" in str(caught.value)
+	assert "7 days" in str(caught.value)
+	assert "private-response" not in str(caught.value)

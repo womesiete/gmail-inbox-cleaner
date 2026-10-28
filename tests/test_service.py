@@ -305,3 +305,17 @@ def test_retry_errors_selection_does_not_reset_other_rows(tmp_path):
 		assert service.store.one("SELECT attempts FROM work_items WHERE message_id='other'")["attempts"] == 3
 	finally:
 		service.close()
+
+
+def test_disconnect_can_explicitly_revoke_google_consent(tmp_path, monkeypatch):
+	from gmail_clean.auth import AuthManager
+	calls = []
+	monkeypatch.setattr(AuthManager, "disconnect", lambda self, revoke=False: calls.append(revoke))
+	service = make_service(tmp_path, mailbox=FakeLive())
+	try:
+		result = service.disconnect(revoke=True)
+		assert calls == [True]
+		assert "revoked" in result["message"]
+		assert not service._connection_state()["connected"]
+	finally:
+		service.close()

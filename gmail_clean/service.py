@@ -569,16 +569,16 @@ class AppService:
 		self.refresh_labels()
 		return {"account_id": identity}
 
-	def disconnect(self):
+	def disconnect(self, revoke=False):
 		if self.demo:
 			return {"message": "Demo has no OAuth credentials"}
 		from .auth import AuthManager
 		with self.execution_lease():
-			AuthManager(self.data_dir).disconnect()
+			AuthManager(self.data_dir).disconnect(revoke=revoke)
 			self._write_identity(connected=False)
 			self._mailbox = None
 			self._close_ai()
-		return {"message": "Disconnected; local data and undo history retained"}
+		return {"message": "Disconnected and Google consent revoked; local data and undo history retained" if revoke else "Disconnected; local data and undo history retained"}
 
 	def error(self, stage, exc, job_id="", message_id=""):
 		insert(self.store, "errors", {"id": identifier(), "job_id": job_id, "message_id": message_id, "stage": stage, "kind": getattr(exc, "category", getattr(exc, "kind", type(exc).__name__)), "class_name": getattr(exc, "exception_class", type(exc).__name__), "summary": safe_error(exc), "created_at": stamp(), "payload_json": encode({"exception_module": getattr(exc, "exception_module", type(exc).__module__)})})

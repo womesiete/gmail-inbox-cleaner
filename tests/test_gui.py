@@ -579,3 +579,23 @@ def test_readonly_gui_tasks_do_not_validate_or_load_the_external_provider(qapp, 
 		assert observed == [(True, 0)]
 	finally:
 		service.close()
+
+
+def test_disconnect_and_revoke_is_an_explicit_confirmed_action(qtbot, service, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox, QPushButton
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	service.demo = False
+	buttons = [button for button in window.findChildren(QPushButton) if button.text() == "Disconnect and revoke"]
+	assert len(buttons) == 1
+	calls = []
+	monkeypatch.setattr(window, "_submit", lambda title, operation: calls.append((title, operation)))
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+	buttons[0].click()
+	assert not calls
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+	buttons[0].click()
+	assert len(calls) == 1
+	fake = type("Connection", (), {"disconnect": lambda self, revoke=False: calls.append(revoke)})()
+	calls[0][1](fake, None)
+	assert calls[-1] is True

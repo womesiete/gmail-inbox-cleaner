@@ -128,3 +128,10 @@ Undo uses the original explicit IDs and inverse app-owned deltas. It can restore
 `max_actions_per_run` defaults to 1,000. A larger reviewed plan requires explicit confirmation of its exact count in **Execute this plan**. The limit also applies to automatic execution and undo; unattended execution cannot silently exceed it. Selected-action, cleanup-job, and keyboard undo paths ask for the same explicit count confirmation above the limit. Execution freezes the checked target IDs, so work added by another worker cannot expand the approved set or bypass the cap.
 
 Headless live runs require `--live --max-actions N` or `--live --yes`. Use `--max-actions` to impose an invocation limit; `--yes` explicitly confirms execution above the configured cap. The JSON result records the execution count and plan hash. Console `--live`, model, and module overrides exist only for that invocation and never persist a live preference, including after an interrupted or crashed run.
+
+
+### Disconnecting an account
+
+**Disconnect** removes this installation's saved authorization while retaining its local database and undo history. **Disconnect and revoke** also asks Google to revoke this application's consent, after confirmation. If revocation fails, the application reports the failure; retry it or remove the application's access in your Google Account. Revocation does not erase local mail caches.
+
+An `invalid_grant` message means Google no longer accepts the saved grant. Reconnect through browser consent. Google normally expires Gmail refresh grants after seven days for external OAuth applications whose publishing status is Testing; revocation and account changes are other possible causes. See Google's [refresh-token expiration documentation](https://developers.google.com/identity/protocols/oauth2#expiration).

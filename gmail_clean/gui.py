@@ -589,6 +589,7 @@ class MainWindow(QMainWindow):
 		bar = QHBoxLayout()
 		bar.addWidget(self._button("Connect Gmail…", self._connect_account))
 		bar.addWidget(self._button("Disconnect", self._disconnect_account))
+		bar.addWidget(self._button("Disconnect and revoke", self._disconnect_and_revoke))
 		bar.addWidget(self._button("Refresh labels", lambda: self._submit("Refresh labels", lambda svc, p: svc.refresh_labels())))
 		bar.addStretch()
 		layout.addLayout(bar)
@@ -1523,6 +1524,15 @@ class MainWindow(QMainWindow):
 	def _disconnect_account(self):
 		if not self.service.demo:
 			self._submit("Disconnecting and removing protected local tokens", lambda svc, p: svc.disconnect())
+
+	def _disconnect_and_revoke(self):
+		if self.service.demo:
+			return
+		if QMessageBox.question(self, "Revoke Google consent?",
+			"Disconnect this account and ask Google to revoke this application's consent? Reconnect with browser consent to use it again. Local messages and undo history remain on this computer.",
+			QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+			QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+			self._submit("Revoking Google consent and removing protected local tokens", lambda svc, p: svc.disconnect(revoke=True))
 
 	def _backup(self):
 		path, _ = QFileDialog.getSaveFileName(self, "Consistent database backup", "gmail-clean-backup.sqlite", "SQLite (*.sqlite)")
