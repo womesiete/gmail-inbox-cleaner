@@ -148,3 +148,7 @@ Checked 2026-10-28:
 - [Gmail error handling](https://developers.google.com/workspace/gmail/api/guides/handle-errors)
 - [Scopes](https://developers.google.com/workspace/gmail/api/auth/scopes)
 - [QSettings persistence](https://doc.qt.io/qt-6/qsettings.html)
+
+## Durable-boundary crash characterization
+
+Offline subprocess regressions terminate with `os._exit` before the attempt insert, immediately after the demo transport commits, and immediately before the receipt is recorded. Reopening SQLite rolls back an unfinished intent transaction; a durable `executing` intent instead requires readback reconciliation. A recovered successful remote effect is recorded without another modify request and keeps ownership marked ambiguous after the lost response. The tests assert that all three boundaries produce exactly one durable synthetic mailbox transition after recovery.
