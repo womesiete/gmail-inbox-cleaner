@@ -14,7 +14,7 @@ import sys
 
 def main(argv=None) -> int:
 	arguments = sys.argv[1:] if argv is None else argv
-	command = [sys.executable, "-m", "pytest", "-q", "--junitxml=test-results.xml", *arguments]
+	command = [sys.executable, "-m", "pytest", "-q", "--junitxml=test-results.xml", "--cov=gmail_clean", "--cov-report=term-missing:skip-covered", "--cov-report=xml:coverage.xml", *arguments]
 	environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 	result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
 		encoding="utf-8", errors="replace", env=environment, check=False)

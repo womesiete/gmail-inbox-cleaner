@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-qt>=4.4,<5", "ruff>=0.9,<1", "build>=1.2,<2"]
+dev = ["pytest>=8,<10", "pytest-qt>=4.4,<5", "pytest-cov>=6,<8", "ruff>=0.9,<1", "build>=1.2,<2"]
 package = ["pyinstaller>=6.6,<7"]
 
 [project.scripts]
@@ -47,3 +47,11 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.format]
 indent-style = "tab"
+
+[tool.coverage.run]
+source = ["gmail_clean"]
+relative_files = true
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
