@@ -15,7 +15,6 @@ import importlib.util
 import json
 import math
 import multiprocessing
-from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 import os
 from pathlib import Path
@@ -30,6 +29,11 @@ from typing import Any, Iterable, cast
 from uuid import uuid4
 
 from .domain import Assessment, domain_matches
+
+if sys.platform == "win32":
+	from multiprocessing.connection import PipeConnection as WorkerConnection
+else:
+	from multiprocessing.connection import Connection as WorkerConnection
 
 PROMPT_VERSION = "gmail-clean-assessment-v1.0.2"
 MAX_RESPONSE_CHARS = 1_000_000
@@ -472,7 +476,7 @@ class AIClient:
 		self._paused = threading.Event()
 		self._closing = threading.Event()
 		self._process: BaseProcess | None = None
-		self._connection: Connection | None = None
+		self._connection: WorkerConnection | None = None
 		self.supports_result = False
 		self.worker_pid = None
 		self.request_state = "idle"

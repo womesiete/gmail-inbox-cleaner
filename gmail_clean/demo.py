@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import uuid
 import weakref
@@ -241,7 +242,7 @@ class DemoMailbox:
 					stream.write(b"\0")
 					stream.flush()
 				stream.seek(0)
-				if os.name == "nt":
+				if sys.platform == "win32":
 					import msvcrt
 					getattr(msvcrt, "locking")(stream.fileno(), getattr(msvcrt, "LK_LOCK"), 1)  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
 				else:
@@ -253,7 +254,7 @@ class DemoMailbox:
 				finally:
 					self._write_depth -= 1
 					stream.seek(0)
-					if os.name == "nt":
+					if sys.platform == "win32":
 						getattr(msvcrt, "locking")(stream.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
 					else:
 						fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
