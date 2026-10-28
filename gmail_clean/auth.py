@@ -111,11 +111,11 @@ class TokenStore:
 			if len(value.encode("utf-16-le")) > 2560:
 				raise AuthenticationError("Credential exceeds Windows Credential Manager's compact payload limit.")
 			self._keyring().set_password(self.SERVICE, self.user, value)
-		except Exception as keyring_error:
+		except Exception as keyring_error:  # noqa: BLE001 - OS keyring backends expose different exception types.
 			# There is deliberately no unencrypted-file fallback.
 			try:
 				protected = self._dpapi(value.encode(), encrypt=True)
-			except Exception:
+			except Exception:  # noqa: BLE001 - Preserve the original keyring failure when encrypted fallback fails.
 				raise AuthenticationError("The OS credential backend could not save authorization. Unlock or configure the protected keyring and reconnect.") from keyring_error
 			temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 			try:
@@ -149,7 +149,7 @@ class TokenStore:
 		if backend != "dpapi":
 			try:
 				value = self._keyring().get_password(self.SERVICE, self.user)
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - Third-party keyring failures stay behind the protected-store boundary.
 				keyring_error = exc
 			if value is not None:
 				try:
@@ -161,7 +161,7 @@ class TokenStore:
 				return json.loads(self._dpapi(self.path.read_bytes(), encrypt=False).decode())
 			except AuthenticationError:
 				raise
-			except Exception as exc:
+			except (OSError, UnicodeError, ValueError) as exc:
 				raise AuthenticationError("Protected credentials could not be read. Reconnect this account.") from exc
 		if backend == "keyring" and keyring_error is not None:
 			raise AuthenticationError("The OS credential backend could not read authorization. Unlock the protected keyring and retry.") from keyring_error
@@ -171,7 +171,7 @@ class TokenStore:
 	def delete(self) -> None:
 		try:
 			self._keyring().delete_password(self.SERVICE, self.user)
-		except Exception:
+		except Exception:  # noqa: BLE001 - Backend failures must still remove the encrypted-file copy.
 			# Missing credentials or unavailable backend does not prevent DPAPI removal.
 			if self.path.exists():
 				self.path.unlink()
@@ -219,7 +219,7 @@ class AuthManager:
 			return box
 		except AuthenticationError:
 			raise
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - OAuth/provider errors need a content-free user-facing summary.
 			raise AuthenticationError("Gmail connection failed. Check the Desktop OAuth client, test-user access, consent, and network.") from exc
 
 	def restore(self) -> Any | None:
@@ -237,7 +237,7 @@ class AuthManager:
 			if self.tokens.payload(credentials) != payload:
 				try:
 					self.tokens.save(credentials)
-				except Exception:
+				except Exception:  # noqa: BLE001 - A credential persistence failure cannot invalidate the refreshed in-memory session.
 					warnings.warn("Gmail authorization refreshed, but changed credentials could not be saved. Unlock the credential backend or reconnect before restarting.", RuntimeWarning, stacklevel=2)
 			return box
 		except AuthenticationError:
@@ -250,7 +250,7 @@ class AuthManager:
 				or (isinstance(value, str) and "invalid_grant" in value) for value in exc.args):
 				raise AuthenticationError("Google rejected authorization (invalid_grant). Reconnect this account. External OAuth apps in Testing normally issue Gmail grants that expire after 7 days; revocation or account changes can also invalidate them.") from exc
 			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect and check your OAuth app configuration.") from exc
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - Unexpected credential errors cannot expose token/response details.
 			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect; test-mode grants may expire.") from exc
 
 	def mailbox(self) -> Any:

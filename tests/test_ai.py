@@ -403,3 +403,37 @@ def test_shutdown_interrupts_a_delayed_call_without_waiting_for_serial_lock(tmp_
 		assert client.worker_pid is None
 	finally:
 		client.close(grace_s=0.1)
+
+
+def test_module_trust_inspection_hashes_without_executing_package(tmp_path, monkeypatch):
+	from gmail_clean.ai import module_trust_details
+	package = tmp_path / "trust_fixture"
+	package.mkdir()
+	marker = tmp_path / "executed"
+	(package / "__init__.py").write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+	module = package / "provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'offline'\n")
+	module.chmod(0o666)
+	monkeypatch.syspath_prepend(str(tmp_path))
+	info = module_trust_details("trust_fixture.provider")
+	assert info["path"] == str(module.resolve())
+	assert info["sha256"] == __import__("hashlib").sha256(module.read_bytes()).hexdigest()
+	assert any("writable" in warning or "not verified" in warning for warning in info["warnings"])
+	assert not marker.exists()
+
+
+def test_client_refuses_changed_code_before_starting_a_child(tmp_path):
+	module = tmp_path / "provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'original'\n")
+	with AIClient(str(module)) as client:
+		module.write_text("def call_api(prompt):\n\treturn 'changed'\n")
+		with pytest.raises(AIError, match="changed"):
+			client.call("offline")
+		assert client.worker_pid is None
+
+
+def test_bundled_demo_does_not_require_a_source_file_in_frozen_builds(monkeypatch):
+	from gmail_clean import ai
+	monkeypatch.setattr(ai, "module_trust_details", lambda location: (_ for _ in ()).throw(AssertionError("bundled demo source is not an external trust boundary")))
+	with AIClient("gmail_clean.demo_ai") as client:
+		assert client.call("synthetic").text

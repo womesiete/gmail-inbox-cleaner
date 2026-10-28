@@ -135,3 +135,9 @@ Headless live runs require `--live --max-actions N` or `--live --yes`. Use `--ma
 **Disconnect** removes this installation's saved authorization while retaining its local database and undo history. **Disconnect and revoke** also asks Google to revoke this application's consent, after confirmation. If revocation fails, the application reports the failure; retry it or remove the application's access in your Google Account. Revocation does not erase local mail caches.
 
 An `invalid_grant` message means Google no longer accepts the saved grant. Reconnect through browser consent. Google normally expires Gmail refresh grants after seven days for external OAuth applications whose publishing status is Testing; revocation and account changes are other possible causes. See Google's [refresh-token expiration documentation](https://developers.google.com/identity/protocols/oauth2#expiration).
+
+### Trusting an external AI module
+
+An external `.py` file or installed package executes Python with your user account's file and network access. Review its source and dependencies first. Saving a new or changed provider in Settings shows its resolved source, SHA-256, and a warning if other users may modify it. Approve the source only after review. The saved fingerprint is checked before AI calls, so replacing the source blocks further calls until you approve its new fingerprint. Older configurations without a fingerprint also need approval.
+
+For headless use, `--approve-ai-module` explicitly approves the current source after you review it. Merely restarting the application does not approve changed code. The built-in offline demo is part of the application and does not need a separate source approval. Entry-file fingerprints do not cover every imported dependency or provide a sandbox; see [SECURITY.md](../SECURITY.md). The database, body cache, and backups are unencrypted at rest.

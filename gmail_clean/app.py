@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .domain import Config, content_hash
+from .domain import content_hash
 from .runtime import data_directory, utc_now
 from .service import AppService
 from .storage import Store
@@ -25,6 +25,7 @@ def parser():
 	result.add_argument("--benchmark", type=int, metavar="ROWS", help="Generate and measure SQL table paging; offline only")
 	result.add_argument("--resume", metavar="JOB_ID", help="Resume the specified durable job")
 	result.add_argument("--ai-module", help="External package name or standalone Python file")
+	result.add_argument("--approve-ai-module", action="store_true", help="Explicitly approve the current AI source SHA-256 after reviewing its code")
 	result.add_argument("--model", help="Exact external model identifier; empty uses the module default")
 	result.add_argument("--credentials", type=Path, help="Installed-desktop OAuth client JSON for explicit connection")
 	result.add_argument("--live", action="store_true", help="Explicitly enable mailbox writes for this invocation")
@@ -122,10 +123,7 @@ def main(argv=None) -> int:
 			service = AppService(data_dir=directory, demo=args.demo, count=args.count)
 			# A console run always requires its own explicit --live choice, even
 			# when the desktop's saved preferences allow automatic execution.
-			service.set_session_config(dry_run=not args.live)
 			service._session_write_confirmation = args.yes
-			if args.max_actions is not None:
-				service.set_session_config(max_actions_per_run=args.max_actions)
 		else:
 			from PyQt6.QtCore import QSettings
 			from PyQt6.QtWidgets import QApplication
@@ -137,15 +135,21 @@ def main(argv=None) -> int:
 			settings = QSettings("GmailInboxCleaner", "Demo" if args.demo else "Personal")
 			config = load_preferences(settings)
 			service = AppService(config=config, data_dir=directory, demo=args.demo, count=args.count)
-		if args.ai_module is not None or args.model is not None or args.live:
-			config = Config.from_dict(service.config.to_dict())
-			if args.ai_module is not None:
-				config.ai_module = args.ai_module
-			if args.model is not None:
-				config.ai_model = args.model
-			if args.live:
-				config.dry_run = False
-			service.set_session_config(**{name: getattr(config, name) for name in ("ai_module", "ai_model", "dry_run")})
+		# Assemble invocation preferences once so a changed saved provider can be
+		# explicitly approved or replaced before unrelated flags validate it.
+		overrides = {}
+		if args.headless:
+			overrides["dry_run"] = not args.live
+		elif args.live:
+			overrides["dry_run"] = False
+		if args.max_actions is not None:
+			overrides["max_actions_per_run"] = args.max_actions
+		if args.ai_module is not None:
+			overrides["ai_module"] = args.ai_module
+		if args.model is not None:
+			overrides["ai_model"] = args.model
+		if overrides or args.approve_ai_module:
+			service.set_session_config(approve_ai_module=args.approve_ai_module, **overrides)
 		if args.credentials:
 			service.connect(args.credentials)
 		if args.headless:

@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 	QTableView, QTextBrowser, QVBoxLayout, QWidget)
 
 from .domain import Config, resolve_age_cutoff, resolve_window
+from .ai import AIError, module_trust_details
 from .table_model import Column, SqlTableModel
 
 
@@ -355,7 +356,7 @@ class SettingsEditor(QWidget):
 		values = config.to_dict()
 		included = set()
 		groups = list(self.GROUPS)
-		remaining = [key for key in values if key not in {k for _, keys in groups for k in keys} and key != "extras"]
+		remaining = [key for key in values if key not in {k for _, keys in groups for k in keys} and key not in {"extras", "ai_module_sha256"}]
 		if remaining:
 			groups.append(("Additional preferences", remaining))
 		for title, keys in groups:
@@ -453,8 +454,18 @@ class SettingsEditor(QWidget):
 		try:
 			config = self.read_config()
 			self._preview()
+			if config.ai_module and not self.demo and config.ai_module != "gmail_clean.demo_ai":
+				info = module_trust_details(config.ai_module)
+				if config.ai_module != self.config.ai_module or info["sha256"] != self.config.ai_module_sha256:
+					warning = "\n".join(info["warnings"])
+					if QMessageBox.question(self, "Trust external Python code?",
+						f"This provider runs as Python code with your user account's file and network access.\nSource: {info['path']}\nSHA-256: {info['sha256']}\n{warning}\nApprove this exact source after reviewing it?",
+						QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+						QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+						return
+					config.ai_module_sha256 = info["sha256"]
 			self.saved.emit(config)
-		except (ValueError, TypeError, KeyError) as exc:
+		except (AIError, ValueError, TypeError, KeyError) as exc:
 			self.error.setText(str(exc))
 
 

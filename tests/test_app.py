@@ -66,3 +66,42 @@ def test_cli_live_override_never_changes_saved_preferences(tmp_path, monkeypatch
 	monkeypatch.setattr(AppService, "run_job", interrupted_run)
 	assert main(["--demo", "--headless", "--live", "--yes", "--count", "2", "--data-dir", str(root)]) == 130
 	assert observed == [(False, True)]
+
+
+def test_cli_module_reapproval_is_explicit_and_forwarded(tmp_path, monkeypatch):
+	from gmail_clean import app
+	from gmail_clean.service import AppService
+	calls = []
+	original = AppService.set_session_config
+	def update(self, *, approve_ai_module=False, **overrides):
+		calls.append(approve_ai_module)
+		return original(self, approve_ai_module=approve_ai_module, **overrides)
+	monkeypatch.setattr(AppService, "set_session_config", update)
+	assert app.main(["--demo", "--headless", "--count", "4", "--data-dir", str(tmp_path), "--approve-ai-module"]) == 0
+	assert True in calls
+
+
+def test_cli_can_approve_changed_saved_ai_before_any_unrelated_session_override(tmp_path, monkeypatch):
+	module = tmp_path / "saved_provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'approved'\n", encoding="utf-8")
+	root = tmp_path / "data"
+	service = AppService(data_dir=root / "live", config=Config(ai_module=str(module)))
+	service.update_config(service.config, approve_ai_module=True)
+	service.close()
+	module.write_text("def call_api(prompt):\n\treturn 'reviewed change'\n", encoding="utf-8")
+	monkeypatch.setattr(AppService, "run_job", lambda self, job_id, **kwargs: {"state": "completed", "failed": 0})
+	assert main(["--headless", "--approve-ai-module", "--data-dir", str(root)]) == 0
+
+
+def test_cli_can_replace_a_missing_saved_ai_module(tmp_path, monkeypatch):
+	module = tmp_path / "missing_provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'approved'\n", encoding="utf-8")
+	root = tmp_path / "data"
+	service = AppService(data_dir=root / "live", config=Config(ai_module=str(module)))
+	service.update_config(service.config, approve_ai_module=True)
+	service.close()
+	module.unlink()
+	replacement = tmp_path / "replacement_provider.py"
+	replacement.write_text("def call_api(prompt):\n\treturn 'reviewed replacement'\n", encoding="utf-8")
+	monkeypatch.setattr(AppService, "run_job", lambda self, job_id, **kwargs: {"state": "completed", "failed": 0})
+	assert main(["--headless", "--ai-module", str(replacement), "--data-dir", str(root)]) == 0

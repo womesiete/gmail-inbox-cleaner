@@ -319,3 +319,117 @@ def test_disconnect_can_explicitly_revoke_google_consent(tmp_path, monkeypatch):
 		assert not service._connection_state()["connected"]
 	finally:
 		service.close()
+
+
+def test_external_ai_fingerprint_is_recorded_and_changed_code_needs_approval(tmp_path):
+	from gmail_clean.ai import AIError
+	module = tmp_path / "provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'original'\n")
+	service = make_service(tmp_path / "data", config=Config(ai_module=str(module)), mailbox=FakeLive())
+	try:
+		with pytest.raises(AIError, match="no approved"):
+			_ = service.ai_for()
+		service.update_config(service.config, approve_ai_module=True)
+		assert len(service.config.ai_module_sha256) == 64
+		first_hash = service.config.ai_module_sha256
+		_ = service.ai_for()
+		module.write_text("def call_api(prompt):\n\treturn 'changed'\n")
+		with pytest.raises(AIError, match="changed"):
+			_ = service.ai_for()
+		with pytest.raises(AIError, match="changed"):
+			service.update_config(service.config)
+		service.update_config(service.config, approve_ai_module=True)
+		assert service.config.ai_module_sha256 != first_hash
+		assert service.store.checkpoint("effective_preferences")["ai_module_sha256"] == service.config.ai_module_sha256
+	finally:
+		service.close()
+
+
+def test_session_ai_source_approval_is_verified_and_never_persisted(tmp_path):
+	from gmail_clean.ai import module_trust_details
+	module = tmp_path / "session_ai.py"
+	module.write_text("def call_api(prompt):\n\treturn 'offline fixture'\n", encoding="utf-8")
+	service = make_service(tmp_path, mailbox=FakeLive())
+	try:
+		before = service.store.checkpoint("effective_preferences")
+		service.set_session_config(ai_module=str(module), approve_ai_module=True)
+		assert service.config.ai_module_sha256 == module_trust_details(str(module))["sha256"]
+		assert service.store.checkpoint("effective_preferences") == before
+		module.write_text("def call_api(prompt):\n\treturn 'changed'\n", encoding="utf-8")
+		with pytest.raises(Exception, match="changed|SHA-256|approved"):
+			service.set_session_config(ai_model="another")
+	finally:
+		service.close()
+
+
+def test_new_module_keeps_the_exact_fingerprint_confirmed_before_settings_save(tmp_path):
+	from gmail_clean.ai import AIError, module_trust_details
+	module = tmp_path / "new_provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'reviewed source'\n", encoding="utf-8")
+	service = make_service(tmp_path / "data", mailbox=FakeLive())
+	try:
+		before = service.store.checkpoint("effective_preferences")
+		candidate = Config.from_dict(service.config.to_dict())
+		candidate.ai_module = str(module)
+		candidate.ai_module_sha256 = module_trust_details(str(module))["sha256"]
+		module.write_text("def call_api(prompt):\n\treturn 'unreviewed replacement'\n", encoding="utf-8")
+		with pytest.raises(AIError, match="changed"):
+			service.update_config(candidate)
+		assert service.store.checkpoint("effective_preferences") == before
+	finally:
+		service.close()
+
+
+def test_connect_preserves_session_overrides_without_saving_them_to_another_account(tmp_path, monkeypatch):
+	from gmail_clean.auth import AuthManager
+	service = make_service(tmp_path, mailbox=FakeLive())
+	base = service.store.checkpoint("effective_preferences")
+	service.set_session_config(dry_run=False, max_actions_per_run=7, ai_model="invocation-only")
+	monkeypatch.setattr(AuthManager, "connect", lambda self, path: FakeLive("another@example.invalid"))
+	try:
+		service.connect("synthetic-not-read.json")
+		assert service.store.checkpoint("effective_preferences")["dry_run"] == base["dry_run"]
+		assert service.store.checkpoint("effective_preferences")["ai_model"] == base["ai_model"]
+		assert service.store.checkpoint("effective_preferences")["max_actions_per_run"] == base["max_actions_per_run"]
+		assert service.config.dry_run is False
+		assert service.config.ai_model == "invocation-only"
+		assert service.config.max_actions_per_run == 7
+	finally:
+		service.close()
+
+
+def test_first_worker_checkpoint_does_not_include_inherited_session_overrides(tmp_path):
+	service = make_service(tmp_path, mailbox=FakeLive())
+	service.set_session_config(dry_run=False, ai_model="invocation-only")
+	# A newly initialized worker/account database may not yet have preferences.
+	service.store.execute("DELETE FROM checkpoints WHERE key='effective_preferences'")
+	try:
+		with service.worker() as worker:
+			assert worker.config.dry_run is False
+			assert worker.config.ai_model == "invocation-only"
+			assert worker.store.checkpoint("effective_preferences")["dry_run"] is True
+			assert worker.store.checkpoint("effective_preferences")["ai_model"] == ""
+	finally:
+		service.close()
+
+
+def test_unrelated_session_override_keeps_connected_accounts_own_ai_approval(tmp_path, monkeypatch):
+	from gmail_clean.ai import module_trust_details
+	from gmail_clean.auth import AuthManager
+	from gmail_clean.storage import Store
+	module = tmp_path / "account_provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'approved account source'\n", encoding="utf-8")
+	service = make_service(tmp_path / "data", mailbox=FakeLive())
+	target = "another@example.invalid"
+	preferences = Config(ai_module=str(module), ai_module_sha256=module_trust_details(str(module))["sha256"])
+	other = Store(service._database(target), target)
+	other.set_checkpoint("effective_preferences", preferences.to_dict())
+	other.close()
+	service.set_session_config(dry_run=False)
+	monkeypatch.setattr(AuthManager, "connect", lambda self, path: FakeLive(target))
+	try:
+		service.connect("synthetic-not-read.json")
+		assert service.config.ai_module == str(module)
+		assert service.config.ai_module_sha256 == preferences.ai_module_sha256
+	finally:
+		service.close()

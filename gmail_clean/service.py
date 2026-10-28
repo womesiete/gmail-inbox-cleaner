@@ -6,11 +6,12 @@ import contextlib
 import json
 import os
 import threading
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .actions import ActionExecutor
-from .ai import AIClient, AIError
+from .ai import AIClient, AIError, module_trust_details, verify_module_trust
 from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, eligible, protections, recommend, resolve_window
 from .jobs import JobRunner
 from .learning import Learning
@@ -72,11 +73,15 @@ class AppService:
 			self.config.label_meanings.setdefault("label_action", "requires_attention")
 		if demo and not self.config.ai_module:
 			self.config.ai_module = "gmail_clean.demo_ai"
-		self.config = Config.from_dict({**self.config.to_dict(), **self._config_overrides})
 		self._validate_demo_ai(self.config)
 		self.config.validate()
 		if config is not None or saved is None:
 			self.store.set_checkpoint("effective_preferences", self.config.to_dict())
+		# Worker/account initialization persists only base preferences. Invocation
+		# overlays remain in memory even when this is the first checkpoint.
+		self.config = Config.from_dict({**self.config.to_dict(), **self._config_overrides})
+		self._validate_demo_ai(self.config)
+		self.config.validate()
 		self._configure_services()
 		if self._mailbox is not None:
 			self._check_identity()
@@ -179,14 +184,17 @@ class AppService:
 
 	def ai_for(self, category=""):
 		self._validate_demo_ai(self.config)
+		if not self.demo and self.config.ai_module and self.config.ai_module != "gmail_clean.demo_ai":
+			verify_module_trust(self.config.ai_module, self.config.ai_module_sha256)
 		if self._closed or self._resource_owner._abort_event.is_set():
 			raise AIError("InterruptedRequest", "Application shutdown stopped new local AI work; remote completion of an active request remains unknown.")
 		model = self.config.optional_model_routes.get(category, self.config.ai_model)
-		key = (self.config.ai_module, model, self.config.ai_use_call_api_result, self.config.ai_timeout_seconds)
+		key = (self.config.ai_module, self.config.ai_module_sha256, model, self.config.ai_use_call_api_result, self.config.ai_timeout_seconds)
 		with self._clients_lock:
 			if key not in self._clients:
 				factory = self._ai_factory or AIClient
-				self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds)
+				trust = {"expected_sha256": self.config.ai_module_sha256} if not self.demo and self.config.ai_module and self.config.ai_module != "gmail_clean.demo_ai" else {}
+				self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds, **trust)
 			return self._clients[key]
 
 	def _validate_demo_ai(self, config):
@@ -199,11 +207,17 @@ class AppService:
 		self.config.dry_run = True
 		self.reload_config()
 
-	def set_session_config(self, **overrides):
+	def set_session_config(self, *, approve_ai_module=False, **overrides):
 		"""Apply invocation-only preferences without writing a live flag to disk."""
 		candidate = Config.from_dict({**self.config.to_dict(), **overrides})
+		if "ai_module" in overrides and candidate.ai_module != self.config.ai_module and "ai_module_sha256" not in overrides:
+			# A copied fingerprint belongs to the old location, not this selection.
+			candidate.ai_module_sha256 = ""
 		candidate.validate()
 		self._validate_demo_ai(candidate)
+		self._approve_ai_source(candidate, self.config, approve_ai_module)
+		if approve_ai_module or "ai_module" in overrides or "ai_module_sha256" in overrides:
+			overrides["ai_module_sha256"] = candidate.ai_module_sha256
 		self._config_overrides.update(overrides)
 		self.reload_config()
 
@@ -213,7 +227,20 @@ class AppService:
 			self.config = Config.from_dict({**value, **self._config_overrides})
 			self.learning.enabled = self.config.learning_enabled
 
-	def update_config(self, config):
+	def _approve_ai_source(self, config, previous, approve_ai_module=False):
+		"""Use the same source approval checks for saved and invocation preferences."""
+		if config.ai_module and config.ai_module != "gmail_clean.demo_ai":
+			if approve_ai_module or (config.ai_module != previous.ai_module and not config.ai_module_sha256):
+				trust = module_trust_details(config.ai_module)
+				config.ai_module_sha256 = trust["sha256"]
+				for warning in trust["warnings"]:
+					warnings.warn(warning, RuntimeWarning, stacklevel=2)
+			else:
+				# Settings may already carry the exact source the user confirmed.
+				# Never replace that approval with bytes changed while work queued.
+				verify_module_trust(config.ai_module, config.ai_module_sha256)
+
+	def update_config(self, config, *, approve_ai_module=False):
 		if isinstance(config, dict):
 			config = Config.from_dict(config)
 		else:
@@ -222,13 +249,14 @@ class AppService:
 		self._validate_demo_ai(config)
 		resolve_window(config, self.clock())
 		previous = Config.from_dict(self.store.checkpoint("effective_preferences", self.config.to_dict()))
+		self._approve_ai_source(config, previous, approve_ai_module)
 		self.config = config
 		with self.store.transaction():
 			self.store.set_checkpoint("effective_preferences", config.to_dict())
 			if previous.revision != config.revision:
 				self.store.execute("UPDATE actions SET state='stale',reason='Settings changed; replan',updated_at=? WHERE state IN ('queued','proposed','retry')", (stamp(),))
 		self.learning.enabled = config.learning_enabled
-		if (previous.ai_module, previous.ai_model, previous.ai_use_call_api_result, previous.ai_timeout_seconds, previous.optional_model_routes) != (config.ai_module, config.ai_model, config.ai_use_call_api_result, config.ai_timeout_seconds, config.optional_model_routes):
+		if (previous.ai_module, previous.ai_module_sha256, previous.ai_model, previous.ai_use_call_api_result, previous.ai_timeout_seconds, previous.optional_model_routes) != (config.ai_module, config.ai_module_sha256, config.ai_model, config.ai_use_call_api_result, config.ai_timeout_seconds, config.optional_model_routes):
 			self._close_ai()
 		return config.to_dict()
 
@@ -548,16 +576,15 @@ class AppService:
 			identity = mailbox.identity().casefold()
 			new_store = Store(self._database(identity), identity)
 			saved = new_store.checkpoint("effective_preferences")
-			if saved:
-				self.config = Config.from_dict(saved)
-			elif previous_account not in {"unconnected", identity}:
+			base = Config.from_dict(saved or previous_store.checkpoint("effective_preferences", Config().to_dict()))
+			if not saved and previous_account not in {"unconnected", identity}:
 				# User-label IDs have account-local identity. Carrying their meanings
 				# to a different account could protect or select an unrelated label.
-				self.config = Config.from_dict(self.config.to_dict())
-				self.config.label_meanings = {}
-				self.config.protected_label_ids = []
-				self.config.excluded_label_ids = []
-			new_store.set_checkpoint("effective_preferences", self.config.to_dict())
+				base.label_meanings = {}
+				base.protected_label_ids = []
+				base.excluded_label_ids = []
+			new_store.set_checkpoint("effective_preferences", base.to_dict())
+			self.config = Config.from_dict({**base.to_dict(), **self._config_overrides})
 			self._close_ai()
 			self.account_id = identity
 			self._mailbox = mailbox

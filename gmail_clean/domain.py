@@ -84,6 +84,7 @@ class Config:
 	auto_label: bool = False
 	learning_enabled: bool = True
 	ai_module: str = ""
+	ai_module_sha256: str = ""
 	ai_model: str = ""
 	ai_use_call_api_result: bool = False
 	ai_batch_size: int = 1
@@ -129,6 +130,8 @@ class Config:
 		return canonical_hash(value)
 
 	def validate(self) -> None:
+		if self.ai_module_sha256 and not re.fullmatch(r"[0-9a-f]{64}", self.ai_module_sha256):
+			raise ValueError("AI module SHA-256 must be a lowercase 64-character fingerprint")
 		try:
 			ZoneInfo(self.timezone)
 		except (ZoneInfoNotFoundError, TypeError) as exc:

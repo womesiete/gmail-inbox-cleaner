@@ -599,3 +599,27 @@ def test_disconnect_and_revoke_is_an_explicit_confirmed_action(qtbot, service, m
 	fake = type("Connection", (), {"disconnect": lambda self, revoke=False: calls.append(revoke)})()
 	calls[0][1](fake, None)
 	assert calls[-1] is True
+
+
+def test_saving_external_ai_code_requires_hash_confirmation(qtbot, tmp_path, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox
+	module = tmp_path / "provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'offline'\n")
+	editor = SettingsEditor(Config(ai_module=str(module)))
+	qtbot.addWidget(editor)
+	saved = []
+	editor.saved.connect(saved.append)
+	questions = []
+	def answer_no(*args):
+		questions.append(args)
+		return QMessageBox.StandardButton.No
+	monkeypatch.setattr(QMessageBox, "question", answer_no)
+	editor._save()
+	assert questions
+	assert not saved
+	assert "SHA-256" in questions[-1][2]
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+	editor._save()
+	assert len(saved) == 1
+	assert len(saved[0].ai_module_sha256) == 64
+	assert "ai_module_sha256" not in editor.controls

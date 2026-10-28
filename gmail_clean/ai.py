@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.util
 import json
 import math
@@ -17,6 +18,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import threading
 import time
@@ -73,6 +75,47 @@ class AIError(RuntimeError):
 
 	def to_dict(self) -> dict[str, Any]:
 		return {"category": self.category, "summary": self.summary, "exception_class": self.exception_class, "exception_module": self.exception_module, "request_id": self.request_id, "configuration": self.configuration, "transient": self.transient, "interrupted": self.interrupted}
+
+
+def module_trust_details(location: str) -> dict[str, Any]:
+	"""Inspect source without importing the module or executing parent packages.
+
+	The fingerprint covers the entry source, not dependencies or a Python sandbox.
+	An external provider runs with the current user's full operating-system access.
+	"""
+	try:
+		if location.endswith(".py") or "/" in location or "\\" in location:
+			path = Path(location).expanduser().resolve()
+		else:
+			search_path = None
+			parts = location.split(".")
+			for index in range(len(parts)):
+				spec = importlib.machinery.PathFinder.find_spec(".".join(parts[:index + 1]), search_path)
+				if spec is None:
+					raise ValueError("No module source")
+				search_path = spec.submodule_search_locations
+			path = Path(spec.origin or "").resolve()
+		if not path.is_file() or path.suffix.lower() != ".py":
+			raise ValueError("No Python source")
+		fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+		warnings = []
+		if os.name == "nt":
+			warnings.append("Windows ACL write permissions are not verified; choose a source folder that other users cannot modify.")
+		else:
+			if any(item.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH) for item in (path, *path.parents)):
+				warnings.append("The module or a containing folder is writable by other users; they may replace executable provider code.")
+		return {"path": str(path), "sha256": fingerprint, "warnings": warnings}
+	except (OSError, ValueError, AttributeError) as exc:
+		raise AIError("ConfigurationError", "The external AI module source cannot be inspected. Choose an accessible Python source file or installed source package.") from exc
+
+
+def verify_module_trust(location: str, expected_sha256: str) -> dict[str, Any]:
+	info = module_trust_details(location)
+	if not expected_sha256:
+		raise AIError("ConfigurationError", "The external AI module has no approved SHA-256 fingerprint. Review and save its configuration before execution.")
+	if info["sha256"] != expected_sha256:
+		raise AIError("ConfigurationError", "The external AI module changed since its SHA-256 was approved. Review the source and explicitly approve it in settings before execution.")
+	return info
 
 
 @dataclass(frozen=True)
@@ -310,7 +353,7 @@ def _error_packet(exc: BaseException, exports: dict[str, Any] | None = None, cat
 	return {"category": category, "summary": _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"]), "exception_class": type(exc).__name__, "exception_module": type(exc).__module__}
 
 
-def _load_module(location: str) -> Any:
+def _load_module(location: str, expected_sha256: str = "") -> Any:
 	if location.lower().endswith(".py") or os.path.sep in location or (os.path.altsep and os.path.altsep in location):
 		path = Path(location).expanduser().resolve()
 		if not path.is_file() or path.suffix.lower() != ".py":
@@ -322,8 +365,13 @@ def _load_module(location: str) -> Any:
 		module = importlib.util.module_from_spec(spec)
 		sys.modules[name] = module
 		try:
-			spec.loader.exec_module(module)
-		except BaseException:
+			source = path.read_bytes()
+			if expected_sha256 and hashlib.sha256(source).hexdigest() != expected_sha256:
+				raise AIError("ConfigurationError", "The external AI module changed before execution; review and approve its SHA-256 again.")
+			# Compile the exact approved bytes; a stale or replaced pyc is not a
+			# substitute for the source the user reviewed.
+			exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102 - Explicitly approved provider code executes only inside the isolated child.
+		except BaseException:  # noqa: BLE001 - Roll back module registration even for SystemExit, then re-raise.
 			sys.modules.pop(name, None)
 			raise
 	else:
@@ -333,14 +381,16 @@ def _load_module(location: str) -> Any:
 	return module
 
 
-def _worker_main(connection: Any, location: str, environment: dict[str, str]) -> None:
+def _worker_main(connection: Any, location: str, environment: dict[str, str], expected_sha256: str = "") -> None:
 	"""Spawn-safe target. Intentionally receives no store, Qt object, or connection."""
 	try:
 		os.environ.update(environment)
-		module = _load_module(location)
+		if expected_sha256:
+			verify_module_trust(location, expected_sha256)
+		module = _load_module(location, expected_sha256)
 		exports = _exception_exports(module)
 		connection.send({"kind": "ready", "pid": os.getpid(), "supports_result": callable(getattr(module, "call_api_result", None))})
-	except BaseException as exc:
+	except BaseException as exc:  # noqa: BLE001 - Untrusted module initialization may raise SystemExit; report safe child failure.
 		connection.send({"kind": "error", "error": _error_packet(exc, category="ImportInitializationError")})
 		connection.close()
 		return
@@ -381,7 +431,7 @@ def _worker_main(connection: Any, location: str, environment: dict[str, str]) ->
 					connection.send({"kind": "error", "id": request_id, "error": {"category": "APIResponseError", "summary": "The AI response exceeded the bounded response size.", "exception_class": "ResponseTooLarge", "exception_module": __name__}})
 					continue
 				connection.send({"kind": "response", "id": request_id, "text": text, "metadata": metadata})
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - Provider exception identities are classified and raw content is withheld.
 				connection.send({"kind": "error", "id": request_id, "error": _error_packet(exc, exports)})
 	except (EOFError, BrokenPipeError, OSError):
 		# Parent shutdown is a normal local lifecycle event, not a provider success.
@@ -398,7 +448,7 @@ class AIClient:
 	retry occurs here: durable scheduling belongs to the caller's job ledger.
 	"""
 
-	def __init__(self, module_location: str, model: str = "", use_call_api_result: bool = False, timeout_s: float = 120, environment: dict[str, str] | None = None):
+	def __init__(self, module_location: str, model: str = "", use_call_api_result: bool = False, timeout_s: float = 120, environment: dict[str, str] | None = None, expected_sha256: str | None = None):
 		if not isinstance(module_location, str) or not module_location.strip():
 			raise AIError("ConfigurationError", "Configure the external AI module package or standalone .py path.")
 		if not isinstance(model, str):
@@ -406,6 +456,9 @@ class AIClient:
 		if not isinstance(timeout_s, (int, float)) or timeout_s <= 0 or not math.isfinite(timeout_s):
 			raise ValueError("The local AI watchdog must be a positive finite duration")
 		self.module_location = module_location
+		# Constructing a standalone client is its explicit configuration boundary.
+		# The application passes the separately persisted, user-approved value.
+		self.expected_sha256 = ("" if module_location == "gmail_clean.demo_ai" else module_trust_details(module_location)["sha256"]) if expected_sha256 is None else expected_sha256
 		self.model = model if model.strip() else ""
 		self.use_call_api_result = bool(use_call_api_result)
 		self.timeout_s = float(timeout_s)
@@ -452,14 +505,14 @@ class AIClient:
 				child.close()
 				raise AIError("InterruptedRequest")
 			self._connection = parent
-			self._process = context.Process(target=_worker_main, args=(child, self.module_location, self.environment), name="GmailCleanerAI")
+			self._process = context.Process(target=_worker_main, args=(child, self.module_location, self.environment, self.expected_sha256), name="GmailCleanerAI")
 			try:
 				self._process.start()
 				# Unused clients hold no exit hook. A started child's hook is removed
 				# as soon as it is closed, timed out, or explicitly abandoned.
 				atexit.register(self.close)
 				self._atexit_registered = True
-			except BaseException:
+			except BaseException:  # noqa: BLE001 - Clean up IPC if spawn is interrupted, then preserve the original failure.
 				parent.close()
 				self._connection = None
 				self._process = None
@@ -485,6 +538,8 @@ class AIClient:
 				raise AIError("Paused")
 			if self._closing.is_set():
 				raise AIError("InterruptedRequest", "The AI client is closed. Create or restart the worker before requesting more work.")
+			if self.module_location != "gmail_clean.demo_ai" or self.expected_sha256:
+				verify_module_trust(self.module_location, self.expected_sha256)
 			self._ensure_worker()
 			request_id = uuid4().hex
 			self.request_state = "running"
