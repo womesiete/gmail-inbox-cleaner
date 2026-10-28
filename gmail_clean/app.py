@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .domain import Config, as_utc, content_hash
+from .domain import Config, content_hash
 from .runtime import data_directory, utc_now
 from .service import AppService
 from .storage import Store
@@ -64,32 +64,31 @@ def benchmark(count: int, directory: Path) -> dict:
 	return result
 
 
-def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep=time.sleep):
-	"""Resume persisted transient retries without changing the stage-run contract.
+def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep=time.sleep, max_wait_seconds=300):
+	"""Resume durable operational retries within an interruptible wait budget.
 
-	Waits are short and interruptible. Authentication/configuration pauses and
-	failed items remain visible; only a waiting job's scheduled retries resume.
+	User pauses and authorization blocks require an explicit user action. Quota
+	resets outside this invocation's wait budget remain visible for a later run.
 	"""
 	summary = service.run_job(job_id, progress=progress, should_stop=should_stop)
-	while summary["state"] == "waiting":
-		current = service.store.one("SELECT state FROM jobs WHERE id=?", (job_id,))
-		if current and current["state"] != "waiting":
-			return service.jobs.summary(job_id)
+	waited = 0.0
+	while summary["state"] in {"waiting", "retry", "paused"}:
 		if should_stop and should_stop():
 			signal = should_stop()
 			service.control_job(job_id, signal if signal in {"paused", "stopped"} else "paused")
 			return service.jobs.summary(job_id)
-		row = service.store.one("SELECT MIN(next_attempt_utc) AS due,COUNT(*) AS count,"
-			"SUM(next_attempt_utc IS NULL) AS immediate FROM work_items WHERE job_id=? AND state='retry'", (job_id,))
-		if not row or not row["count"]:
-			break
-		delay = 0 if row["immediate"] else (as_utc(row["due"]) - service.clock()).total_seconds() if row["due"] else None
-		if delay is None:
-			break
+		due = service.jobs.retry_deadline(job_id)
+		if due is None:
+			return service.jobs.summary(job_id)
+		delay = max(0.0, (due - service.clock()).total_seconds())
+		if delay > max(0.0, max_wait_seconds - waited):
+			return service.jobs.summary(job_id)
 		if delay > 0:
 			if progress:
-				progress(f"Waiting for scheduled retry at {row['due']}")
-			sleep(min(delay, 30))
+				progress(f"Waiting for scheduled retry at {due.isoformat()}")
+			interval = min(delay, 30)
+			sleep(interval)
+			waited += interval
 			continue
 		summary = service.run_job(job_id, progress=progress, should_stop=should_stop)
 	return summary

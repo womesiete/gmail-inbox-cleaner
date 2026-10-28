@@ -304,15 +304,28 @@ class AppService:
 			return self.jobs.summary(job_id)
 		with self.execution_lease():
 			self.reload_config()
-			self.refresh_labels()
 			self.current_job_id = job_id
+			try:
+				self.refresh_labels()
+			except Exception as exc:
+				self.error("discovery", exc, job_id=job_id)
+				self.jobs.handle_exception(job_id, exc, self.config)
+				return self.jobs.summary(job_id)
 			return self.jobs.run(job_id, progress, should_stop)
 
 	def control_job(self, job_id, state):
 		state = {"pause": "paused", "resume": "pending", "stop": "stopped", "running": "pending"}.get(state, state)
 		if state not in {"paused", "pending", "stopped"}:
 			raise ValueError("Use pause, resume, or stop")
-		self.store.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job_id))
+		with self.store.transaction():
+			payload = self.jobs.payload(job_id)
+			if state == "pending":
+				for key in ("pause", "backoff", "system_retries"):
+					payload.pop(key, None)
+			else:
+				payload["pause"] = {"origin": "user", "kind": state, "reason": "Paused by the user" if state == "paused" else "Stopped by the user", "due": None}
+			self.jobs.save_payload(job_id, payload)
+			self.store.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job_id))
 		return state
 
 	def eligible(self, message, window):

@@ -899,7 +899,11 @@ class MainWindow(QMainWindow):
 			jobs = self._query("SELECT * FROM jobs WHERE id=?", (self.current_job_id,))
 			if jobs:
 				job = jobs[0]
-				self.job_status.setText(f"Job {job['id']} · {job['state']} · stage {job['stage']} · anchor {job['anchor_utc']}")
+				pause = json.loads(job.get("payload_json") or "{}").get("pause", {})
+				block = f" · {pause.get('kind', 'pause')}: {pause.get('reason', '')}" if pause else ""
+				if pause.get("due"):
+					block += f" · retry after {pause['due']}"
+				self.job_status.setText(f"Job {job['id']} · {job['state']} · stage {job['stage']} · anchor {job['anchor_utc']}" + block)
 				try:
 					from .domain import Window
 					window = Window.from_dict(json.loads(job["window_json"]))
@@ -939,19 +943,32 @@ class MainWindow(QMainWindow):
 		self._resume_due_retry()
 
 	def _resume_due_retry(self):
-		"""Resume durable retry work when its deadline arrives, never paused jobs."""
+		"""Resume due retries and system pauses while preserving user pauses."""
 		if self.tasks or self._running_job or self._closing:
 			return False
-		due = self._query("SELECT j.id FROM jobs j WHERE j.state IN ('waiting','retry') AND EXISTS "
-			"(SELECT 1 FROM work_items w WHERE w.job_id=j.id AND w.state='retry' "
-			"AND (w.next_attempt_utc IS NULL OR julianday(w.next_attempt_utc)<=julianday(?))) "
-			"ORDER BY CASE WHEN j.id=? THEN 0 ELSE 1 END,j.created_at LIMIT 1",
-			(datetime.now(UTC).isoformat(), self.current_job_id))
-		if not due:
-			return False
-		self.current_job_id = due[0]["id"]
-		self.resume_job(self.current_job_id)
-		return True
+		candidates = self._query("SELECT j.id,j.state,j.payload_json,"
+			"(SELECT MIN(w.next_attempt_utc) FROM work_items w WHERE w.job_id=j.id AND w.state='retry') due,"
+			"EXISTS(SELECT 1 FROM work_items w WHERE w.job_id=j.id AND w.state='retry' AND w.next_attempt_utc IS NULL) immediate "
+			"FROM jobs j WHERE j.state IN ('waiting','retry','paused') "
+			"ORDER BY CASE WHEN j.id=? THEN 0 ELSE 1 END,j.created_at", (self.current_job_id,))
+		now = datetime.now(UTC)
+		for candidate in candidates:
+			payload = json.loads(candidate.get("payload_json") or "{}")
+			if candidate["state"] == "paused":
+				pause = payload.get("pause", {})
+				if pause.get("origin") != "system" or not pause.get("due"):
+					continue
+				due = pause["due"]
+			else:
+				due = payload.get("backoff", {}).get("due") or candidate.get("due")
+				if not due and not candidate.get("immediate"):
+					continue
+			if due and datetime.fromisoformat(due.replace("Z", "+00:00")) > now:
+				continue
+			self.current_job_id = candidate["id"]
+			self.resume_job(self.current_job_id)
+			return True
+		return False
 
 	def _submit(self, title, operation, callback=None, *, pool=None):
 		if self._closing:

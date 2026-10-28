@@ -213,3 +213,42 @@ raise SystemExit(app.main())
 	assert result.returncode == 0, result.stderr
 	notice = tmp_path / "demo" / "shutdown-notice.log"
 	assert "unfinished network work" in notice.read_text(encoding="utf-8")
+
+
+def test_headless_recovers_system_discovery_pause_with_bounded_backoff(tmp_path):
+	clock = Clock()
+	service = AppService(demo=True, count=4, data_dir=tmp_path, clock=clock, config=Config(max_retries=2))
+	try:
+		service.mailbox.inject_error("list", GmailError("network", "Synthetic discovery interruption"))
+		job = service.new_job()
+		result = run_until_settled(service, job, sleep=clock.sleep)
+		assert result["state"] == "completed"
+		assert clock.waits and sum(clock.waits) < 300
+	finally:
+		service.close()
+
+
+def test_headless_system_discovery_retries_stop_at_job_budget(tmp_path):
+	clock = Clock()
+	service = AppService(demo=True, count=4, data_dir=tmp_path, clock=clock, config=Config(max_retries=1))
+	try:
+		for _ in range(4):
+			service.mailbox.inject_error("list", GmailError("network", "Synthetic persistent interruption"))
+		job = service.new_job()
+		result = run_until_settled(service, job, sleep=clock.sleep)
+		pause = service.jobs.payload(job)["pause"]
+		assert result["state"] == "paused" and pause["origin"] == "system"
+		assert pause["due"] is None and pause["attempts"] == 2
+		assert clock.waits and sum(clock.waits) < 300
+	finally:
+		service.close()
+
+
+def test_user_pause_origin_is_persisted_and_never_auto_resumed(tmp_path):
+	service = AppService(demo=True, count=4, data_dir=tmp_path)
+	try:
+		job = service.new_job()
+		service.control_job(job, "paused")
+		assert service.jobs.payload(job)["pause"]["origin"] == "user"
+	finally:
+		service.close()

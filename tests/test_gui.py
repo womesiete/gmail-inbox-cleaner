@@ -451,3 +451,18 @@ def test_switching_simulation_off_in_settings_keeps_reviewed_action_ids(qtbot, s
 	config = Config.from_dict({**service.config.to_dict(), "dry_run": False})
 	window._save_settings(config)
 	assert replanned == []
+
+
+def test_retry_refresh_resumes_due_system_pause_and_surfaces_block_reason(qapp, qtbot, service, tmp_path, monkeypatch):
+	import json
+	window = MainWindow(service, QSettings(str(tmp_path / "system-retry.ini"), QSettings.Format.IniFormat))
+	qtbot.addWidget(window)
+	payload = {"pause": {"origin": "system", "kind": "network", "reason": "Network recovery pending", "due": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()}}
+	service.store.execute("INSERT INTO jobs(id,state,payload_json) VALUES('system','paused',?)", (json.dumps(payload),))
+	window.current_job_id = "system"
+	resumed = []
+	monkeypatch.setattr(window, "resume_job", lambda job_id=None: resumed.append(job_id))
+	window.refresh(force=True)
+	assert resumed == ["system"]
+	assert "Network recovery pending" in window.job_status.text()
+	window.close()

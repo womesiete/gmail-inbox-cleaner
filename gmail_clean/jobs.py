@@ -64,6 +64,9 @@ class JobRunner:
 		signal = should_stop() if callable(should_stop) else False
 		if signal:
 			state = signal if signal in {"paused", "stopped"} else "paused"
+			payload = self.payload(job)
+			payload["pause"] = {"origin": "user", "kind": state, "reason": "Paused by the user", "due": None}
+			self.save_payload(job, payload)
 			self.db.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job))
 			return True
 		return False
@@ -180,6 +183,9 @@ class JobRunner:
 		backoff = json.loads(row["payload_json"]).get("backoff", {})
 		if row["state"] == "waiting" and backoff.get("due") and datetime.fromisoformat(backoff["due"]) > self.s.clock():
 			return self.summary(job)
+		payload = json.loads(row["payload_json"])
+		payload.pop("pause", None)
+		self.save_payload(job, payload)
 		window = Window.from_dict(json.loads(row["window_json"]))
 		config = Config.from_dict(json.loads(row["config_json"]))
 		# Recovered running items were never acknowledged; stages are idempotent.
@@ -193,6 +199,10 @@ class JobRunner:
 				self.db.execute("UPDATE jobs SET stage=?,updated_at=? WHERE id=?", (stage, stamp(), job))
 				if not self.process_stage(job, stage, window, config, progress, should_stop):
 					return self.summary(job)
+			payload = self.payload(job)
+			for key in ("pause", "backoff", "system_retries"):
+				payload.pop(key, None)
+			self.save_payload(job, payload)
 			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
 			self.set_checkpoint("boundary_latest", window.to_dict()["latest_exclusive"])
 			self.set_checkpoint("boundary_window", {"earliest_date": config.earliest_date, "latest_mode": config.latest_mode, "latest_days": config.latest_days, "latest_date": config.latest_date, "timezone": config.timezone})
@@ -205,7 +215,7 @@ class JobRunner:
 				self.s.apply_actions(job_id=job, should_stop=should_stop)
 		except Exception as exc:
 			self.s.error("job", exc, job_id=job)
-			self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(), job))
+			self.handle_exception(job, exc, config)
 			if progress:
 				progress("Paused: " + safe_error(exc))
 		return self.summary(job)
@@ -648,9 +658,51 @@ class JobRunner:
 	def done(self, job: str, mid: str, stage: str) -> None:
 		self.db.execute("UPDATE work_items SET state='completed',error='',next_attempt_utc=NULL WHERE job_id=? AND message_id=? AND stage=?", (job, mid, stage))
 
-	def pause_system(self, job: str, kind: str, reason: str, *, due=None) -> None:
+	def retry_deadline(self, job: str):
+		"""Return an automatic retry deadline; user pauses never have one."""
+		row = self.db.one("SELECT state,payload_json FROM jobs WHERE id=?", (job,))
+		if not row:
+			return None
+		payload = json.loads(row["payload_json"])
+		if row["state"] == "paused":
+			pause = payload.get("pause", {})
+			return datetime.fromisoformat(pause["due"]) if pause.get("origin") == "system" and pause.get("due") else None
+		if row["state"] not in {"waiting", "retry"}:
+			return None
+		backoff = payload.get("backoff", {})
+		if backoff.get("due"):
+			return datetime.fromisoformat(backoff["due"])
+		work = self.db.one("SELECT MIN(next_attempt_utc) due,COUNT(*) n,SUM(next_attempt_utc IS NULL) immediate FROM work_items WHERE job_id=? AND state='retry'", (job,))
+		if not work or not work["n"]:
+			return None
+		return self.s.clock() if work["immediate"] else datetime.fromisoformat(work["due"]) if work["due"] else None
+
+	def handle_exception(self, job: str, exc: Exception, config: Config) -> None:
+		"""Keep operational pauses distinct from the user's explicit pause."""
+		kind = getattr(exc, "kind", "") or ("rate_limit" if getattr(exc, "category", "") == "RateLimitError" else "network")
+		if getattr(exc, "configuration", False):
+			kind = "configuration"
+		reason = safe_error(exc)
+		if kind in {"auth", "permission", "account", "configuration", "data"}:
+			self.pause_system(job, kind, reason)
+			return
+		if kind == "quota":
+			now = self.s.clock()
+			reset = float(getattr(exc, "retry_after", 0) or 0)
+			due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+			self.pause_system(job, kind, reason, due=due)
+			return
 		payload = self.payload(job)
-		payload["pause"] = {"origin": "system", "kind": kind, "reason": reason, "due": due}
+		attempt = int(payload.get("system_retries", 0)) + 1
+		payload["system_retries"] = attempt
+		self.save_payload(job, payload)
+		delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())
+		due = stamp(self.s.clock() + timedelta(seconds=delay)) if attempt <= config.max_retries else None
+		self.pause_system(job, kind, reason, due=due, attempts=attempt)
+
+	def pause_system(self, job: str, kind: str, reason: str, *, due=None, attempts=0) -> None:
+		payload = self.payload(job)
+		payload["pause"] = {"origin": "system", "kind": kind, "reason": reason, "due": due, "attempts": attempts}
 		self.save_payload(job, payload)
 		self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(self.s.clock()), job))
 
@@ -658,7 +710,7 @@ class JobRunner:
 		current = self.db.one("SELECT state,attempts FROM work_items WHERE id=?", (row["id"],))
 		if not current or current["state"] == "completed":
 			return
-		kind = getattr(exc, "kind", "")
+		kind = getattr(exc, "kind", "") or ("rate_limit" if getattr(exc, "category", "") == "RateLimitError" else "")
 		if getattr(exc, "configuration", False):
 			kind = "configuration"
 		if kind == "missing":
@@ -710,4 +762,7 @@ class JobRunner:
 			result[row["state"]] = row["n"]
 		state = self.db.one("SELECT state,stage FROM jobs WHERE id=?", (job,))
 		result.update(state or {})
+		pause = self.payload(job).get("pause")
+		if pause:
+			result["pause"] = pause
 		return result
