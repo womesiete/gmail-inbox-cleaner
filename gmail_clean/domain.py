@@ -9,6 +9,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
@@ -109,6 +110,10 @@ class Config:
 	shortcuts: dict[str, str] = field(default_factory=dict)
 	optional_model_routes: dict[str, str] = field(default_factory=dict)
 	estimated_cost_per_call: float = 0.0
+	max_ai_calls_per_job: int = 5000
+	max_ai_calls_per_day: int = 10000
+	max_ai_cost_per_job: float = 0.0
+	max_ai_cost_per_day: float = 0.0
 	extras: dict[str, Any] = field(default_factory=dict)
 
 	@classmethod
@@ -125,7 +130,7 @@ class Config:
 	def revision(self) -> str:
 		"""Execution-relevant revision; layout/logging changes do not stale plans."""
 		value = self.to_dict()
-		for key in ("dry_run", "max_actions_per_run", "shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras"):
+		for key in ("dry_run", "max_actions_per_run", "shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras", "max_ai_calls_per_job", "max_ai_calls_per_day", "max_ai_cost_per_job", "max_ai_cost_per_day"):
 			value.pop(key, None)
 		return canonical_hash(value)
 
@@ -138,9 +143,13 @@ class Config:
 			raise ValueError("Choose a valid IANA policy timezone") from exc
 		if self.latest_mode not in {"rolling", "fixed"}:
 			raise ValueError("Latest mode must be rolling or fixed")
-		for name in ("latest_days", "age_months", "age_days", "max_retries", "retention_days", "max_actions_per_run"):
+		for name in ("latest_days", "age_months", "age_days", "max_retries", "retention_days", "max_actions_per_run", "max_ai_calls_per_job", "max_ai_calls_per_day"):
 			if type(getattr(self, name)) is not int or getattr(self, name) < 0:
 				raise ValueError(f"{name} must be a non-negative integer")
+		for name in ("estimated_cost_per_call", "max_ai_cost_per_job", "max_ai_cost_per_day"):
+			value = getattr(self, name)
+			if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+				raise ValueError(f"{name} must be a finite non-negative amount")
 		if not 0 <= self.archive_threshold < self.keep_threshold <= 100:
 			raise ValueError("Require 0 <= archive threshold < keep threshold <= 100")
 		if not 0 <= self.age_archive_max_score <= 100:

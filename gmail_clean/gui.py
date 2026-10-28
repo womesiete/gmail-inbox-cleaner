@@ -314,7 +314,7 @@ class SettingsEditor(QWidget):
 		("Archival policy", ["age_enabled", "age_months", "age_days", "category_age_overrides", "archive_threshold", "keep_threshold", "age_archive_max_score"]),
 		("Protection and labels", ["protect_starred", "protected_senders", "protected_domains", "protected_label_ids", "label_meanings"]),
 		("Execution and learning", ["dry_run", "auto_execute", "auto_label", "learning_enabled"]),
-		("External AI", ["ai_module", "ai_model", "ai_use_call_api_result", "ai_batch_size", "ai_timeout_seconds", "optional_model_routes", "estimated_cost_per_call"]),
+		("External AI", ["ai_module", "ai_model", "ai_use_call_api_result", "ai_batch_size", "ai_timeout_seconds", "optional_model_routes", "estimated_cost_per_call", "max_ai_calls_per_job", "max_ai_calls_per_day", "max_ai_cost_per_job", "max_ai_cost_per_day"]),
 		("Content sharing and context", ["excluded_senders", "excluded_domains", "excluded_label_ids", "sent_context_enabled", "archived_context_enabled", "download_all_bodies", "body_limit"]),
 		("Jobs and local data", ["retrieval_batch_size", "execution_batch_size", "max_retries", "retry_base_seconds", "maintenance_interval_minutes", "reconciliation_interval_hours", "retention_days", "log_level", "shortcuts"]),
 	]
@@ -335,6 +335,11 @@ class SettingsEditor(QWidget):
 		"excluded_label_ids": "Do not share content · label IDs", "label_meanings": "Label ID → protected/reference/neutral · JSON",
 		"protected_label_ids": "Protect existing label IDs", "protected_senders": "Protect sender addresses", "protected_domains": "Protect sender domains",
 		"shortcuts": "Review shortcuts · action → key sequence JSON", "maintenance_interval_minutes": "Optional in-app maintenance interval · minutes",
+		"max_ai_calls_per_job": "AI calls per job cap · 0 = unlimited",
+		"max_ai_calls_per_day": "AI calls per UTC day cap · 0 = unlimited",
+		"max_ai_cost_per_job": "Estimated AI cost per job cap · 0 = unlimited",
+		"max_ai_cost_per_day": "Estimated AI cost per UTC day cap · 0 = unlimited",
+		"estimated_cost_per_call": "Estimated cost per attempted AI call",
 		"body_limit": "Maximum normalized body characters", "retention_days": "Body-cache retention · days",
 	}
 
@@ -955,6 +960,10 @@ class MainWindow(QMainWindow):
 			if self.service.config.estimated_cost_per_call > 0 and pending_ai:
 				batches = (pending_ai + self.service.config.ai_batch_size - 1) // self.service.config.ai_batch_size
 				details += f"\nSimple batch cost estimate: {batches} remaining prompt batches × configured estimate = ${batches * self.service.config.estimated_cost_per_call:.4f}; routing/retries can differ. Actual usage is unavailable."
+			if jobs:
+				usage = json.loads(jobs[0].get("payload_json") or "{}").get("ai_usage", {})
+				if usage:
+					details += f"\nAI reserved usage: {usage.get('calls', 0)} calls · ${usage.get('estimated_cost', 0):.4f} estimated. Failed/interrupted calls count toward caps."
 			self.stage_counts.setText(details)
 		counts = self._query("SELECT state,action,COUNT(*) n FROM actions WHERE undo_of IS NULL GROUP BY state,action")
 		self.plan_summary.setText("Proposals / receipts · " + " · ".join(f"{r['action']} {r['state']}: {r['n']}" for r in counts))

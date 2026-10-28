@@ -813,3 +813,68 @@ def test_history_expiring_during_listing_forces_next_metadata_refresh(service, m
 	_, _, result = run_new(service)
 	assert result["state"] == "completed"
 	assert "old" in service.mailbox.metadata_fetches
+
+
+@pytest.mark.parametrize("limits,expected", [
+	({"max_ai_calls_per_job": 1}, "ai_budget_job"),
+	({"max_ai_calls_per_day": 1}, "ai_budget_daily"),
+	({"max_ai_cost_per_job": 0.15, "estimated_cost_per_call": 0.1}, "ai_budget_job"),
+	({"max_ai_cost_per_day": 0.15, "estimated_cost_per_call": 0.1}, "ai_budget_daily"),
+])
+def test_ai_spending_caps_pause_before_an_extra_billable_call(service, limits, expected):
+	service.config = replace(service.config, **limits)
+	service.mailbox.messages = {str(i): mail(str(i)) for i in range(3)}
+	runner, job, result = run_new(service)
+	assert result["state"] == "paused" and result["failed"] == 0
+	assert len(service.ai.calls) == 1
+	assert runner.payload(job)["pause"]["kind"] == expected
+	assert runner.payload(job)["ai_usage"]["calls"] == 1
+	assert service.store.one("SELECT count(*) n FROM work_items WHERE stage='classification' AND state='pending'")["n"] == 2
+
+
+def test_ai_daily_cap_survives_jobs_and_resets_at_utc_day_boundary(service):
+	service.config.max_ai_calls_per_day = 1
+	service.mailbox.messages = {"old": mail()}
+	_, _, first = run_new(service)
+	assert first["state"] == "completed"
+	service.mailbox.messages["new"] = mail("new")
+	service.mailbox.events = [{"id": "101", "messagesAdded": [{"message": {"id": "new"}}]}]
+	runner, job, blocked = run_new(service)
+	assert blocked["state"] == "paused" and len(service.ai.calls) == 1
+	assert runner.retry_deadline(job) == (service.now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+	service.now += timedelta(days=1)
+	assert runner.run(job)["state"] == "completed"
+	assert len(service.ai.calls) == 2
+
+
+def test_failed_ai_calls_are_reserved_against_spending_caps(service):
+	service.config.max_ai_calls_per_job = 1
+	service.mailbox.messages = {"old": mail()}
+	service.ai.error = GmailError("network", "Synthetic billed failure")
+	runner, job, first = run_new(service)
+	assert first["state"] == "waiting" and len(service.ai.calls) == 1
+	service.now += timedelta(minutes=10)
+	second = runner.run(job)
+	assert second["state"] == "paused" and len(service.ai.calls) == 1
+	assert runner.payload(job)["ai_usage"]["calls"] == 1
+
+
+def test_inbox_membership_hash_change_reassesses_a_revisited_sibling(service):
+	service.mailbox.messages = {mid: mail(mid, thread="shared") for mid in ("a", "b")}
+	_, _, first = run_new(service)
+	assert first["state"] == "completed" and len(service.ai.calls) == 2
+	service.mailbox.messages["a"].labels.remove("INBOX")
+	service.mailbox.events = [{"id": "101", "labelsRemoved": [{"message": {"id": mid}, "labelIds": ["INBOX"]} for mid in ("a", "b")]}]
+	_, _, second = run_new(service)
+	assert second["state"] == "completed"
+	assert len(service.ai.calls) == 3
+	assert service.ai.calls[-1]["ids"] == ["b"]
+
+
+def test_cost_cap_requires_a_configured_estimate_before_any_ai_submission(service):
+	service.config.max_ai_cost_per_job = 1.0
+	service.mailbox.messages = {"old": mail()}
+	runner, job, result = run_new(service)
+	assert result["state"] == "paused" and not service.ai.calls
+	assert runner.payload(job)["pause"]["kind"] == "ai_budget_configuration"
+	assert "positive estimated cost" in result["pause"]["reason"]

@@ -6,7 +6,7 @@ import contextlib
 import json
 import random
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Callable
 
 from .ai import PROMPT_VERSION
@@ -596,6 +596,39 @@ class JobRunner:
 				category = "newsletter"
 		return category if category in config.optional_model_routes else ""
 
+	def reserve_ai_call(self, job: str, config: Config) -> bool:
+		"""Reserve estimated spend durably before a potentially billable request.
+
+		A crashed or failed call still counts: absence of a response does not prove
+		that the provider avoided billing it. Daily limits use explicit UTC days.
+		"""
+		now = self.s.clock().astimezone(UTC)
+		day_key = "ai_budget_daily:" + now.date().isoformat()
+		cost = config.estimated_cost_per_call
+		with self.db.transaction():
+			payload = self.payload(job)
+			usage = payload.get("ai_usage", {"calls": 0, "estimated_cost": 0.0})
+			daily = self.checkpoint(day_key, {"calls": 0, "estimated_cost": 0.0})
+			if (config.max_ai_cost_per_job or config.max_ai_cost_per_day) and cost <= 0:
+				self.pause_system(job, "ai_budget_configuration", "Set a positive estimated cost per call before using an AI cost cap")
+				return False
+			for scope, counts, calls_cap, cost_cap in (
+				("job", usage, config.max_ai_calls_per_job, config.max_ai_cost_per_job),
+				("daily", daily, config.max_ai_calls_per_day, config.max_ai_cost_per_day),
+			):
+				if ((calls_cap and counts["calls"] + 1 > calls_cap)
+					or (cost_cap and counts["estimated_cost"] + cost > cost_cap + 1e-9)):
+					due = stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)) if scope == "daily" else None
+					self.pause_system(job, "ai_budget_" + scope, f"AI {scope} spending cap reached; reserved {counts['calls']} calls and ${counts['estimated_cost']:.4f} estimated cost. Raise the cap explicitly or wait for the daily reset.", due=due)
+					return False
+			for counts in (usage, daily):
+				counts["calls"] += 1
+				counts["estimated_cost"] = round(counts["estimated_cost"] + cost, 10)
+			payload["ai_usage"] = usage
+			self.save_payload(job, payload)
+			self.set_checkpoint(day_key, daily)
+		return True
+
 	def classify(self, job: str, rows: list[dict], window: Window, config: Config) -> None:
 		pending = defaultdict(list)
 		try:
@@ -670,6 +703,9 @@ class JobRunner:
 					for context in self.s.context_messages(message, window, **context_options):
 						if window.contains(context.internal_ms) and resolve_window(self.s.config, window.anchor_utc).contains(context.internal_ms) and not self.excluded(context, config):
 							contexts[context.id] = context
+				if not self.reserve_ai_call(job, config):
+					self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND stage='classification' AND state='running'", (job,))
+					return
 				batch = self.s.ai_for(route).assess([p[1] for p in group], self.db.labels(), examples=examples, exclusions=exclusions, sent_context_enabled=config.sent_context_enabled, context_messages=list(contexts.values()))
 			except Exception as exc:
 				for row, _, _, _ in group:
@@ -812,7 +848,10 @@ class JobRunner:
 			result[row["state"]] = row["n"]
 		state = self.db.one("SELECT state,stage FROM jobs WHERE id=?", (job,))
 		result.update(state or {})
-		pause = self.payload(job).get("pause")
+		payload = self.payload(job)
+		if payload.get("ai_usage"):
+			result["ai_usage"] = payload["ai_usage"]
+		pause = payload.get("pause")
 		if pause:
 			result["pause"] = pause
 		return result
