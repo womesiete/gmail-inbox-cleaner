@@ -566,11 +566,30 @@ class AppService:
 	def error(self, stage, exc, job_id="", message_id=""):
 		insert(self.store, "errors", {"id": identifier(), "job_id": job_id, "message_id": message_id, "stage": stage, "kind": getattr(exc, "category", getattr(exc, "kind", type(exc).__name__)), "class_name": getattr(exc, "exception_class", type(exc).__name__), "summary": safe_error(exc), "created_at": stamp(), "payload_json": encode({"exception_module": getattr(exc, "exception_module", type(exc).__module__)})})
 
-	def retry_errors(self):
-		self.store.execute("UPDATE work_items SET state='pending',next_attempt_utc=NULL,error='' WHERE state IN ('failed','retry')")
-		self.store.execute("UPDATE errors SET state='retry_requested' WHERE state='open'")
-		self.store.execute("UPDATE jobs SET state='pending' WHERE state IN ('paused','waiting')")
-		return {"message": "Failed work queued; resume its job. Unknown writes reconcile before retry."}
+	def retry_errors(self, *, job_id=None, work_item_ids=None):
+		"""Reset explicitly scoped work without reviving a user-paused job."""
+		selection = sorted(set(work_item_ids or []))
+		if not job_id and not selection:
+			raise ValueError("Choose a job or work-item selection to retry")
+		with self.store.transaction():
+			rows = self.store.query("SELECT id,job_id,message_id,stage FROM work_items WHERE state IN ('failed','retry') "
+				"AND (? IS NULL OR job_id=?) AND (?='[]' OR id IN (SELECT value FROM json_each(?)))",
+				(job_id, job_id, encode(selection), encode(selection)))
+			jobs = {row["job_id"] for row in rows}
+			for row in rows:
+				self.store.execute("UPDATE work_items SET state='pending',attempts=0,next_attempt_utc=NULL,error='' WHERE id=?", (row["id"],))
+				self.store.execute("UPDATE errors SET state='retry_requested' WHERE state='open' AND job_id=? AND message_id=? AND stage=?", (row["job_id"], row["message_id"], row["stage"]))
+			for job in jobs:
+				current = self.store.one("SELECT state,payload_json FROM jobs WHERE id=?", (job,))
+				payload = json.loads(current["payload_json"])
+				pause = payload.get("pause", {})
+				if current["state"] == "stopped" or (current["state"] == "paused" and pause.get("origin") != "system"):
+					continue
+				for key in ("pause", "backoff", "system_retries"):
+					payload.pop(key, None)
+				self.jobs.save_payload(job, payload)
+				self.store.execute("UPDATE jobs SET state='pending' WHERE id=?", (job,))
+		return {"queued": len(rows), "jobs": len(jobs), "message": "Selected failed work queued with fresh attempts; user-paused jobs remain paused. Unknown writes reconcile before retry."}
 
 	def retention(self):
 		before = stamp(self.clock() - timedelta(days=self.config.retention_days))

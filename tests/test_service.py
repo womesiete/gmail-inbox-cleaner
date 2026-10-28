@@ -270,3 +270,38 @@ def test_demo_external_ai_is_rejected_before_import_or_execution(tmp_path):
 		assert service._clients == {}
 	finally:
 		service.close()
+
+
+def test_retry_errors_scopes_work_resets_attempts_and_preserves_user_pause(tmp_path):
+	service = make_service(tmp_path)
+	try:
+		first, other = service.new_job(), service.new_job()
+		for job in (first, other):
+			service.store.execute("INSERT INTO work_items(job_id,message_id,stage,state,attempts,error) VALUES(?,'m','body','failed',3,'old')", (job,))
+		service.control_job(first, "paused")
+		service.control_job(other, "paused")
+		result = service.retry_errors(job_id=first)
+		assert result["queued"] == 1
+		rows = {row["job_id"]: row for row in service.store.query("SELECT * FROM work_items")}
+		assert rows[first]["state"] == "pending" and rows[first]["attempts"] == 0
+		assert rows[other]["state"] == "failed" and rows[other]["attempts"] == 3
+		assert service.jobs.summary(first)["state"] == "paused"
+		assert service.jobs.summary(other)["state"] == "paused"
+		with pytest.raises(ValueError, match="job or work-item"):
+			service.retry_errors()
+	finally:
+		service.close()
+
+
+def test_retry_errors_selection_does_not_reset_other_rows(tmp_path):
+	service = make_service(tmp_path)
+	try:
+		job = service.new_job()
+		for mid in ("selected", "other"):
+			service.store.execute("INSERT INTO work_items(job_id,message_id,stage,state,attempts) VALUES(?,?,'metadata','retry',3)", (job, mid))
+		selected = service.store.one("SELECT id FROM work_items WHERE message_id='selected'")["id"]
+		service.retry_errors(work_item_ids=[selected])
+		assert service.store.one("SELECT attempts FROM work_items WHERE message_id='selected'")["attempts"] == 0
+		assert service.store.one("SELECT attempts FROM work_items WHERE message_id='other'")["attempts"] == 3
+	finally:
+		service.close()

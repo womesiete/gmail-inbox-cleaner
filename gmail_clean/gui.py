@@ -801,7 +801,7 @@ class MainWindow(QMainWindow):
 		self.error_search = QLineEdit(placeholderText="Filter stage, kind, state, or summary…")
 		self.error_search.textChanged.connect(self._filter_errors)
 		bar.addWidget(self.error_search, 1)
-		bar.addWidget(self._button("Retry eligible errors", lambda: self._submit("Retry errors", lambda svc, p: svc.retry_errors())))
+		bar.addWidget(self._button("Retry selected job errors", self._retry_job_errors))
 		layout.addLayout(bar)
 		layout.addWidget(self._table("errors", "SELECT id,job_id,message_id,stage,kind,class_name,summary,attempts,next_attempt_utc,state,created_at FROM errors",
 			[Column("created_at", "Observed (UTC)", 205), Column("stage", "Stage", 100), Column("kind", "Kind", 130),
@@ -941,6 +941,13 @@ class MainWindow(QMainWindow):
 		self.learning_summary.setText("Reviewed independent events · " + " · ".join(f"{r['action']}: {r['n']}" for r in metrics) +
 			". These counts measure explicit feedback; automatic decisions are not accuracy successes. Inferred archive rules require enablement.")
 		self._resume_due_retry()
+
+	def _retry_job_errors(self):
+		job_id = self.current_job_id
+		if not job_id:
+			self.statusBar().showMessage("Select a saved job before retrying its errors.")
+			return
+		self._submit("Retry selected job errors", lambda svc, p: svc.retry_errors(job_id=job_id))
 
 	def _resume_due_retry(self):
 		"""Resume due retries and system pauses while preserving user pauses."""
