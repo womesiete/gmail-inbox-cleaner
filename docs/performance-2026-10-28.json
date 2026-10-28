@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-28",
+  "environment": {
+    "os": "Linux",
+    "python": "3.12.14",
+    "shared_host": true
+  },
+  "baseline_commit": "1ff85fd1eab4b2e7d35f3067c95d4615d3e51734",
+  "verified_code_tree": "b77b171f42ef50e0c3efdc83d8b8d08759c1a7c8",
+  "demo_3000": {
+    "before_seconds": 27.5609,
+    "after_seconds": 21.638,
+    "completed_stage_items": 7844
+  },
+  "sql_50000": {
+    "before": {
+      "rows": 50000,
+      "seed_seconds": 7.898,
+      "first_page_seconds": 0.004736,
+      "last_page_seconds": 0.03797,
+      "cached_pages": 8,
+      "max_pages": 8
+    },
+    "after": {
+      "rows": 50000,
+      "seed_seconds": 8.2352,
+      "first_page_seconds": 0.005475,
+      "last_page_seconds": 0.052349,
+      "cached_pages": 8,
+      "max_pages": 8
+    },
+    "before_command_seconds": 9.1115,
+    "after_command_seconds": 9.5574
+  },
+  "job_50000": {
+    "ai_batch_size": 10,
+    "retrieval_batch_size": 50,
+    "before_seed_seconds": 2.9267,
+    "after_seed_seconds": 2.5864,
+    "before_job_seconds": 412.023,
+    "after_job_seconds": 259.3289,
+    "completed_stage_items": 130783,
+    "ai_calls_reserved_after": 4178,
+    "failed": 0,
+    "pending": 0,
+    "retry": 0
+  }
+}

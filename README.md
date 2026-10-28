@@ -67,3 +67,5 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 Linux/macOS use `.venv/bin/python` and `QT_QPA_PLATFORM=offscreen python -m pytest`. Tests use synthetic messages, temporary databases, and fake transports; they require no Gmail credentials or provider access. CI defines Windows and Linux jobs; a workflow definition is not a claim that hosted CI or Windows packaging has already passed.
 
 Google OAuth approval and the user's private AI module are deployment dependencies. The live Gmail adapter and isolated module adapter are separate from the synthetic demo; account access and real provider behavior require testing on the configured PC.
+
+Final offline checks and before/after timings: [validation and measurements](docs/performance-2026-10-28.md).

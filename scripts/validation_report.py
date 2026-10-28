@@ -38,7 +38,7 @@ Generated on {datetime.now(UTC).date().isoformat()} by `scripts/validation_repor
 | Pytest elapsed seconds | {elapsed:.2f} |
 | Application line coverage | {coverage_text} (gate: 75%) |
 
-The workflow also checks compilation, expanded Ruff rules, typed core modules, the offline pipeline, source/wheel builds, dependency auditing, and a Windows frozen-executable smoke test. The status reflects the generating job; consult the linked Actions run for individual check results. These tests use synthetic mail and fixture transports. No live Gmail or private AI performance is claimed. This report intentionally excludes test failure text, mail, settings, and credentials.
+The workflow also checks compilation, expanded Ruff rules, typed core modules, the offline pipeline, source/wheel builds, dependency auditing, and a Windows frozen-executable smoke test. The status reflects the generating job; consult the Actions run for individual check results. These tests use synthetic mail and fixture transports. No live Gmail or private AI performance is claimed. This report intentionally excludes test failure text, mail, settings, and credentials.
 """
 
 

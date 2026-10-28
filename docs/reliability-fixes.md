@@ -60,6 +60,6 @@ The supplied [second plan](history/reliability-plan-2.txt) is retained verbatim.
 | 25 | Actions are SHA-pinned; constraints, dependency audit, typed-core checks, expanded Ruff rules and Windows frozen smoke run in CI. | `test_release_policy.py`, [boundary review](integration-boundaries.md), CI checks. |
 | 26 | MIT license/author/URLs, cross-platform README, changelog, historical plans and generated CI validation records complete release metadata. | Metadata/report-generation regression and source/wheel inspection. |
 | 27 | GUI modules and per-stage job handlers are split after characterization; shared exclusion/history helpers retain behavior. | Characterization and full-suite regressions. |
-| 28 | Final suite, lint, package build, fresh 3,000-message demo and 50,000-message measurements record implementation evidence. | Final validation artifacts and benchmark records. |
+| 28 | Final suite, lint, package build, fresh 3,000-message demo and 50,000-message measurements record implementation evidence. | [Final checks and before/after measurements](performance-2026-10-28.md). |
 
 CI-generated [validation](validation.md) reports counts/status without failure payloads. Earlier manual measurements remain in [history](history/validation-2026-10-28.md). Synthetic timings and request/query counts are not live Gmail performance or AI-billing guarantees. Native frozen packaging results are claimed only when the corresponding hosted job passes.

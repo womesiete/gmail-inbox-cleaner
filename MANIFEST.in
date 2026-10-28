@@ -9,3 +9,4 @@ prune dist
 prune private_ai
 prune local_ai
 global-exclude __pycache__ *.py[cod] *.db *.sqlite *.sqlite3 *.log *.dpapi
+include docs/performance-2026-10-28.json
