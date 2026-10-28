@@ -200,7 +200,8 @@ def test_token_store_never_falls_back_to_plaintext(tmp_path, monkeypatch):
 	store.save(credentials)
 	assert store.path.read_bytes() == b"encrypted"
 	assert store.load() == {}
-	assert len(list(tmp_path.iterdir())) == 1
+	assert {path.name for path in tmp_path.iterdir()} == {"oauth.dpapi", "oauth.backend"}
+	assert store.backend_path.read_text() == "dpapi"
 
 
 def test_synthetic_generator_has_pre_2000_messages_and_mixed_sender_intent():
@@ -376,7 +377,8 @@ def test_protected_token_saves_use_distinct_temporary_files_and_cleanup_on_failu
 	barrier = threading.Barrier(2)
 	paths = []
 	def concurrent_replace(source, target):
-		paths.append(Path(source))
+		if Path(target) == store.path:
+			paths.append(Path(source))
 		original_replace(source, target)
 	monkeypatch.setattr(auth.os, "replace", concurrent_replace)
 	def save_token(token):

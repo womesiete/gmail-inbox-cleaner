@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import uuid
+import warnings
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ class TokenStore:
 		self.data_dir = Path(data_dir)
 		self.data_dir.mkdir(parents=True, exist_ok=True)
 		self.path = self.data_dir / "oauth.dpapi"
+		self.backend_path = self.data_dir / "oauth.backend"
 		self.user = "desktop-" + hashlib.sha256(str(self.data_dir.resolve()).encode()).hexdigest()[:20]
 
 	@staticmethod
@@ -81,10 +83,27 @@ class TokenStore:
 			ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 			ctypes.windll.kernel32.LocalFree(target.pbData)
 
+	@staticmethod
+	def payload(credential: Any) -> dict:
+		return {key: getattr(credential, key, None) for key in
+			("refresh_token", "token_uri", "client_id", "client_secret", "scopes")}
+
+	def _select_backend(self, name: str) -> None:
+		"""Persist only the selected backend name; this file contains no secrets."""
+		temporary = self.backend_path.with_name(f"{self.backend_path.name}.{uuid.uuid4().hex}.tmp")
+		try:
+			with temporary.open("x", encoding="ascii") as stream:
+				stream.write(name)
+				stream.flush()
+				os.fsync(stream.fileno())
+			os.chmod(temporary, 0o600)
+			os.replace(temporary, self.backend_path)
+		finally:
+			temporary.unlink(missing_ok=True)
+
 	@_serialized_credentials
 	def save(self, credential: Any) -> None:
-		payload = {key: getattr(credential, key, None) for key in
-			("refresh_token", "token_uri", "client_id", "client_secret", "scopes")}
+		payload = self.payload(credential)
 		if not payload["refresh_token"]:
 			raise AuthenticationError("Google did not return a refresh token; reconnect with consent.")
 		value = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
@@ -92,11 +111,12 @@ class TokenStore:
 			if len(value.encode("utf-16-le")) > 2560:
 				raise AuthenticationError("Credential exceeds Windows Credential Manager's compact payload limit.")
 			self._keyring().set_password(self.SERVICE, self.user, value)
-			self.path.unlink(missing_ok=True)
-			return
-		except Exception:
+		except Exception as keyring_error:
 			# There is deliberately no unencrypted-file fallback.
-			protected = self._dpapi(value.encode(), encrypt=True)
+			try:
+				protected = self._dpapi(value.encode(), encrypt=True)
+			except Exception:
+				raise AuthenticationError("The OS credential backend could not save authorization. Unlock or configure the protected keyring and reconnect.") from keyring_error
 			temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 			try:
 				with temporary.open("xb") as stream:
@@ -107,26 +127,45 @@ class TokenStore:
 				os.replace(temporary, self.path)
 			finally:
 				temporary.unlink(missing_ok=True)
+			self._select_backend("dpapi")
+		else:
+			self._select_backend("keyring")
+			self.path.unlink(missing_ok=True)
 
 	@_serialized_credentials
 	def load(self) -> dict | None:
-		if self.path.exists():
+		try:
+			backend = self.backend_path.read_text(encoding="ascii").strip()
+		except FileNotFoundError:
+			backend = ""
+		if backend not in {"", "keyring", "dpapi", "none"}:
+			raise AuthenticationError("The protected credential backend selection is invalid; reconnect.")
+		if backend == "none":
+			return None
+		# The marker is authoritative after a save. Legacy stores without a marker
+		# prefer the OS keyring so an abandoned DPAPI file cannot hide current data.
+		value = None
+		keyring_error = None
+		if backend != "dpapi":
+			try:
+				value = self._keyring().get_password(self.SERVICE, self.user)
+			except Exception as exc:
+				keyring_error = exc
+			if value is not None:
+				try:
+					return json.loads(value)
+				except (ValueError, TypeError) as exc:
+					raise AuthenticationError("Stored credentials are invalid; reconnect.") from exc
+		if backend == "dpapi" or (not backend and self.path.exists()):
 			try:
 				return json.loads(self._dpapi(self.path.read_bytes(), encrypt=False).decode())
 			except AuthenticationError:
 				raise
 			except Exception as exc:
 				raise AuthenticationError("Protected credentials could not be read. Reconnect this account.") from exc
-		try:
-			value = self._keyring().get_password(self.SERVICE, self.user)
-		except Exception:
-			return None
-		if value is None:
-			return None
-		try:
-			return json.loads(value)
-		except (ValueError, TypeError) as exc:
-			raise AuthenticationError("Stored credentials are invalid; reconnect.") from exc
+		if backend == "keyring" and keyring_error is not None:
+			raise AuthenticationError("The OS credential backend could not read authorization. Unlock the protected keyring and retry.") from keyring_error
+		return None
 
 	@_serialized_credentials
 	def delete(self) -> None:
@@ -138,6 +177,9 @@ class TokenStore:
 				self.path.unlink()
 		else:
 			self.path.unlink(missing_ok=True)
+		# An unavailable keyring may still contain an obsolete credential. Keep a
+		# non-secret tombstone so reconnect cannot silently revive that copy.
+		self._select_backend("none")
 
 
 class AuthManager:
@@ -192,7 +234,11 @@ class AuthManager:
 			if not credentials.valid:
 				credentials.refresh(Request())
 			box = self._mailbox(credentials)
-			self.tokens.save(credentials)
+			if self.tokens.payload(credentials) != payload:
+				try:
+					self.tokens.save(credentials)
+				except Exception:
+					warnings.warn("Gmail authorization refreshed, but changed credentials could not be saved. Unlock the credential backend or reconnect before restarting.", RuntimeWarning, stacklevel=2)
 			return box
 		except AuthenticationError:
 			raise
