@@ -640,3 +640,20 @@ def test_example_statistics_reuse_assessment_but_changed_prompt_text_reassesses(
 	_, _, changed_prompt = run_new(service)
 	assert changed_prompt["state"] == "completed"
 	assert len(service.ai.calls) == 2
+
+
+def test_classification_save_failure_retries_only_unresolved_item(service, monkeypatch):
+	service.config.ai_batch_size = 4
+	service.mailbox.messages = {str(i): mail(str(i)) for i in range(4)}
+	runner = JobRunner(service)
+	job = runner.new()
+	original = runner.save_recommendation
+	def save(*args, **kwargs):
+		if args[1].id == "2":
+			raise OSError("Synthetic third-item persistence failure")
+		return original(*args, **kwargs)
+	monkeypatch.setattr(runner, "save_recommendation", save)
+	runner.run(job)
+	states = {row["message_id"]: row["state"] for row in service.store.query("SELECT message_id,state FROM work_items WHERE stage='classification'")}
+	assert states == {"0": "completed", "1": "completed", "2": "retry", "3": "completed"}
+	assert len(service.ai.calls) == 1

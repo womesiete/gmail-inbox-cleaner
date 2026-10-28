@@ -603,18 +603,21 @@ class JobRunner:
 						if window.contains(context.internal_ms) and resolve_window(self.s.config, window.anchor_utc).contains(context.internal_ms) and not self.excluded(context, config):
 							contexts[context.id] = context
 				batch = self.s.ai_for(route).assess([p[1] for p in group], self.db.labels(), examples=examples, exclusions=exclusions, sent_context_enabled=config.sent_context_enabled, context_messages=list(contexts.values()))
-				for row, message, _, version in group:
-					assessment = batch.assessments.get(message.id)
-					if assessment is None:
-						raise_for = ValueError(batch.errors.get(message.id, "Missing assessment"))
-						self.fail(job, row, raise_for, config)
-						continue
-					decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-					telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
-					self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
-					self.done(job, message.id, "classification")
 			except Exception as exc:
 				for row, _, _, _ in group:
+					self.fail(job, row, exc, config)
+				continue
+			for row, message, _, version in group:
+				try:
+					assessment = batch.assessments.get(message.id)
+					if assessment is None:
+						raise ValueError(batch.errors.get(message.id, "Missing assessment"))
+					decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+					telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
+					with self.db.transaction():
+						self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
+						self.done(job, message.id, "classification")
+				except Exception as exc:
 					self.fail(job, row, exc, config)
 
 	def save_recommendation(self, job, message, assessment, action, reason, window, version="", telemetry=None, label_ids=None, approval="automatic"):
