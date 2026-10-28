@@ -2,7 +2,7 @@ Implement the complete project described below. Make reasonable implementation c
 1. PROJECT AND DELIVERABLES
 Build a personal Gmail inbox cleaning application named Gmail Inbox Cleaner, with Python package name gmail_clean.
 Required environment:
-Windows 10/11 PC, Python 3.11 or later, PyQt6, and a normal virtual environment suitable for PyCharm.
+Windows 10/11 PC, Python 3.11, PyQt6, and a normal virtual environment suitable for PyCharm.
 One personal Gmail account, accessed directly through the Gmail API using installed-desktop OAuth.
 Initial cleanup of tens of thousands of inbox messages, followed by incremental maintenance when the application is run. No processing is required while the PC or application is off.
 An existing user-provided local AI module, integrated through the exact contract in section 8.

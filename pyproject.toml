@@ -10,7 +10,7 @@ license-files = ["LICENSE"]
 authors = [{name = "Wilson Omesiete"}]
 description = "A local, reviewable Gmail inbox cleanup application with a separate offline demo"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 dependencies = [
 	"PyQt6>=6.6,<7",
 	"google-api-python-client>=2.100,<3",

@@ -1,6 +1,6 @@
 # Validation record
 
-Checks recorded on **2026-10-28**, using **Linux and Python 3.12** in a project virtual environment. Qt checks used an offscreen environment. These measurements describe the local synthetic workload on the implementation host; they are not Gmail/provider performance claims or measurements on the target Windows PC.
+Checks recorded on **2026-10-28**, using **Linux** in a project virtual environment. Qt checks used an offscreen environment. The historical interpreter version is omitted; these results do not validate the currently supported runtime. These measurements describe the local synthetic workload on the implementation host; they are not Gmail/provider performance claims or measurements on the target Windows PC.
 
 ## Checks executed
 
@@ -28,7 +28,7 @@ The follow-up correction adds:
 - A test wrapper that preserves failures, emits a bounded traceback annotation, and saves JUnit/output files. Failed hosted jobs upload these diagnostics. The wrapper's failure path was separately checked with an intentionally failing synthetic test.
 - Current Node24-based versions of the checkout, Python setup, and artifact actions. The original Node20 deprecation annotations were warnings, not evidence of the test failure's cause.
 
-The portability correction passed its 220-test local suite and [all four hosted Windows/Linux Python 3.11/3.12 jobs](https://github.com/womesiete/gmail-inbox-cleaner/actions/runs/40699101132). A local result alone does not establish hosted success.
+The portability correction passed its 220-test local suite and [all four historical hosted Windows/Linux jobs](https://github.com/womesiete/gmail-inbox-cleaner/actions/runs/40699101132). A local result alone does not establish hosted success.
 
 ## Reliability and performance follow-up
 

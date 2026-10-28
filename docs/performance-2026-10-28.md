@@ -1,6 +1,6 @@
 # Offline validation and measurements — 2026-10-28
 
-The 28-item reliability plan is implemented in separate item commits. Verification uses synthetic messages, fixture transports, and the built-in offline AI. No real mailbox or private AI provider was used. The machine was Linux / Python 3.12.14. The checked application code tree is `b77b171f42ef50e0c3efdc83d8b8d08759c1a7c8`; historical baseline commit is `1ff85fd1eab4b2e7d35f3067c95d4615d3e51734`.
+The 28-item reliability plan is implemented in separate item commits. Verification uses synthetic messages, fixture transports, and the built-in offline AI. No real mailbox or private AI provider was used. These historical measurements used a Linux implementation host; its interpreter version is omitted, and they do not validate the currently supported runtime. The checked application code tree is `b77b171f42ef50e0c3efdc83d8b8d08759c1a7c8`; historical baseline commit is `1ff85fd1eab4b2e7d35f3067c95d4615d3e51734`.
 
 ## Final checks
 

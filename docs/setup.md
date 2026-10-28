@@ -2,7 +2,7 @@
 
 ## Python, virtual environment, and PyCharm
 
-Use Windows 10/11 and Python 3.11 or later. A regular project virtual environment is supported; Conda and system-wide installation are unnecessary.
+Use Windows 10/11 and Python 3.11. A regular project virtual environment is supported; Conda and system-wide installation are unnecessary.
 
 ```powershell
 cd C:\Projects\gmail-inbox-cleaner

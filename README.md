@@ -6,7 +6,7 @@ The first run is a **simulation**. The application records proposals for inspect
 
 ## Try it without credentials
 
-Install Python 3.11 or later. In PowerShell from this directory:
+Install Python 3.11. In PowerShell from this directory:
 
 ```powershell
 py -3.11 -m venv .venv
