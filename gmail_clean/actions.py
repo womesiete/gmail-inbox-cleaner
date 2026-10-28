@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Callable
 
 from .domain import Message, Window, context_hash, precondition_hash, protections
-from .runtime import encode, identifier, insert, safe_error, stamp
+from .runtime import digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
 	from .service import AppService
@@ -166,11 +166,29 @@ class ActionExecutor:
 		current = self.db.one("SELECT state FROM actions WHERE id=?", (action["id"],))
 		return bool(current and current["state"] in {"queued", "proposed", "retry"})
 
-	def apply(self, action_ids=None, job_id=None, should_stop: Callable[[], bool] | None = None) -> dict:
+	def plan_snapshot(self, action_ids=None, job_id=None) -> dict:
+		"""Hash the exact reviewed target IDs and write intents, independent of simulation."""
+		where = "state IN ('queued','proposed','uncertain','executing','retry')"
+		params = []
+		if action_ids is not None:
+			if not action_ids:
+				return {"count": 0, "hash": digest([]), "action_ids": []}
+			where += f" AND id IN ({','.join('?' for _ in action_ids)})"
+			params.extend(action_ids)
+		if job_id:
+			where += " AND job_id=?"
+			params.append(job_id)
+		rows = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY id", params)
+		keys = ("id", "account_id", "job_id", "message_id", "action", "add_json", "remove_json", "before_json", "context_version", "precondition_version", "policy_version", "approval", "undo_of", "payload_json")
+		return {"count": len(rows), "hash": digest([{key: row[key] for key in keys} for row in rows]), "action_ids": [row["id"] for row in rows]}
+
+	def apply(self, action_ids=None, job_id=None, should_stop: Callable[[], bool] | None = None, *, expected_plan_hash: str | None = None) -> dict:
 		self._batch_identity_cache = True
 		self._identity_verified = False
 		self._should_stop = should_stop
 		try:
+			if expected_plan_hash is not None and self.plan_snapshot(action_ids, job_id)["hash"] != expected_plan_hash:
+				raise ValueError("The reviewed plan changed; inspect the count and hash again before execution")
 			return self._apply(action_ids, job_id)
 		finally:
 			# Neither another command nor a canceled/failed request may reuse stale

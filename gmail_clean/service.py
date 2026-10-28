@@ -467,10 +467,13 @@ class AppService:
 			self.apply_actions(result, should_stop=should_stop)
 		return result
 
-	def apply_actions(self, action_ids=None, job_id=None, should_stop=None):
+	def plan_snapshot(self, action_ids=None, job_id=None):
+		return self.actions.plan_snapshot(action_ids, job_id)
+
+	def apply_actions(self, action_ids=None, job_id=None, should_stop=None, *, expected_plan_hash=None):
 		with self.execution_lease():
 			self.reload_config()
-			return self.actions.apply(action_ids, job_id, should_stop=self._stop_callback(should_stop))
+			return self.actions.apply(action_ids, job_id, should_stop=self._stop_callback(should_stop), expected_plan_hash=expected_plan_hash)
 
 	def undo(self, action_ids, should_stop=None):
 		with self.execution_lease():

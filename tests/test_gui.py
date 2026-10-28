@@ -437,3 +437,17 @@ def test_preview_preserves_only_explicit_safe_link_attributes():
 	from bs4 import BeautifulSoup
 	clean = sanitize_preview_html('<a href="https://example.invalid/path" title="Open" target="_blank" style="color:red">Link</a>')
 	assert BeautifulSoup(clean, "html.parser").a.attrs == {"href": "https://example.invalid/path", "title": "Open"}
+
+
+def test_switching_simulation_off_in_settings_keeps_reviewed_action_ids(qtbot, service, monkeypatch):
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	replanned = []
+	def update_config(config):
+		service.config = config
+	monkeypatch.setattr(service, "update_config", update_config, raising=False)
+	monkeypatch.setattr(service, "replan", lambda **kwargs: replanned.append(True), raising=False)
+	monkeypatch.setattr(window, "_submit", lambda title, operation, done=None, **kwargs: operation(service, lambda value: None))
+	config = Config.from_dict({**service.config.to_dict(), "dry_run": False})
+	window._save_settings(config)
+	assert replanned == []

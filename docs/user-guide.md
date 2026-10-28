@@ -2,7 +2,7 @@
 
 ## Simulation and live actions
 
-Simulation is enabled by default. A job can discover messages, assess them, save feedback, and build an action ledger without changing Gmail. **Queued/proposed** does not mean **applied**. Inspect the target counts, exact dates, reasons, and exceptions in Plan before switching off simulation.
+Simulation is enabled by default. A job can discover messages, assess them, save feedback, and build an action ledger without changing Gmail. **Queued/proposed** does not mean **applied**. Inspect the target counts, exact dates, reasons, and exceptions in Plan before switching off simulation. Switching simulation off preserves the reviewed plan. Choose **Execute this plan** (or **Execute selected plan**) and confirm its exact action count and SHA-256 plan hash. If target IDs or write intents changed while the confirmation was open, execution refuses the old approval and requires another review.
 
 In live mode, an ordinary manual Archive or label command queues execution asynchronously; repeated confirmation dialogs are not part of the normal review flow. Direct selections apply only to the displayed explicit message IDs. The live executor still checks the account, scope, current protections, labels, context, and action versions. A setting change or new reply can make an approved proposal stale.
 

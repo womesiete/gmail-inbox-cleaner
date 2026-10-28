@@ -123,7 +123,7 @@ class Config:
 	def revision(self) -> str:
 		"""Execution-relevant revision; layout/logging changes do not stale plans."""
 		value = self.to_dict()
-		for key in ("shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras"):
+		for key in ("dry_run", "shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras"):
 			value.pop(key, None)
 		return canonical_hash(value)
 

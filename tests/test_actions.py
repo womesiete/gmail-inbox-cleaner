@@ -661,3 +661,33 @@ def test_enabled_keep_rule_edit_invalidates_already_loaded_automatic_archive(app
 	assert not app.mailbox.calls
 	assert not app.store.one("SELECT id FROM attempts")
 	assert all("INBOX" in item.labels for item in app.mailbox.messages.values())
+
+
+def test_simulation_toggle_preserves_reviewed_plan(app):
+	app.config.dry_run = True
+	aid = plan(app, seed(app))
+	reviewed_revision = app.config.revision
+	app.config.dry_run = False
+	assert app.config.revision == reviewed_revision
+	assert app.actions.apply([aid])["applied"] == 1
+
+
+def test_reviewed_plan_hash_rejects_changed_scope_before_network_write(app):
+	aid = plan(app, seed(app))
+	snapshot = app.actions.plan_snapshot()
+	assert snapshot["count"] == 1
+	assert len(snapshot["hash"]) == 64
+	plan(app, seed(app, "another"))
+	with pytest.raises(ValueError, match="reviewed plan changed"):
+		app.actions.apply(expected_plan_hash=snapshot["hash"])
+	assert not app.mailbox.calls
+	assert state(app, aid)["state"] == "queued"
+
+
+def test_reviewed_plan_hash_rejects_changed_delta(app):
+	aid = plan(app, seed(app))
+	snapshot = app.actions.plan_snapshot([aid])
+	app.store.execute("UPDATE actions SET add_json=? WHERE id=?", ('["Label_added"]', aid))
+	with pytest.raises(ValueError, match="reviewed plan changed"):
+		app.actions.apply([aid], expected_plan_hash=snapshot["hash"])
+	assert not app.mailbox.calls

@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
 	QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
 	QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
 	QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-	QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
+	QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
 	QScrollArea, QSpinBox, QSplitter, QStatusBar, QTabWidget,
 	QTableView, QTextBrowser, QVBoxLayout, QWidget)
 
@@ -711,8 +711,8 @@ class MainWindow(QMainWindow):
 		layout.addWidget(groups)
 		bar = QHBoxLayout()
 		bar.addWidget(self._button("Recompute recommendations", lambda: self._submit("Replan", lambda svc, p: svc.replan(should_stop=self.stop_event.is_set))))
-		bar.addWidget(self._button("Apply selected approved", lambda: self.apply_plan(False)))
-		bar.addWidget(self._button("Apply all approved", lambda: self.apply_plan(True)))
+		bar.addWidget(self._button("Execute selected plan", lambda: self.apply_plan(False)))
+		bar.addWidget(self._button("Execute this plan", lambda: self.apply_plan(True)))
 		bar.addWidget(self._button("Cancel selected / undo queued", lambda: self.undo_selected("plan")))
 		bar.addStretch()
 		self.plan_filter = QComboBox()
@@ -1307,8 +1307,13 @@ class MainWindow(QMainWindow):
 		ids = None if all_approved else self._selected_ids("plan")
 		if not all_approved and not ids:
 			return
-		self._submit("Applying approved plans" if not self.service.config.dry_run else "Simulating approved plans",
-			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set))
+		snapshot = self.service.plan_snapshot(action_ids=ids)
+		if not self.service.config.dry_run:
+			answer = QMessageBox.question(self, "Execute this plan", f"Execute this plan of {snapshot['count']} actions?\nPlan SHA-256: {snapshot['hash']}\nOnly these reviewed message IDs and label deltas are approved.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+			if answer != QMessageBox.StandardButton.Yes:
+				return
+		self._submit("Executing reviewed plan" if not self.service.config.dry_run else "Simulating approved plans",
+			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set, expected_plan_hash=snapshot["hash"]))
 
 	def _undo_scope_changed(self, *args):
 		self._describe_undo_scope(self._selected("history"))
@@ -1448,8 +1453,10 @@ class MainWindow(QMainWindow):
 
 	def _save_settings(self, config):
 		def operation(svc, progress):
+			previous_revision = svc.config.revision
 			svc.update_config(config)
-			svc.replan(should_stop=self.stop_event.is_set)
+			if previous_revision != config.revision:
+				svc.replan(should_stop=self.stop_event.is_set)
 			return config
 		def done(result):
 			self.service.config = result
