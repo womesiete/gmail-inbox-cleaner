@@ -691,3 +691,61 @@ def test_reviewed_plan_hash_rejects_changed_delta(app):
 	with pytest.raises(ValueError, match="reviewed plan changed"):
 		app.actions.apply([aid], expected_plan_hash=snapshot["hash"])
 	assert not app.mailbox.calls
+
+
+def test_definite_rejection_isolated_by_bisection_without_uncertain_writes(app):
+	from gmail_clean.gmail import GmailError
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(4)]
+	original_modify = app.mailbox.modify
+	requests = []
+	deleted = False
+	def modify(message_ids, add, remove):
+		nonlocal deleted
+		requests.append(list(message_ids))
+		if not deleted:
+			del app.mailbox.messages["m2"]
+			deleted = True
+		if "m2" in message_ids:
+			raise GmailError("missing", "Deleted synthetic target", status=404)
+		return original_modify(message_ids, add, remove)
+	app.mailbox.modify = modify
+	result = app.actions.apply(ids)
+	assert result["applied"] == 3
+	assert len(requests) > 1
+	assert state(app, ids[2])["state"] == "conflict"
+	assert all(state(app, aid)["state"] == "applied" for aid in ids if aid != ids[2])
+	assert not app.store.one("SELECT id FROM actions WHERE state='uncertain'")
+
+
+def test_recovery_uses_batched_metadata_readback(app):
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(4)]
+	app.mailbox.lose_response = True
+	app.actions.apply(ids)
+	assert all(state(app, aid)["state"] == "uncertain" for aid in ids)
+	bulk_calls = []
+	single_reads = []
+	original_get = app.mailbox.get_message
+	def get_messages(message_ids, body=False):
+		bulk_calls.append(list(message_ids))
+		return {mid: original_get(mid, body=body) for mid in message_ids}
+	def get_message(mid, body=False):
+		single_reads.append(mid)
+		return original_get(mid, body=body)
+	app.mailbox.get_messages = get_messages
+	app.mailbox.get_message = get_message
+	app.actions.apply(ids)
+	assert bulk_calls == [[f"m{i}" for i in range(4)]]
+	assert not single_reads
+	assert all(state(app, aid)["state"] == "reconciled" for aid in ids)
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409, 422, 429])
+def test_explicit_http_rejection_records_not_applied_instead_of_uncertain(app, status_code):
+	from gmail_clean.gmail import GmailError
+	aid = plan(app, seed(app))
+	def rejected(*args, **kwargs):
+		raise GmailError("data", "Synthetic explicit rejection", status=status_code)
+	app.mailbox.modify = rejected
+	app.actions.apply([aid])
+	assert state(app, aid)["state"] == ("conflict" if status_code in {400, 404, 422} else "retry")
+	assert app.store.one("SELECT state FROM attempts WHERE action_id=?", (aid,))["state"] == "not_applied"

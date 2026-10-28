@@ -220,13 +220,14 @@ class ActionExecutor:
 		actions = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY created_at,id", params)
 		groups = defaultdict(list)
 		applied = 0
-		self._prefetch([action["message_id"] for action in actions if action["state"] not in {"uncertain", "executing"}])
+		self._prefetch([action["message_id"] for action in actions])
+		recovery_checkpoint = self._checkpoint() if any(action["state"] in {"uncertain", "executing"} for action in actions) else None
 		for action in actions:
 			if self._stop_requested():
 				break
 			try:
 				if action["state"] in {"uncertain", "executing"}:
-					self.recover(action)
+					self.recover(action, end_history_id=recovery_checkpoint)
 					continue
 				message = self.preflight(action)
 				if message is None:
@@ -304,7 +305,34 @@ class ActionExecutor:
 						return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 					self.s.mailbox.modify([action["message_id"] for action, _ in ready], list(add), list(remove))
 				except Exception as exc:
-					# Even a lost response can follow a successful Gmail commit.
+					status = getattr(exc, "status", None)
+					if status is not None and 400 <= status < 500 and status != 408:
+						# An explicit rejection has no successful response to own. Cheap
+						# bulk readback distinguishes existing effects before any replay.
+						self._prefetch([action["message_id"] for action, _ in ready])
+						if status in {400, 404} and callable(getattr(self.s, "invalidate_labels", None)):
+							self.s.invalidate_labels()
+							self.s.refresh_labels()
+						retry_ids = []
+						with self.db.transaction():
+							for action, _ in ready:
+								self.db.execute("UPDATE attempts SET state='not_applied',error=?,finished_at=? WHERE action_id=? AND state='sending'", (safe_error(exc), stamp(), action["id"]))
+								observed = self._prefetched_messages.get(action["message_id"])
+								if observed is not None and set(add) <= observed.labels and not (set(remove) & observed.labels):
+									self.mark(action["id"], "satisfied", "Effects present after rejected request; no ownership claimed")
+								elif status in {400, 404, 422} and len(ready) == 1:
+									self.mark(action["id"], "conflict", "Gmail definitely rejected this target; inspect deleted IDs or invalid labels")
+								else:
+									self.mark(action["id"], "retry", "Gmail rejected the write; no uncertain attempt remains")
+									retry_ids.append(action["id"])
+						if status in {400, 404, 422} and len(ready) > 1 and retry_ids:
+							middle = max(1, len(retry_ids) // 2)
+							for subset in (retry_ids[:middle], retry_ids[middle:]):
+								if subset and not self._stop_requested():
+									applied += self._apply(subset)["applied"]
+						continue
+					# A lost response can follow a successful Gmail commit; only these
+					# transport/server outcomes require uncertain-write reconciliation.
 					for action, _ in ready:
 						self.mark(action["id"], "uncertain", "Write outcome unknown; reconcile before retry")
 						self.s.error("execution", exc, job_id=action["job_id"], message_id=action["message_id"])
@@ -420,13 +448,15 @@ class ActionExecutor:
 			if action["undo_of"]:
 				self.mark(action["undo_of"], "undone")
 
-	def recover(self, action):
+	def recover(self, action, *, end_history_id=None):
 		self.verify_identity()
-		message = self.s.mailbox.get_message(action["message_id"], body=False)
+		message = self._prefetched_messages.pop(action["message_id"], None)
+		if message is None:
+			message = self.s.mailbox.get_message(action["message_id"], body=False)
 		add, remove = set(json.loads(action["add_json"])), set(json.loads(action["remove_json"]))
 		if add <= message.labels and not (remove & message.labels):
 			before = self.db.get_message(message.id)
-			self.receipt(action, before, message, "reconciled", ownership="ambiguous_lost_response")
+			self.receipt(action, before, message, "reconciled", ownership="ambiguous_lost_response", end_history_id=end_history_id)
 		elif not (add & message.labels) and remove <= message.labels:
 			# The inverse state is observed. Replay is still subject to fresh preflight;
 			# do not make another call in the same recovery operation.
