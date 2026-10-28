@@ -14,7 +14,7 @@ from .ai import AIClient, AIError
 from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, eligible, protections, recommend, resolve_window
 from .jobs import JobRunner
 from .learning import Learning
-from .runtime import data_directory, digest, encode, identifier, insert, safe_error, stamp, utc_now
+from .runtime import data_directory, digest, encode, identifier, insert, path_lock, safe_error, stamp, utc_now
 from .storage import LeaseBusyError, Store
 
 
@@ -26,6 +26,7 @@ class AppService:
 		self.count = count
 		self.data_dir = Path(data_dir) if data_dir else data_directory(demo)
 		self.data_dir.mkdir(parents=True, exist_ok=True)
+		self._identity_lock = path_lock(self.data_dir / "account.json")
 		if os.name != "nt":
 			os.chmod(self.data_dir, 0o700)
 		self._mailbox = mailbox
@@ -87,7 +88,7 @@ class AppService:
 		if self.demo:
 			return "demo@example.invalid"
 		try:
-			return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))["account_id"].casefold()
+			return self._connection_state()["account_id"].casefold()
 		except (FileNotFoundError, ValueError, KeyError):
 			return "unconnected"
 
@@ -95,24 +96,26 @@ class AppService:
 		return self.data_dir / ("unconnected.sqlite" if account == "unconnected" else "mailbox-" + digest(account)[:12] + ".sqlite")
 
 	def _connection_state(self):
-		try:
-			return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))
-		except (FileNotFoundError, ValueError):
-			return {}
+		with self._identity_lock:
+			try:
+				return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))
+			except (FileNotFoundError, ValueError):
+				return {}
 
 	def _write_identity(self, connected=True):
-		target = self.data_dir / "account.json"
-		temporary = target.with_name(f"{target.name}.{os.getpid()}.{identifier()[:8]}.tmp")
-		generation = identifier()
-		try:
-			with temporary.open("w", encoding="utf-8") as stream:
-				stream.write(encode({"account_id": self.account_id, "connected": connected, "generation": generation}))
-				stream.flush()
-				os.fsync(stream.fileno())
-			temporary.replace(target)
-		finally:
-			temporary.unlink(missing_ok=True)
-		self._connection_generation = generation
+		with self._identity_lock:
+			target = self.data_dir / "account.json"
+			temporary = target.with_name(f"{target.name}.{os.getpid()}.{identifier()[:8]}.tmp")
+			generation = identifier()
+			try:
+				with temporary.open("w", encoding="utf-8") as stream:
+					stream.write(encode({"account_id": self.account_id, "connected": connected, "generation": generation}))
+					stream.flush()
+					os.fsync(stream.fileno())
+				temporary.replace(target)
+			finally:
+				temporary.unlink(missing_ok=True)
+			self._connection_generation = generation
 
 	def refresh_connection(self) -> bool:
 		account = self._identity_from_disk()

@@ -7,7 +7,7 @@ Checks recorded on **2026-10-28**, using **Linux and Python 3.12** in a project 
 | Check | Result |
 | --- | --- |
 | Editable installation, `python -m pip install -e '.[dev]'` | Passed. |
-| Complete suite, `QT_QPA_PLATFORM=offscreen python scripts/ci_tests.py` | 314 tests passed in 28.38 seconds after the 18-issue reliability/performance follow-up. |
+| Complete suite, `QT_QPA_PLATFORM=offscreen python scripts/ci_tests.py` | 316 tests passed in 29.11 seconds after the 18-issue reliability/performance follow-up. |
 | Cross-component offline acceptance | All four acceptance workflows passed as part of the complete suite. |
 | Full lint, `python -m ruff check gmail_clean tests scripts` | Passed with Ruff 0.9.10. |
 | Compile checks, `python -m compileall -q gmail_clean tests scripts` | Passed. |
@@ -32,11 +32,11 @@ The portability correction passed its 220-test local suite and [all four hosted 
 
 ## Reliability and performance follow-up
 
-The [18-issue implementation checklist](reliability-fixes.md) maps changes to their regressions. The current local suite contains 314 passing tests, including due-retry recovery, per-conversation context uncertainty, bounded undo pagination, pooled AI cleanup, blocked-network standalone closure, atomic demo writes, and rule/control race regressions.
+The [18-issue implementation checklist](reliability-fixes.md) maps changes to their regressions. The current local suite contains 316 passing tests, including due-retry recovery, per-conversation context uncertainty, bounded undo pagination, pooled AI cleanup, blocked-network standalone closure, atomic demo writes, and rule/control race regressions.
 
 The required fresh 60-message headless demo completed with 57 metadata candidates and 155 completed stage items: zero failed, pending, or retry items, ending at Completed / Review. The final source/wheel build and dependency check passed. Wheel inspection confirmed complete parseable `service.py`, `storage.py`, and `table_model.py` modules, an explicit Requests requirement, and no Bleach requirement. The Windows packaging script collects Gmail static discovery data; a native frozen executable has not been built on this Linux host.
 
-Performance tests include a 1,000-action shared-conversation transport-count regression and a 50,000-row learning/template lookup regression. They measure synthetic behavior and query/request counts, not live Gmail latency or provider cost. Current hosted workflow results are reported separately from these local checks.
+Performance tests include a 1,000-action shared-conversation transport-count regression and a 50,000-row learning/template lookup regression. They measure synthetic behavior and query/request counts, not live Gmail latency or provider cost. The first hosted follow-up exposed concurrent account-file replacement failures on both Windows versions: each had 313 passing tests and one failing identity-write regression. Shared per-target reader/writer guards now serialize identity and encrypted-token operations across worker instances; deterministic simulated-Windows regressions run on every platform. Current hosted workflow results are reported separately from these local checks.
 
 ## Offline 3,000-message pipeline
 

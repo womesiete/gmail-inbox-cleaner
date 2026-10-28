@@ -7,10 +7,27 @@ import json
 import os
 import re
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def path_lock(path: str | Path):
+	"""Share one reader/writer guard for an atomic-file target across app workers.
+
+	Unique temporary names prevent collisions between temporary files. Windows
+	also needs readers and replacers of the destination to avoid overlapping.
+	The application instance lock separately protects its data directory across
+	processes; the demo adapter additionally has a cross-process file lock.
+	"""
+	key = os.path.normcase(str(Path(path).resolve()))
+	with _PATH_LOCKS_GUARD:
+		return _PATH_LOCKS.setdefault(key, threading.RLock())
 
 
 def utc_now() -> datetime:

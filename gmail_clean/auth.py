@@ -10,10 +10,22 @@ import hashlib
 import json
 import os
 import uuid
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from .runtime import path_lock
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+
+def _serialized_credentials(method):
+	"""Keep every protected-file reader inside the atomic replacement protocol."""
+	@wraps(method)
+	def call(self, *args, **kwargs):
+		with path_lock(self.path):
+			return method(self, *args, **kwargs)
+	return call
 
 
 class AuthenticationError(RuntimeError):
@@ -69,6 +81,7 @@ class TokenStore:
 			ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 			ctypes.windll.kernel32.LocalFree(target.pbData)
 
+	@_serialized_credentials
 	def save(self, credential: Any) -> None:
 		payload = {key: getattr(credential, key, None) for key in
 			("refresh_token", "token_uri", "client_id", "client_secret", "scopes")}
@@ -95,6 +108,7 @@ class TokenStore:
 			finally:
 				temporary.unlink(missing_ok=True)
 
+	@_serialized_credentials
 	def load(self) -> dict | None:
 		if self.path.exists():
 			try:
@@ -114,6 +128,7 @@ class TokenStore:
 		except (ValueError, TypeError) as exc:
 			raise AuthenticationError("Stored credentials are invalid; reconnect.") from exc
 
+	@_serialized_credentials
 	def delete(self) -> None:
 		try:
 			self._keyring().delete_password(self.SERVICE, self.user)

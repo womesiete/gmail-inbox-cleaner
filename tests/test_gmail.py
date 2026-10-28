@@ -377,10 +377,10 @@ def test_protected_token_saves_use_distinct_temporary_files_and_cleanup_on_failu
 	paths = []
 	def concurrent_replace(source, target):
 		paths.append(Path(source))
-		barrier.wait(timeout=10)
 		original_replace(source, target)
 	monkeypatch.setattr(auth.os, "replace", concurrent_replace)
 	def save_token(token):
+		barrier.wait(timeout=10)
 		store.save(SimpleNamespace(refresh_token=token, token_uri="uri", client_id="id", client_secret="secret", scopes=["modify"]))
 	with ThreadPoolExecutor(max_workers=2) as pool:
 		list(pool.map(save_token, ["synthetic-first", "synthetic-second"]))
@@ -391,5 +391,87 @@ def test_protected_token_saves_use_distinct_temporary_files_and_cleanup_on_failu
 		raise PermissionError("synthetic replace failure")
 	monkeypatch.setattr(auth.os, "replace", failed_replace)
 	with pytest.raises(PermissionError):
-		save_token("synthetic-third")
+		store.save(SimpleNamespace(refresh_token="synthetic-third", token_uri="uri", client_id="id", client_secret="secret", scopes=["modify"]))
+	assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_token_readers_replacements_and_delete_use_one_shared_path_lock(tmp_path, monkeypatch):
+	from gmail_clean import auth
+	stores = [TokenStore(tmp_path), TokenStore(tmp_path / "alias" / "..")]
+	target = stores[0].path.resolve()
+	monkeypatch.setattr(TokenStore, "_keyring", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("unavailable"))))
+	monkeypatch.setattr(TokenStore, "_dpapi", staticmethod(lambda data, encrypt: b"encrypted:" + data if encrypt else data.removeprefix(b"encrypted:")))
+	monitor = threading.Lock()
+	busy = {"readers": 0, "writers": 0}
+	original_read = Path.read_bytes
+	original_replace = auth.os.replace
+	original_unlink = Path.unlink
+	original_lock = auth.path_lock
+	owners = set()
+	observed = set()
+	@contextmanager
+	def tracked_lock(path):
+		with original_lock(path):
+			owner = threading.get_ident()
+			with monitor:
+				assert not owners, "Distinct stores must serialize the same protected file"
+				owners.add(owner)
+			try:
+				yield
+			finally:
+				with monitor:
+					owners.remove(owner)
+	def read_bytes(path):
+		if path.resolve() != target:
+			return original_read(path)
+		with monitor:
+			assert threading.get_ident() in owners
+			assert not busy["writers"]
+			busy["readers"] += 1
+			observed.add("read")
+		try:
+			# Simulate a Windows reader that denies FILE_SHARE_DELETE while open.
+			time.sleep(0.002)
+			return original_read(path)
+		finally:
+			with monitor:
+				busy["readers"] -= 1
+	def replace(source, destination):
+		if Path(destination).resolve() != target:
+			return original_replace(source, destination)
+		with monitor:
+			assert threading.get_ident() in owners
+			if busy["readers"] or busy["writers"]:
+				raise PermissionError("simulated Windows replacement sharing violation")
+			busy["writers"] += 1
+			observed.add("replace")
+		try:
+			time.sleep(0.002)
+			return original_replace(source, destination)
+		finally:
+			with monitor:
+				busy["writers"] -= 1
+	def unlink(path, *args, **kwargs):
+		if path.resolve() == target:
+			assert threading.get_ident() in owners
+			observed.add("delete")
+		return original_unlink(path, *args, **kwargs)
+	monkeypatch.setattr(auth, "path_lock", tracked_lock)
+	monkeypatch.setattr(Path, "read_bytes", read_bytes)
+	monkeypatch.setattr(auth.os, "replace", replace)
+	monkeypatch.setattr(Path, "unlink", unlink)
+	barrier = threading.Barrier(8)
+	def work(index):
+		store = stores[index % len(stores)]
+		barrier.wait(timeout=10)
+		for version in range(4):
+			store.save(SimpleNamespace(refresh_token=f"synthetic-{index}-{version}", token_uri="uri", client_id="id", client_secret="secret", scopes=["modify"]))
+			value = store.load()
+			assert value is None or value["refresh_token"].startswith("synthetic-")
+			if version == 3:
+				store.delete()
+	with ThreadPoolExecutor(max_workers=8) as pool:
+		list(pool.map(work, range(8)))
+	assert observed == {"read", "replace", "delete"}
+	assert not owners and busy == {"readers": 0, "writers": 0}
 	assert not list(tmp_path.glob("*.tmp"))

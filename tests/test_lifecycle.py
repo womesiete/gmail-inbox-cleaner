@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -147,6 +149,47 @@ def test_identity_commit_uses_unique_temporaries_and_cleans_failed_replace(tmp_p
 		assert not list(tmp_path.glob("account.json.*.tmp"))
 	finally:
 		service.close()
+
+
+def test_identity_readers_and_replacers_share_a_guard_across_service_instances(tmp_path, monkeypatch):
+	first = AppService(demo=True, count=4, data_dir=tmp_path)
+	second = AppService(demo=True, count=4, data_dir=tmp_path)
+	first._write_identity()
+	target = tmp_path / "account.json"
+	read_text, replace = Path.read_text, Path.replace
+	guard = threading.Lock()
+	busy = [False]
+	def exclusive(operation):
+		with guard:
+			if busy[0]:
+				raise PermissionError("Synthetic Windows destination is open or being replaced")
+			busy[0] = True
+		try:
+			time.sleep(0.005)
+			return operation()
+		finally:
+			with guard:
+				busy[0] = False
+	def checked_read(path, *args, **kwargs):
+		return exclusive(lambda: read_text(path, *args, **kwargs)) if path == target else read_text(path, *args, **kwargs)
+	def checked_replace(path, destination):
+		return exclusive(lambda: replace(path, destination)) if destination == target else replace(path, destination)
+	monkeypatch.setattr(Path, "read_text", checked_read)
+	monkeypatch.setattr(Path, "replace", checked_replace)
+	try:
+		def operation(index):
+			service = first if index % 2 else second
+			if index % 3:
+				service._write_identity()
+			else:
+				assert service._connection_state()["account_id"] == first.account_id
+		with ThreadPoolExecutor(max_workers=4) as pool:
+			list(pool.map(operation, range(24)))
+		assert first._connection_state()["account_id"] == first.account_id
+		assert not list(tmp_path.glob("account.json.*.tmp"))
+	finally:
+		first.close()
+		second.close()
 
 
 def test_standalone_close_deadline_does_not_wait_for_a_blocked_network_thread(tmp_path):
