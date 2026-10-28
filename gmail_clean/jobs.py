@@ -111,27 +111,28 @@ class JobRunner:
 				AND p.prompt_version=?) AS has_assessment
 			FROM messages m WHERE m.in_inbox=1 AND NOT EXISTS
 				(SELECT 1 FROM work_items w WHERE w.job_id=? AND w.message_id=m.id AND w.stage='metadata')""", (PROMPT_VERSION, job))
-		for row in rows:
-			if not window.contains(row["internal_ms"]):
-				continue
-			needs = force or not row["decision"] or row["decision"] == "pending" or not row["has_assessment"]
-			for field in ("defer_until_utc", "deadline_utc"):
-				if row[field]:
+		with self.db.transaction():
+			for row in rows:
+				if not window.contains(row["internal_ms"]):
+					continue
+				needs = force or not row["decision"] or row["decision"] == "pending" or not row["has_assessment"]
+				for field in ("defer_until_utc", "deadline_utc"):
+					if row[field]:
+						try:
+							due = datetime.fromisoformat(row[field].replace("Z", "+00:00"))
+							needs = needs or (due <= window.anchor_utc and (previous_anchor is None or previous_anchor < due))
+						except (TypeError, ValueError):
+							# Malformed state must be reconsidered, never silently retained.
+							needs = True
+				if row["decision"] == "review" and not needs:
 					try:
-						due = datetime.fromisoformat(row[field].replace("Z", "+00:00"))
-						needs = needs or (due <= window.anchor_utc and (previous_anchor is None or previous_anchor < due))
+						cutoff = resolve_age_cutoff(effective, window.anchor_utc, row["category"])
+						old_cutoff = resolve_age_cutoff(effective, previous_anchor, row["category"]) if previous_anchor else None
+						needs = cutoff is not None and row["internal_ms"] < epoch_ms(cutoff) and (old_cutoff is None or row["internal_ms"] >= epoch_ms(old_cutoff))
 					except (TypeError, ValueError):
-						# Malformed state must be reconsidered, never silently retained.
 						needs = True
-			if row["decision"] == "review" and not needs:
-				try:
-					cutoff = resolve_age_cutoff(effective, window.anchor_utc, row["category"])
-					old_cutoff = resolve_age_cutoff(effective, previous_anchor, row["category"]) if previous_anchor else None
-					needs = cutoff is not None and row["internal_ms"] < epoch_ms(cutoff) and (old_cutoff is None or row["internal_ms"] >= epoch_ms(old_cutoff))
-				except (TypeError, ValueError):
-					needs = True
-			if needs:
-				self.queue(job, row["id"])
+				if needs:
+					self.queue(job, row["id"])
 
 	def effective_config(self, frozen: Config) -> Config:
 		"""Recompute current policy without broadening an older job's protections.
@@ -346,6 +347,33 @@ class JobRunner:
 				return True
 			token = payload[key]
 
+
+	def _prefetch_threads(self, messages) -> dict:
+		"""Fetch conversation evidence before taking SQLite's writer lock.
+
+		Cache failures as well as successful results for this phase: every row in
+		a failed conversation gets its own retry without repeating the request.
+		"""
+		threads = {}
+		for message in messages:
+			if isinstance(message, Exception) or message.thread_id in threads:
+				continue
+			try:
+				threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+			except Exception as exc:
+				threads[message.thread_id] = exc
+		return threads
+
+	def _thread_members(self, message, threads):
+		if message.thread_id not in threads:
+			if self.db.conn.in_transaction:
+				raise RuntimeError("Conversation evidence must be fetched before a write transaction")
+			threads.update(self._prefetch_threads([message]))
+		members = threads[message.thread_id]
+		if isinstance(members, Exception):
+			raise members
+		return members
+
 	def process_stage(self, job: str, stage: str, window: Window, config: Config, progress, should_stop) -> bool:
 		while True:
 			if self.held(job, should_stop):
@@ -374,68 +402,72 @@ class JobRunner:
 				except Exception as exc:
 					live_metadata = {row["message_id"]: exc for row in rows}
 				allowed = []
-				threads = {}
-				for row in rows:
-					old = self.db.get_message(row["message_id"])
-					message = live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata"))
-					if isinstance(message, Exception):
-						self.fail(job, row, message, effective)
-						continue
-					if old and old.headers == message.headers and old.internal_ms == message.internal_ms:
-						message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
-						message.context_version = old.context_version
-						message.content_hash = old.content_hash
-					self.db.upsert_message(message)
-					if not self.s.eligible(message, window):
-						self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
-						self.db.execute("UPDATE actions SET state='stale',reason='No longer an eligible inbox target' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
-						self.done(job, row["message_id"], stage)
-						continue
-					if self.excluded(message, effective):
-						self.save_recommendation(job, message, None, "review", "Content sharing excluded by effective privacy settings", window)
-						self.done(job, message.id, stage)
-						continue
-					download_only = json.loads(row["payload_json"]).get("download_only", False)
-					if download_only and not effective.download_all_bodies:
-						self.done(job, message.id, stage)
-						continue
-					try:
-						if message.thread_id not in threads:
-							threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
-						members = threads[message.thread_id]
-						message.context_version = context_hash(members, effective.sent_context_enabled)
-						current_window = resolve_window(self.s.config, window.anchor_utc)
-						newer_excluded = any(member.id != message.id and member.internal_ms > message.internal_ms and (not window.contains(member.internal_ms) or not current_window.contains(member.internal_ms)) and not ({"TRASH", "SPAM", "DRAFT"} & member.labels) for member in members)
-						context_changed = bool(old and old.context_version != message.context_version)
+				threads = self._prefetch_threads(
+					message for row in rows
+					if not isinstance(message := live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata")), Exception)
+					and self.s.eligible(message, window) and not self.excluded(message, effective)
+					and (not json.loads(row["payload_json"]).get("download_only", False) or effective.download_all_bodies)
+				)
+				with self.db.transaction():
+					for row in rows:
+						old = self.db.get_message(row["message_id"])
+						message = live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata"))
+						if isinstance(message, Exception):
+							self.fail(job, row, message, effective)
+							continue
+						if old and old.headers == message.headers and old.internal_ms == message.internal_ms:
+							message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
+							message.context_version = old.context_version
+							message.content_hash = old.content_hash
 						self.db.upsert_message(message)
-						if context_changed:
-							self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
-							self.db.execute("UPDATE actions SET state='stale',reason='Conversation changed during body queue' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
-							self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
-							self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
-						if context_changed or newer_excluded:
-							self.set_checkpoint(f"recent_reply:{message.id}", newer_excluded)
-							self.save_recommendation(job, message, None, "review", "Conversation changed or has a newer excluded reply; reconsider before classification", window)
+						if not self.s.eligible(message, window):
+							self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
+							self.db.execute("UPDATE actions SET state='stale',reason='No longer an eligible inbox target' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
+							self.done(job, row["message_id"], stage)
+							continue
+						if self.excluded(message, effective):
+							self.save_recommendation(job, message, None, "review", "Content sharing excluded by effective privacy settings", window)
+							self.done(job, message.id, stage)
+							continue
+						download_only = json.loads(row["payload_json"]).get("download_only", False)
+						if download_only and not effective.download_all_bodies:
+							self.done(job, message.id, stage)
+							continue
+						try:
+							members = self._thread_members(message, threads)
+							message.context_version = context_hash(members, effective.sent_context_enabled)
+							current_window = resolve_window(self.s.config, window.anchor_utc)
+							newer_excluded = any(member.id != message.id and member.internal_ms > message.internal_ms and (not window.contains(member.internal_ms) or not current_window.contains(member.internal_ms)) and not ({"TRASH", "SPAM", "DRAFT"} & member.labels) for member in members)
+							context_changed = bool(old and old.context_version != message.context_version)
+							self.db.upsert_message(message)
+							if context_changed:
+								self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
+								self.db.execute("UPDATE actions SET state='stale',reason='Conversation changed during body queue' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
+								self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
+								self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
+							if context_changed or newer_excluded:
+								self.set_checkpoint(f"recent_reply:{message.id}", newer_excluded)
+								self.save_recommendation(job, message, None, "review", "Conversation changed or has a newer excluded reply; reconsider before classification", window)
+								if effective.download_all_bodies:
+									row["payload_json"] = encode({"download_only": True})
+									self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
+									allowed.append(row)
+								else:
+									self.done(job, message.id, stage)
+								continue
+						except Exception as exc:
+							self.fail(job, row, exc, effective)
+							continue
+						direct = recommend(message, None, effective, window, manual_override=self.s.override(message), rules=self.s.rules())
+						if direct.action in {"keep", "skip", "archive"}:
+							self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
 							if effective.download_all_bodies:
 								row["payload_json"] = encode({"download_only": True})
 								self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
-								allowed.append(row)
 							else:
 								self.done(job, message.id, stage)
-							continue
-					except Exception as exc:
-						self.fail(job, row, exc, effective)
-						continue
-					direct = recommend(message, None, effective, window, manual_override=self.s.override(message), rules=self.s.rules())
-					if direct.action in {"keep", "skip", "archive"}:
-						self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
-						if effective.download_all_bodies:
-							row["payload_json"] = encode({"download_only": True})
-							self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
-						else:
-							self.done(job, message.id, stage)
-							continue
-					allowed.append(row)
+								continue
+						allowed.append(row)
 				rows = allowed
 				if not rows:
 					continue
@@ -449,30 +481,35 @@ class JobRunner:
 					results = self.s.mailbox.get_messages(ids, body=stage == "body")
 				except Exception as exc:
 					results = {mid: exc for mid in ids}
-				threads = {}
-				for row in rows:
-					mid = row["message_id"]
-					result = results.get(mid, ValueError("Missing retrieval result"))
-					try:
-						if isinstance(result, Exception):
-							raise result
-						if stage == "metadata":
-							self.metadata(job, result, window, effective, threads=threads)
-						else:
-							# Eligibility is established before this retrieval was queued.
-							if self.s.eligible(result, window):
-								old = self.db.get_message(mid)
-								result.context_version = old.context_version if old else ""
-								if len(result.body or "") > effective.body_limit:
-									result.body = result.body[:effective.body_limit]
-									result.truncated = True
-								result.content_hash = content_hash(result)
-								self.db.upsert_message(result)
-								if not json.loads(row["payload_json"]).get("download_only", False):
-									self.queue(job, mid, "classification")
-						self.done(job, mid, stage)
-					except Exception as exc:
-						self.fail(job, row, exc, effective)
+				threads = self._prefetch_threads(
+					message for message in results.values()
+					if not isinstance(message, Exception) and self.s.eligible(message, window)
+				) if stage == "metadata" else {}
+				with self.db.transaction():
+					for row in rows:
+						mid = row["message_id"]
+						result = results.get(mid, ValueError("Missing retrieval result"))
+						try:
+							with self.db.transaction():
+								if isinstance(result, Exception):
+									raise result
+								if stage == "metadata":
+									self.metadata(job, result, window, effective, threads=threads)
+								else:
+									# Eligibility is established before this retrieval was queued.
+									if self.s.eligible(result, window):
+										old = self.db.get_message(mid)
+										result.context_version = old.context_version if old else ""
+										if len(result.body or "") > effective.body_limit:
+											result.body = result.body[:effective.body_limit]
+											result.truncated = True
+										result.content_hash = content_hash(result)
+										self.db.upsert_message(result)
+										if not json.loads(row["payload_json"]).get("download_only", False):
+											self.queue(job, mid, "classification")
+								self.done(job, mid, stage)
+						except Exception as exc:
+							self.fail(job, row, exc, effective)
 			else:
 				self.classify(job, rows, window, effective)
 			if progress:
@@ -488,9 +525,7 @@ class JobRunner:
 			self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
 			return
 		threads = {} if threads is None else threads
-		if message.thread_id not in threads:
-			threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
-		members = threads[message.thread_id]
+		members = self._thread_members(message, threads)
 		message.context_version = context_hash(members, config.sent_context_enabled)
 		if old and old.internal_ms == message.internal_ms and old.headers == message.headers:
 			message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content

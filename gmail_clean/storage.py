@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _PROCESS_FALLBACK = uuid.uuid4().hex
 
 
@@ -207,6 +207,7 @@ _MIGRATIONS = [
 	CREATE INDEX idx_rules_pattern_action ON rules(json_extract(payload_json,'$.pattern_key'),action);
 	""",
 	"""ALTER TABLE job_leases ADD COLUMN process_start TEXT NOT NULL DEFAULT '';""",
+	"""SELECT 1; -- Account guards are installed once with this migration.""",
 ]
 
 _ACCOUNT_TABLES = (
@@ -237,10 +238,10 @@ class Store:
 		self.conn.execute("PRAGMA foreign_keys=ON")
 		self.conn.execute("PRAGMA busy_timeout=5000")
 		self.conn.execute("PRAGMA journal_mode=WAL")
+		self.conn.execute("PRAGMA synchronous=FULL")
 		try:
 			self._migrate()
 			self._bind_account()
-			self._account_triggers()
 		except Exception:
 			self.conn.close()
 			raise
@@ -273,6 +274,8 @@ class Store:
 						statement = ""
 				if statement.strip():
 					self.conn.execute(statement)
+				if number == 5:
+					self._account_triggers()
 				self.conn.execute(f"PRAGMA user_version={number + 1}")
 			self.conn.commit()
 		except Exception:
@@ -292,7 +295,7 @@ class Store:
 		# A single-account database prevents unsafe cross-account reuse by design.
 		for table in _ACCOUNT_TABLES:
 			key = "rowid"  # Includes text and composite-primary-key tables.
-			self.conn.executescript(f"""
+			self._script(f"""
 			CREATE TRIGGER IF NOT EXISTS {table}_account_default AFTER INSERT ON {table}
 			WHEN NEW.account_id = '' BEGIN
 				UPDATE {table} SET account_id=(SELECT id FROM accounts LIMIT 1) WHERE {key}=NEW.{key};
@@ -304,6 +307,31 @@ class Store:
 			WHEN NEW.account_id != (SELECT id FROM accounts LIMIT 1)
 			BEGIN SELECT RAISE(ABORT,'account mismatch'); END;
 			""")
+
+	def _script(self, script: str) -> None:
+		"""Execute complete SQL statements without executescript's implicit commit."""
+		statement = ""
+		for line in script.splitlines(keepends=True):
+			statement += line
+			if sqlite3.complete_statement(statement):
+				self.conn.execute(statement)
+				statement = ""
+		if statement.strip():
+			self.conn.execute(statement)
+
+	def upsert_messages(self, messages) -> None:
+		"""Persist one already-retrieved batch with a single durable commit."""
+		with self.transaction():
+			for message in messages:
+				self.upsert_message(message)
+
+	def checkpoint_wal(self, *, truncate: bool = False) -> dict:
+		"""Bound WAL growth during idle maintenance, never inside an action intent."""
+		if self.conn.in_transaction:
+			raise RuntimeError("Cannot checkpoint an active transaction")
+		mode = "TRUNCATE" if truncate else "PASSIVE"
+		row = self.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+		return {"busy": row[0], "log_frames": row[1], "checkpointed": row[2]}
 
 	def execute(self, sql: str, params: Sequence[Any] | Mapping[str, Any] = ()) -> sqlite3.Cursor:
 		self._check_thread()

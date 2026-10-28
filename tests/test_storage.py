@@ -311,3 +311,21 @@ def test_numbered_migration_has_a_pre_migration_backup(tmp_path):
 		assert len(backups) == 1
 		with sqlite3.connect(backups[0]) as backup:
 			assert backup.execute('PRAGMA user_version').fetchone()[0] == 4
+
+
+def test_trigger_ddl_is_migrated_once_and_bulk_upsert_is_atomic(tmp_path, monkeypatch):
+	calls = []
+	original = Store._account_triggers
+	def tracked(self):
+		calls.append(True)
+		return original(self)
+	monkeypatch.setattr(Store, '_account_triggers', tracked)
+	path = tmp_path / 'triggers.sqlite'
+	with Store(path, 'me@example.invalid'):
+		pass
+	with Store(path, 'me@example.invalid') as store:
+		assert len(calls) == 1
+		with pytest.raises(AccountMismatchError):
+			store.upsert_messages([message('ok'), replace(message('bad'), account_id='wrong@example.invalid')])
+		assert store.get_message('ok') is None
+		assert store.one('PRAGMA synchronous')['synchronous'] == 2

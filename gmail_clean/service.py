@@ -357,7 +357,10 @@ class AppService:
 				self.error("discovery", exc, job_id=job_id)
 				self.jobs.handle_exception(job_id, exc, self.config)
 				return self.jobs.summary(job_id)
-			return self.jobs.run(job_id, progress, should_stop)
+			result = self.jobs.run(job_id, progress, should_stop)
+			if result["state"] == "completed":
+				self.store.checkpoint_wal(truncate=True)
+			return result
 
 	def control_job(self, job_id, state):
 		state = {"pause": "paused", "resume": "pending", "stop": "stopped", "running": "pending"}.get(state, state)

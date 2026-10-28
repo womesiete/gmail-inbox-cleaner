@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import multiprocessing
 import os
@@ -10,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .domain import content_hash
+from .domain import Config, content_hash
 from .runtime import data_directory, digest, utc_now
 from .service import AppService
 from .storage import Store
@@ -22,6 +23,7 @@ def parser():
 	result.add_argument("--headless", action="store_true", help="Run one durable job without the desktop interface")
 	result.add_argument("--data-dir", type=Path, help="Data root; separate demo/live subdirectories are added")
 	result.add_argument("--count", type=int, default=3000, help="Synthetic message count for a new demo mailbox")
+	result.add_argument("--job-benchmark", type=int, metavar="MESSAGES", help="Measure the complete offline discovery/body/classification job")
 	result.add_argument("--benchmark", type=int, metavar="ROWS", help="Generate and measure SQL table paging; offline only")
 	result.add_argument("--resume", metavar="JOB_ID", help="Resume the specified durable job")
 	result.add_argument("--ai-module", help="External package name or standalone Python file")
@@ -70,6 +72,23 @@ def benchmark(count: int, directory: Path) -> dict:
 	model.close()
 	store.close()
 	return result
+
+
+def job_benchmark(count: int, directory: Path) -> dict:
+	"""Measure a complete offline job, including durable work queues and AI stages."""
+	if (directory / "demo-mailbox.json").exists():
+		raise ValueError("Use a fresh data directory for comparable job benchmarks")
+	start = time.perf_counter()
+	with contextlib.closing(AppService(data_dir=directory, demo=True, count=count)) as service:
+		seed_seconds = time.perf_counter() - start
+		config = Config.from_dict(service.config.to_dict())
+		config.ai_batch_size = 10
+		config.retrieval_batch_size = 50
+		service.update_config(config)
+		job = service.new_job()
+		start = time.perf_counter()
+		summary = run_until_settled(service, job)
+		return {"messages": count, "ai_batch_size": 10, "retrieval_batch_size": 50, "seed_seconds": round(seed_seconds, 4), "job_seconds": round(time.perf_counter() - start, 4), "summary": summary}
 
 
 def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep=time.sleep, max_wait_seconds=300):
@@ -146,6 +165,11 @@ def main(argv=None) -> int:
 			from .runtime import safe_error
 			print(str(exc) if isinstance(exc, ValueError) else safe_error(exc), file=sys.stderr)
 			return 1
+	if args.job_benchmark:
+		if not args.demo or args.job_benchmark < 1:
+			parser().error("--job-benchmark requires --demo and a positive count")
+		print(json.dumps(job_benchmark(args.job_benchmark, directory), indent=2))
+		return 0
 	if args.benchmark:
 		if not args.demo:
 			parser().error("--benchmark requires --demo")

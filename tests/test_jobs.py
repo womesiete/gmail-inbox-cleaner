@@ -684,3 +684,90 @@ def test_fail_policy_preserves_decisions_and_separates_job_blocks(service, kind)
 		assert work["state"] == "failed" and work["attempts"] == 1
 	else:
 		assert work["state"] == "retry" and work["attempts"] == 1
+
+
+@pytest.mark.parametrize('stage,commit_cap', [('metadata', 3), ('body', 4)])
+def test_retrieval_batches_commit_once_and_never_hold_writer_during_mailbox_calls(tmp_path, monkeypatch, stage, commit_cap):
+	messages = [mail(f'batched-{index}') for index in range(8)]
+	value = PipelineService(tmp_path / f'{stage}.sqlite', messages)
+	try:
+		runner = JobRunner(value)
+		job = runner.new()
+		window = resolve_window(value.config, ANCHOR)
+		for message in messages:
+			if stage == 'body':
+				runner.metadata(job, replace(message, body='', missing_content=True), window, value.config)
+			else:
+				runner.queue(job, message.id, stage)
+		for name in ('get_messages', 'thread_metadata'):
+			original = getattr(value.mailbox, name)
+			def checked(*args, _original=original, **kwargs):
+				assert not value.store.conn.in_transaction, 'mailbox call while SQLite writer is held'
+				return _original(*args, **kwargs)
+			monkeypatch.setattr(value.mailbox, name, checked)
+		commits = []
+		original_execute = value.store.execute
+		def counted_execute(sql, params=()):
+			verb = sql.strip().split()[0].upper()
+			if verb in {'INSERT', 'UPDATE', 'DELETE', 'REPLACE'} and not value.store.conn.in_transaction:
+				commits.append(sql)
+			return original_execute(sql, params)
+		monkeypatch.setattr(value.store, 'execute', counted_execute)
+		value.store.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == 'COMMIT' else None)
+		assert runner.process_stage(job, stage, window, value.config, None, None)
+		value.store.conn.set_trace_callback(None)
+		assert len(commits) <= commit_cap, f'{len(commits)} commits for one {len(messages)}-message batch'
+		assert value.store.one('SELECT COUNT(*) n FROM work_items WHERE job_id=? AND stage=? AND state=\'completed\'', (job, stage))['n'] == len(messages)
+	finally:
+		value.store.close()
+
+
+def test_batched_metadata_caches_thread_errors_and_isolates_failed_rows(tmp_path, monkeypatch):
+	messages = [mail('bad-one', thread='broken'), mail('bad-two', thread='broken'), mail('good')]
+	value = PipelineService(tmp_path / 'thread-errors.sqlite', messages)
+	try:
+		runner = JobRunner(value)
+		job = runner.new()
+		window = resolve_window(value.config, ANCHOR)
+		for message in messages:
+			runner.queue(job, message.id)
+		original = value.mailbox.thread_metadata
+		calls = []
+		def thread(thread_id):
+			assert not value.store.conn.in_transaction
+			calls.append(thread_id)
+			if thread_id == 'broken':
+				raise GmailError('network', 'Offline transient')
+			return original(thread_id)
+		monkeypatch.setattr(value.mailbox, 'thread_metadata', thread)
+		assert not runner.process_stage(job, 'metadata', window, value.config, None, None)
+		assert calls.count('broken') == 1
+		states = {row['message_id']: row['state'] for row in value.store.query("SELECT message_id,state FROM work_items WHERE stage='metadata'")}
+		assert states == {'bad-one': 'retry', 'bad-two': 'retry', 'good': 'completed'}
+		assert value.store.get_message('bad-one') is None
+		assert value.store.get_message('good')
+	finally:
+		value.store.close()
+
+
+def test_local_transition_queue_uses_one_batch_transaction(tmp_path, monkeypatch):
+	messages = [mail(f'local-{index}') for index in range(25)]
+	value = PipelineService(tmp_path / 'local-transitions.sqlite', messages)
+	try:
+		value.store.upsert_messages(messages)
+		runner = JobRunner(value)
+		job = runner.new()
+		commits = []
+		original = value.store.execute
+		def counted(sql, params=()):
+			if sql.strip().split()[0].upper() in {'INSERT', 'UPDATE', 'DELETE'} and not value.store.conn.in_transaction:
+				commits.append(sql)
+			return original(sql, params)
+		monkeypatch.setattr(value.store, 'execute', counted)
+		value.store.conn.set_trace_callback(lambda sql: commits.append(sql) if sql == 'COMMIT' else None)
+		runner.queue_local_transitions(job, resolve_window(value.config, ANCHOR), value.config, full=True)
+		assert len(commits) == 2
+		assert value.store.one('SELECT COUNT(*) n FROM work_items')['n'] == 25
+	finally:
+		value.store.conn.set_trace_callback(None)
+		value.store.close()
