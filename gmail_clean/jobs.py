@@ -10,11 +10,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .ai import PROMPT_VERSION
-from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
+from .domain import Assessment, Config, Message, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
 from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
 	from .service import AppService
+
+
+_AssessmentWork = tuple[dict, Message, list[dict], str]
 
 
 class JobRunner:
@@ -383,6 +386,12 @@ class JobRunner:
 			raise members
 		return members
 
+	def _newer_excluded(self, message: Message, members: list[Message], window: Window) -> bool:
+		current_window = resolve_window(self.s.config, window.anchor_utc)
+		return any(member.id != message.id and member.internal_ms > message.internal_ms
+			and (not window.contains(member.internal_ms) or not current_window.contains(member.internal_ms))
+			and not ({"TRASH", "SPAM", "DRAFT"} & set(member.labels)) for member in members)
+
 	def process_stage(self, job: str, stage: str, window: Window, config: Config, progress, should_stop) -> bool:
 		while True:
 			if self.held(job, should_stop):
@@ -406,127 +415,154 @@ class JobRunner:
 			batch_policy = self.s.policy_batch([row["message_id"] for row in rows]) if hasattr(self.s, "policy_batch") else contextlib.nullcontext()
 			with batch_policy:
 				if stage == "body":
-					# A paused body queue may predate stricter settings or a manual keep.
-					# Recheck before requesting any content, not after downloading it.
-					try:
-						live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
-					except Exception as exc:  # noqa: BLE001 - metadata transport failure is assigned to unresolved work only
-						live_metadata = {row["message_id"]: exc for row in rows}
-					allowed = []
-					threads = self._prefetch_threads(
-						message for row in rows
-						if not isinstance(message := live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata")), Exception)
-						and self.s.eligible(message, window) and not self.excluded(message, effective)
-						and (not json.loads(row["payload_json"]).get("download_only", False) or effective.download_all_bodies)
-					)
-					with self.db.transaction():
-						for row in rows:
-							old = self.db.get_message(row["message_id"])
-							message = live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata"))
-							if isinstance(message, Exception):
-								self.fail(job, row, message, effective)
-								continue
-							if old and old.headers == message.headers and old.internal_ms == message.internal_ms:
-								message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
-								message.context_version = old.context_version
-								message.content_hash = old.content_hash
-							self.db.upsert_message(message)
-							if not self.s.eligible(message, window):
-								self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
-								self.db.execute("UPDATE actions SET state='stale',reason='No longer an eligible inbox target' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
-								self.done(job, row["message_id"], stage)
-								continue
-							if self.excluded(message, effective):
-								self.save_recommendation(job, message, None, "review", "Content sharing excluded by effective privacy settings", window)
-								self.done(job, message.id, stage)
-								continue
-							download_only = json.loads(row["payload_json"]).get("download_only", False)
-							if download_only and not effective.download_all_bodies:
-								self.done(job, message.id, stage)
-								continue
-							try:
-								members = self._thread_members(message, threads)
-								message.context_version = context_hash(members, effective.sent_context_enabled)
-								current_window = resolve_window(self.s.config, window.anchor_utc)
-								newer_excluded = any(member.id != message.id and member.internal_ms > message.internal_ms and (not window.contains(member.internal_ms) or not current_window.contains(member.internal_ms)) and not ({"TRASH", "SPAM", "DRAFT"} & member.labels) for member in members)
-								context_changed = bool(old and old.context_version != message.context_version)
-								self.db.upsert_message(message)
-								if context_changed:
-									self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
-									self.db.execute("UPDATE actions SET state='stale',reason='Conversation changed during body queue' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
-									self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
-									self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
-								if context_changed or newer_excluded:
-									self.set_checkpoint(f"recent_reply:{message.id}", newer_excluded)
-									self.save_recommendation(job, message, None, "review", "Conversation changed or has a newer excluded reply; reconsider before classification", window)
-									if effective.download_all_bodies:
-										row["payload_json"] = encode({"download_only": True})
-										self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
-										allowed.append(row)
-									else:
-										self.done(job, message.id, stage)
-									continue
-							except Exception as exc:  # noqa: BLE001 - per-item safety check failure enters the kind-aware work queue
-								self.fail(job, row, exc, effective)
-								continue
-							direct = recommend(message, None, effective, window, manual_override=self.s.override(message), rules=self.s.rules())
-							if direct.action in {"keep", "skip", "archive"}:
-								self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
-								if effective.download_all_bodies:
-									row["payload_json"] = encode({"download_only": True})
-									self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
-								else:
-									self.done(job, message.id, stage)
-									continue
-							allowed.append(row)
-					rows = allowed
-					if not rows:
-						continue
-				ids = [r["message_id"] for r in rows]
-				for selected in chunks(ids):
-					self.db.execute(
-						f"UPDATE work_items SET state='running' WHERE job_id=? AND stage=? AND message_id IN ({placeholders(selected)})",  # noqa: S608 -- chunk contains only bind markers; job, stage and IDs stay bound
-						(job, stage, *selected),
-					)
-				if stage in {"metadata", "body"}:
-					try:
-						results = self.s.mailbox.get_messages(ids, body=stage == "body")
-					except Exception as exc:  # noqa: BLE001 - multipart failure produces independent per-item error results
-						results = {mid: exc for mid in ids}
-					threads = self._prefetch_threads(
-						message for message in results.values()
-						if not isinstance(message, Exception) and self.s.eligible(message, window)
-					) if stage == "metadata" else {}
-					with self.db.transaction():
-						for row in rows:
-							mid = row["message_id"]
-							result = results.get(mid, ValueError("Missing retrieval result"))
-							try:
-								with self.db.transaction():
-									if isinstance(result, Exception):
-										raise result
-									if stage == "metadata":
-										self.metadata(job, result, window, effective, threads=threads)
-									else:
-										# Eligibility is established before this retrieval was queued.
-										if self.s.eligible(result, window):
-											old = self.db.get_message(mid)
-											result.context_version = old.context_version if old else ""
-											if len(result.body or "") > effective.body_limit:
-												result.body = result.body[:effective.body_limit]
-												result.truncated = True
-											result.content_hash = content_hash(result)
-											self.db.upsert_message(result)
-											if not json.loads(row["payload_json"]).get("download_only", False):
-												self.queue(job, mid, "classification")
-									self.done(job, mid, stage)
-							except Exception as exc:  # noqa: BLE001 - one persistence failure must not discard prior completed rows
-								self.fail(job, row, exc, effective)
+					processed = self._body_stage(job, rows, window, effective)
+				elif stage == "metadata":
+					processed = self._metadata_stage(job, rows, window, effective)
 				else:
-					self.classify(job, rows, window, effective)
+					processed = self._classification_stage(job, stage, rows, window, effective)
+				if not processed:
+					continue
 			if progress:
 				counts = self.summary(job)
 				progress(f"{stage.title()}: {counts['completed']:,} stages completed; {counts['failed']:,} errors")
+
+	def _body_stage(self, job: str, rows: list[dict], window: Window, config: Config) -> bool:
+		rows = self._prepare_body_batch(job, rows, window, config)
+		if not rows:
+			return False
+		self._mark_running(job, "body", rows)
+		self._retrieve_stage_batch(job, "body", rows, window, config)
+		return True
+
+	def _metadata_stage(self, job: str, rows: list[dict], window: Window, config: Config) -> bool:
+		self._mark_running(job, "metadata", rows)
+		self._retrieve_stage_batch(job, "metadata", rows, window, config)
+		return True
+
+	def _classification_stage(self, job: str, stage: str, rows: list[dict], window: Window, config: Config) -> bool:
+		self._mark_running(job, stage, rows)
+		self.classify(job, rows, window, config)
+		return True
+
+	def _prepare_body_batch(self, job: str, rows: list[dict], window: Window, config: Config) -> list[dict]:
+		stage = "body"
+		# A paused body queue may predate stricter settings or a manual keep.
+		# Recheck before requesting any content, not after downloading it.
+		try:
+			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
+		except Exception as exc:  # noqa: BLE001 - metadata transport failure is assigned to unresolved work only
+			live_metadata = {row["message_id"]: exc for row in rows}
+		allowed = []
+		threads = self._prefetch_threads(
+			message for row in rows
+			if not isinstance(message := live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata")), Exception)
+			and self.s.eligible(message, window) and not self.excluded(message, config)
+			and (not json.loads(row["payload_json"]).get("download_only", False) or config.download_all_bodies)
+		)
+		with self.db.transaction():
+			for row in rows:
+				old = self.db.get_message(row["message_id"])
+				message = live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata"))
+				if isinstance(message, Exception):
+					self.fail(job, row, message, config)
+					continue
+				if old and old.headers == message.headers and old.internal_ms == message.internal_ms:
+					message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
+					message.context_version = old.context_version
+					message.content_hash = old.content_hash
+				self.db.upsert_message(message)
+				if not self.s.eligible(message, window):
+					self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
+					self.db.execute("UPDATE actions SET state='stale',reason='No longer an eligible inbox target' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
+					self.done(job, row["message_id"], stage)
+					continue
+				if self.excluded(message, config):
+					self.save_recommendation(job, message, None, "review", "Content sharing excluded by effective privacy settings", window)
+					self.done(job, message.id, stage)
+					continue
+				download_only = json.loads(row["payload_json"]).get("download_only", False)
+				if download_only and not config.download_all_bodies:
+					self.done(job, message.id, stage)
+					continue
+				try:
+					members = self._thread_members(message, threads)
+					message.context_version = context_hash(members, config.sent_context_enabled)
+					newer_excluded = self._newer_excluded(message, members, window)
+					context_changed = bool(old and old.context_version != message.context_version)
+					self.db.upsert_message(message)
+					if context_changed:
+						self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
+						self.db.execute("UPDATE actions SET state='stale',reason='Conversation changed during body queue' WHERE message_id=? AND state IN ('queued','proposed')", (message.id,))
+						self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
+						self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
+					if context_changed or newer_excluded:
+						self.set_checkpoint(f"recent_reply:{message.id}", newer_excluded)
+						self.save_recommendation(job, message, None, "review", "Conversation changed or has a newer excluded reply; reconsider before classification", window)
+						if config.download_all_bodies:
+							row["payload_json"] = encode({"download_only": True})
+							self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
+							allowed.append(row)
+						else:
+							self.done(job, message.id, stage)
+						continue
+				except Exception as exc:  # noqa: BLE001 - per-item safety check failure enters the kind-aware work queue
+					self.fail(job, row, exc, config)
+					continue
+				direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+				if direct.action in {"keep", "skip", "archive"}:
+					self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
+					if config.download_all_bodies:
+						row["payload_json"] = encode({"download_only": True})
+						self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (row["payload_json"], row["id"]))
+					else:
+						self.done(job, message.id, stage)
+						continue
+				allowed.append(row)
+		return allowed
+
+	def _mark_running(self, job: str, stage: str, rows: list[dict]) -> None:
+		ids = [r["message_id"] for r in rows]
+		for selected in chunks(ids):
+			self.db.execute(
+				f"UPDATE work_items SET state='running' WHERE job_id=? AND stage=? AND message_id IN ({placeholders(selected)})",  # noqa: S608 -- chunk contains only bind markers; job, stage and IDs stay bound
+				(job, stage, *selected),
+			)
+
+	def _retrieve_stage_batch(self, job: str, stage: str, rows: list[dict], window: Window, config: Config) -> None:
+		ids = [row["message_id"] for row in rows]
+		try:
+			results = self.s.mailbox.get_messages(ids, body=stage == "body")
+		except Exception as exc:  # noqa: BLE001 - multipart failure produces independent per-item error results
+			results = {mid: exc for mid in ids}
+		threads = self._prefetch_threads(
+			message for message in results.values()
+			if not isinstance(message, Exception) and self.s.eligible(message, window)
+		) if stage == "metadata" else {}
+		with self.db.transaction():
+			for row in rows:
+				mid = row["message_id"]
+				result = results.get(mid, ValueError("Missing retrieval result"))
+				try:
+					with self.db.transaction():
+						if isinstance(result, Exception):
+							raise result
+						if stage == "metadata":
+							self.metadata(job, result, window, config, threads=threads)
+						else:
+							# Eligibility is established before this retrieval was queued.
+							if self.s.eligible(result, window):
+								old = self.db.get_message(mid)
+								result.context_version = old.context_version if old else ""
+								if len(result.body or "") > config.body_limit:
+									result.body = result.body[:config.body_limit]
+									result.truncated = True
+								result.content_hash = content_hash(result)
+								self.db.upsert_message(result)
+								if not json.loads(row["payload_json"]).get("download_only", False):
+									self.queue(job, mid, "classification")
+						self.done(job, mid, stage)
+				except Exception as exc:  # noqa: BLE001 - one persistence failure must not discard prior completed rows
+					self.fail(job, row, exc, config)
 
 	def metadata(self, job: str, message, window: Window, config: Config, *, threads=None) -> None:
 		old = self.db.get_message(message.id)
@@ -546,8 +582,7 @@ class JobRunner:
 			message.truncated = True
 		message.content_hash = content_hash(message)
 		self.db.upsert_message(message)
-		current_window = resolve_window(self.s.config, window.anchor_utc)
-		newer_excluded = any(m.id != message.id and m.internal_ms > message.internal_ms and (not window.contains(m.internal_ms) or not current_window.contains(m.internal_ms)) and not ({"TRASH", "SPAM", "DRAFT"} & set(m.labels)) for m in members)
+		newer_excluded = self._newer_excluded(message, members, window)
 		self.set_checkpoint(f"recent_reply:{message.id}", newer_excluded)
 		if old and old.context_version != message.context_version:
 			self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
@@ -630,65 +665,7 @@ class JobRunner:
 		return True
 
 	def classify(self, job: str, rows: list[dict], window: Window, config: Config) -> None:
-		pending = defaultdict(list)
-		try:
-			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
-		except Exception as exc:  # noqa: BLE001 - classification metadata transport failure remains per-item evidence
-			live_metadata = {row["message_id"]: exc for row in rows}
-		threads = {}
-		for row in rows:
-			stored = self.db.get_message(row["message_id"])
-			message = live_metadata.get(row["message_id"], ValueError("Missing classification-preflight metadata"))
-			if isinstance(message, Exception):
-				self.fail(job, row, message, config)
-				continue
-			if stored and stored.internal_ms == message.internal_ms and stored.headers == message.headers:
-				message.body, message.truncated, message.missing_content = stored.body, stored.truncated, stored.missing_content
-				message.context_version, message.content_hash = stored.context_version, stored.content_hash
-			self.db.upsert_message(message)
-			if not stored or not self.s.eligible(message, window) or self.excluded(message, config):
-				if stored:
-					self.save_recommendation(job, message, None, "review" if self.s.eligible(message, window) else "skip", "Classification preflight found changed scope or content-sharing state", window)
-				self.done(job, row["message_id"], "classification")
-				continue
-			try:
-				if message.thread_id not in threads:
-					threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
-				members = threads[message.thread_id]
-				message.context_version = context_hash(members, config.sent_context_enabled)
-				current_window = resolve_window(self.s.config, window.anchor_utc)
-				newer_excluded = any(member.id != message.id and member.internal_ms > message.internal_ms and (not window.contains(member.internal_ms) or not current_window.contains(member.internal_ms)) and not ({"TRASH", "SPAM", "DRAFT"} & member.labels) for member in members)
-				self.db.upsert_message(message)
-				if stored.context_version != message.context_version or newer_excluded or message.missing_content or not message.body:
-					self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
-					self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
-					self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
-					self.save_recommendation(job, message, None, "review", "Conversation/content changed or is incomplete before AI submission", window)
-					self.done(job, message.id, "classification")
-					continue
-			except Exception as exc:  # noqa: BLE001 - one classification preflight failure must preserve other targets
-				self.fail(job, row, exc, config)
-				continue
-			direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-			if direct.action in {"keep", "skip", "archive"}:
-				self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
-				self.done(job, message.id, "classification")
-				continue
-			examples = self.examples(message, config, window)
-			route = self.route_category(message, config)
-			model = config.optional_model_routes.get(route, config.ai_model)
-			example_inputs = self.example_signature(examples)
-			version = digest({"module": config.ai_module, "model": model, "examples": example_inputs, "prompt": PROMPT_VERSION, "sent_context_enabled": config.sent_context_enabled, "archived_context_enabled": config.archived_context_enabled})
-			cached = self.db.one("SELECT assessment_json FROM predictions WHERE message_id=? AND content_hash=? AND context_version=? AND model_version=? AND valid=1 ORDER BY created_at DESC LIMIT 1", (message.id, message.content_hash, message.context_version, version))
-			if cached:
-				assessment = Assessment.from_dict(json.loads(cached["assessment_json"]))
-				decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-				self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
-				self.done(job, message.id, "classification")
-			else:
-				# Batching unrelated example selections would make an assessment
-				# depend on examples absent from its cache key. Group like selections.
-				pending[(route, digest(example_inputs))].append((row, message, examples, version))
+		pending, threads = self._prepare_classification(job, rows, window, config)
 		if not pending:
 			return
 		exclusions = {"senders": config.excluded_senders, "domains": config.excluded_domains, "label_ids": config.excluded_label_ids, "categories": config.excluded_categories}
@@ -696,33 +673,108 @@ class JobRunner:
 		if getattr(self.s, "supports_context_cache", False):
 			context_options.update(threads=threads, bodies={})
 		for (route, _), group in pending.items():
+			if not self._classify_group(job, route, group, window, config, exclusions, context_options):
+				return
+
+	def _prepare_classification(self, job: str, rows: list[dict], window: Window, config: Config) -> tuple[dict[tuple[str, str], list[_AssessmentWork]], dict]:
+		pending: dict[tuple[str, str], list[_AssessmentWork]] = defaultdict(list)
+		try:
+			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
+		except Exception as exc:  # noqa: BLE001 - classification metadata transport failure remains per-item evidence
+			live_metadata = {row["message_id"]: exc for row in rows}
+		threads: dict[str, Any] = {}
+		for row in rows:
+			candidate = self._classification_candidate(job, row, live_metadata, window, config, threads)
+			if candidate is not None:
+				key, work = candidate
+				pending[key].append(work)
+		return pending, threads
+
+	def _classification_candidate(self, job: str, row: dict, live_metadata: dict, window: Window, config: Config,
+			threads: dict) -> tuple[tuple[str, str], _AssessmentWork] | None:
+		stored = self.db.get_message(row["message_id"])
+		message = live_metadata.get(row["message_id"], ValueError("Missing classification-preflight metadata"))
+		if isinstance(message, Exception):
+			self.fail(job, row, message, config)
+			return None
+		if stored and stored.internal_ms == message.internal_ms and stored.headers == message.headers:
+			message.body, message.truncated, message.missing_content = stored.body, stored.truncated, stored.missing_content
+			message.context_version, message.content_hash = stored.context_version, stored.content_hash
+		self.db.upsert_message(message)
+		if not stored or not self.s.eligible(message, window) or self.excluded(message, config):
+			if stored:
+				self.save_recommendation(job, message, None, "review" if self.s.eligible(message, window) else "skip", "Classification preflight found changed scope or content-sharing state", window)
+			self.done(job, row["message_id"], "classification")
+			return None
+		try:
+			if message.thread_id not in threads:
+				threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+			members = threads[message.thread_id]
+			message.context_version = context_hash(members, config.sent_context_enabled)
+			newer_excluded = self._newer_excluded(message, members, window)
+			self.db.upsert_message(message)
+			if stored.context_version != message.context_version or newer_excluded or message.missing_content or not message.body:
+				self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
+				self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
+				self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
+				self.save_recommendation(job, message, None, "review", "Conversation/content changed or is incomplete before AI submission", window)
+				self.done(job, message.id, "classification")
+				return None
+		except Exception as exc:  # noqa: BLE001 - one classification preflight failure must preserve other targets
+			self.fail(job, row, exc, config)
+			return None
+		direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+		if direct.action in {"keep", "skip", "archive"}:
+			self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
+			self.done(job, message.id, "classification")
+			return None
+		examples = self.examples(message, config, window)
+		route = self.route_category(message, config)
+		model = config.optional_model_routes.get(route, config.ai_model)
+		example_inputs = self.example_signature(examples)
+		version = digest({"module": config.ai_module, "model": model, "examples": example_inputs, "prompt": PROMPT_VERSION, "sent_context_enabled": config.sent_context_enabled, "archived_context_enabled": config.archived_context_enabled})
+		cached = self.db.one("SELECT assessment_json FROM predictions WHERE message_id=? AND content_hash=? AND context_version=? AND model_version=? AND valid=1 ORDER BY created_at DESC LIMIT 1", (message.id, message.content_hash, message.context_version, version))
+		if cached:
+			assessment = Assessment.from_dict(json.loads(cached["assessment_json"]))
+			decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+			self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
+			self.done(job, message.id, "classification")
+		else:
+			# Batching unrelated example selections would make an assessment
+			# depend on examples absent from its cache key. Group like selections.
+			return (route, digest(example_inputs)), (row, message, examples, version)
+		return None
+
+	def _classify_group(self, job: str, route: str, group: list[_AssessmentWork], window: Window, config: Config,
+			exclusions: dict, context_options: dict[str, Any]) -> bool:
+		try:
+			examples = group[0][2]
+			contexts = {}
+			for _, message, _, _ in group:
+				for context in self.s.context_messages(message, window, **context_options):
+					if window.contains(context.internal_ms) and resolve_window(self.s.config, window.anchor_utc).contains(context.internal_ms) and not self.excluded(context, config):
+						contexts[context.id] = context
+			if not self.reserve_ai_call(job, config):
+				self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND stage='classification' AND state='running'", (job,))
+				return False
+			batch = self.s.ai_for(route).assess([p[1] for p in group], self.db.labels(), examples=examples, exclusions=exclusions, sent_context_enabled=config.sent_context_enabled, context_messages=list(contexts.values()))
+		except Exception as exc:  # noqa: BLE001 - provider group failure enters kind-aware job backoff without losing receipts
+			for row, _, _, _ in group:
+				self.fail(job, row, exc, config)
+			return True
+		for row, message, _, version in group:
 			try:
-				examples = group[0][2]
-				contexts = {}
-				for _, message, _, _ in group:
-					for context in self.s.context_messages(message, window, **context_options):
-						if window.contains(context.internal_ms) and resolve_window(self.s.config, window.anchor_utc).contains(context.internal_ms) and not self.excluded(context, config):
-							contexts[context.id] = context
-				if not self.reserve_ai_call(job, config):
-					self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND stage='classification' AND state='running'", (job,))
-					return
-				batch = self.s.ai_for(route).assess([p[1] for p in group], self.db.labels(), examples=examples, exclusions=exclusions, sent_context_enabled=config.sent_context_enabled, context_messages=list(contexts.values()))
-			except Exception as exc:  # noqa: BLE001 - provider group failure enters kind-aware job backoff without losing receipts
-				for row, _, _, _ in group:
-					self.fail(job, row, exc, config)
-				continue
-			for row, message, _, version in group:
-				try:
-					assessment = batch.assessments.get(message.id)
-					if assessment is None:
-						raise ValueError(batch.errors.get(message.id, "Missing assessment"))
-					decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-					telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
-					with self.db.transaction():
-						self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
-						self.done(job, message.id, "classification")
-				except Exception as exc:  # noqa: BLE001 - save failure retries only the unresolved classification item
-					self.fail(job, row, exc, config)
+				assessment = batch.assessments.get(message.id)
+				if assessment is None:
+					raise ValueError(batch.errors.get(message.id, "Missing assessment"))
+				decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+				telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
+				with self.db.transaction():
+					self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
+					self.done(job, message.id, "classification")
+			except Exception as exc:  # noqa: BLE001 - save failure retries only the unresolved classification item
+				self.fail(job, row, exc, config)
+		return True
 
 	def save_recommendation(self, job, message, assessment, action, reason, window, version="", telemetry=None, label_ids=None, approval="automatic"):
 		with self.db.transaction():

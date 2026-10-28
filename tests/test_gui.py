@@ -439,20 +439,6 @@ def test_preview_preserves_only_explicit_safe_link_attributes():
 	assert BeautifulSoup(clean, "html.parser").a.attrs == {"href": "https://example.invalid/path", "title": "Open"}
 
 
-def test_switching_simulation_off_in_settings_keeps_reviewed_action_ids(qtbot, service, monkeypatch):
-	window = MainWindow(service)
-	qtbot.addWidget(window)
-	replanned = []
-	def update_config(config):
-		service.config = config
-	monkeypatch.setattr(service, "update_config", update_config, raising=False)
-	monkeypatch.setattr(service, "replan", lambda **kwargs: replanned.append(True), raising=False)
-	monkeypatch.setattr(window, "_submit", lambda title, operation, done=None, **kwargs: operation(service, lambda value: None))
-	config = Config.from_dict({**service.config.to_dict(), "dry_run": False})
-	window._save_settings(config)
-	assert replanned == []
-
-
 def test_retry_refresh_resumes_due_system_pause_and_surfaces_block_reason(qapp, qtbot, service, tmp_path, monkeypatch):
 	import json
 	window = MainWindow(service, QSettings(str(tmp_path / "system-retry.ini"), QSettings.Format.IniFormat))
@@ -466,6 +452,77 @@ def test_retry_refresh_resumes_due_system_pause_and_surfaces_block_reason(qapp, 
 	assert resumed == ["system"]
 	assert "Network recovery pending" in window.job_status.text()
 	window.close()
+
+
+def test_disconnect_and_revoke_is_an_explicit_confirmed_action(qtbot, service, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox, QPushButton
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	service.demo = False
+	buttons = [button for button in window.findChildren(QPushButton) if button.text() == "Disconnect and revoke"]
+	assert len(buttons) == 1
+	calls = []
+	monkeypatch.setattr(window, "_submit", lambda title, operation: calls.append((title, operation)))
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+	buttons[0].click()
+	assert not calls
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+	buttons[0].click()
+	assert len(calls) == 1
+	fake = type("Connection", (), {"disconnect": lambda self, revoke=False: calls.append(revoke)})()
+	calls[0][1](fake, None)
+	assert calls[-1] is True
+
+
+def test_saving_external_ai_code_requires_hash_confirmation(qtbot, tmp_path, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox
+	module = tmp_path / "provider.py"
+	module.write_text("def call_api(prompt):\n\treturn 'offline'\n")
+	editor = SettingsEditor(Config(ai_module=str(module)))
+	qtbot.addWidget(editor)
+	saved = []
+	editor.saved.connect(saved.append)
+	questions = []
+	def answer_no(*args):
+		questions.append(args)
+		return QMessageBox.StandardButton.No
+	monkeypatch.setattr(QMessageBox, "question", answer_no)
+	editor._save()
+	assert questions
+	assert not saved
+	assert "SHA-256" in questions[-1][2]
+	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+	editor._save()
+	assert len(saved) == 1
+	assert len(saved[0].ai_module_sha256) == 64
+	assert "ai_module_sha256" not in editor.controls
+
+
+def test_break_lease_uses_independent_preview_pool(qtbot, service, tmp_path, monkeypatch):
+	from gmail_clean import gui
+	window = MainWindow(service, settings=QSettings(str(tmp_path / 'lease-prefs.ini'), QSettings.Format.IniFormat))
+	qtbot.addWidget(window)
+	assert service.store.acquire_lease('mailbox_execution')
+	monkeypatch.setattr(gui.QMessageBox, 'warning', lambda *args, **kwargs: gui.QMessageBox.StandardButton.Yes)
+	submissions = []
+	monkeypatch.setattr(window, '_submit', lambda *args, **kwargs: submissions.append((args, kwargs)))
+	window._break_lease()
+	assert submissions[0][1]['pool'] is window.preview_pool
+	window.close()
+
+
+def test_switching_simulation_off_in_settings_keeps_reviewed_action_ids(qtbot, service, monkeypatch):
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	replanned = []
+	def update_config(config):
+		service.config = config
+	monkeypatch.setattr(service, "update_config", update_config, raising=False)
+	monkeypatch.setattr(service, "replan", lambda **kwargs: replanned.append(True), raising=False)
+	monkeypatch.setattr(window, "_submit", lambda title, operation, done=None, **kwargs: operation(service, lambda value: None))
+	config = Config.from_dict({**service.config.to_dict(), "dry_run": False})
+	window._save_settings(config)
+	assert replanned == []
 
 
 def test_gui_undo_above_cap_requires_and_passes_explicit_confirmation(qtbot, service, monkeypatch):
@@ -579,60 +636,3 @@ def test_readonly_gui_tasks_do_not_validate_or_load_the_external_provider(qapp, 
 		assert observed == [(True, 0)]
 	finally:
 		service.close()
-
-
-def test_disconnect_and_revoke_is_an_explicit_confirmed_action(qtbot, service, monkeypatch):
-	from PyQt6.QtWidgets import QMessageBox, QPushButton
-	window = MainWindow(service)
-	qtbot.addWidget(window)
-	service.demo = False
-	buttons = [button for button in window.findChildren(QPushButton) if button.text() == "Disconnect and revoke"]
-	assert len(buttons) == 1
-	calls = []
-	monkeypatch.setattr(window, "_submit", lambda title, operation: calls.append((title, operation)))
-	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
-	buttons[0].click()
-	assert not calls
-	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
-	buttons[0].click()
-	assert len(calls) == 1
-	fake = type("Connection", (), {"disconnect": lambda self, revoke=False: calls.append(revoke)})()
-	calls[0][1](fake, None)
-	assert calls[-1] is True
-
-
-def test_saving_external_ai_code_requires_hash_confirmation(qtbot, tmp_path, monkeypatch):
-	from PyQt6.QtWidgets import QMessageBox
-	module = tmp_path / "provider.py"
-	module.write_text("def call_api(prompt):\n\treturn 'offline'\n")
-	editor = SettingsEditor(Config(ai_module=str(module)))
-	qtbot.addWidget(editor)
-	saved = []
-	editor.saved.connect(saved.append)
-	questions = []
-	def answer_no(*args):
-		questions.append(args)
-		return QMessageBox.StandardButton.No
-	monkeypatch.setattr(QMessageBox, "question", answer_no)
-	editor._save()
-	assert questions
-	assert not saved
-	assert "SHA-256" in questions[-1][2]
-	monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
-	editor._save()
-	assert len(saved) == 1
-	assert len(saved[0].ai_module_sha256) == 64
-	assert "ai_module_sha256" not in editor.controls
-
-
-def test_break_lease_uses_independent_preview_pool(qtbot, service, tmp_path, monkeypatch):
-	from gmail_clean import gui
-	window = MainWindow(service, settings=QSettings(str(tmp_path / 'lease-prefs.ini'), QSettings.Format.IniFormat))
-	qtbot.addWidget(window)
-	assert service.store.acquire_lease('mailbox_execution')
-	monkeypatch.setattr(gui.QMessageBox, 'warning', lambda *args, **kwargs: gui.QMessageBox.StandardButton.Yes)
-	submissions = []
-	monkeypatch.setattr(window, '_submit', lambda *args, **kwargs: submissions.append((args, kwargs)))
-	window._break_lease()
-	assert submissions[0][1]['pool'] is window.preview_pool
-	window.close()

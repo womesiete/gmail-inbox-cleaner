@@ -739,18 +739,6 @@ def test_recovery_uses_batched_metadata_readback(app):
 	assert all(state(app, aid)["state"] == "reconciled" for aid in ids)
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409, 422, 429])
-def test_explicit_http_rejection_records_not_applied_instead_of_uncertain(app, status_code):
-	from gmail_clean.gmail import GmailError
-	aid = plan(app, seed(app))
-	def rejected(*args, **kwargs):
-		raise GmailError("data", "Synthetic explicit rejection", status=status_code)
-	app.mailbox.modify = rejected
-	app.actions.apply([aid])
-	assert state(app, aid)["state"] == ("conflict" if status_code in {400, 404, 422} else "retry")
-	assert app.store.one("SELECT state FROM attempts WHERE action_id=?", (aid,))["state"] == "not_applied"
-
-
 def test_write_cap_requires_explicit_confirmation(app):
 	app.config.max_actions_per_run = 1
 	ids = [plan(app, seed(app, f"m{i}")) for i in range(2)]
@@ -778,6 +766,77 @@ def test_reviewed_delta_changed_during_preflight_refuses_the_batch(app):
 		app.actions.apply([aid], expected_plan_hash=snapshot["hash"])
 	assert not app.mailbox.calls
 	assert not app.store.one("SELECT id FROM attempts")
+
+
+def test_undo_history_scan_shared_by_batch(app):
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(10)]
+	assert app.actions.apply(ids)["applied"] == 10
+	reads = []
+	original = app.mailbox.history
+	def history(start, page_token=None):
+		reads.append((start, page_token))
+		return original(start, page_token)
+	app.mailbox.history = history
+	assert app.actions.undo(ids)["applied"] == 10
+	# One shared indexed scan establishes intervening history; one other scan
+	# proves the inverse receipt interval. Rechecks reuse the same evidence.
+	assert len(reads) <= 2
+
+
+def test_unverified_undo_requires_confirmation_and_exact_recorded_after_state(app):
+	aid = plan(app, seed(app))
+	assert app.actions.apply([aid])["applied"] == 1
+	app.mailbox.expired_history = True
+	with pytest.raises(ValueError, match="explicit confirmation"):
+		app.actions.undo([aid], allow_unverified=True)
+	assert "INBOX" not in app.mailbox.messages["old"].labels
+	assert app.actions.undo([aid], allow_unverified=True, confirmed=True)["applied"] == 1
+	assert "INBOX" in app.mailbox.messages["old"].labels
+
+
+def test_unverified_undo_refuses_even_unrelated_label_changes(app):
+	aid = plan(app, seed(app))
+	app.actions.apply([aid])
+	app.mailbox.expired_history = True
+	app.mailbox.edit("old", add=["Label_other"])
+	app.actions.undo([aid], allow_unverified=True, confirmed=True)
+	assert "INBOX" not in app.mailbox.messages["old"].labels
+	inverse = app.store.one("SELECT * FROM actions WHERE undo_of=?", (aid,))
+	assert inverse["state"] == "conflict"
+	assert "exact recorded after-state" in inverse["reason"]
+
+
+def test_confirmation_error_keeps_content_free_ui_explanation(app):
+	from gmail_clean.runtime import safe_error
+	app.config.max_actions_per_run = 0
+	plan(app, seed(app))
+	with pytest.raises(ValueError) as caught:
+		app.actions.apply()
+	assert "exceeds the write cap" in safe_error(caught.value)
+
+
+def test_large_reviewed_snapshot_stays_below_sqlite_variable_limit(app):
+	import sqlite3
+	ids = [f"selected-{index:05}" for index in range(1200)]
+	with app.store.transaction():
+		app.store.conn.executemany("INSERT INTO actions(id,message_id,state) VALUES(?,?,'queued')", ((aid, aid) for aid in ids))
+	app.store.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 900)
+	forward = app.actions.plan_snapshot(ids)
+	reverse = app.actions.plan_snapshot(list(reversed(ids)))
+	assert forward["count"] == 1200
+	assert forward["hash"] == reverse["hash"]
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409, 422, 429])
+def test_explicit_http_rejection_records_not_applied_instead_of_uncertain(app, status_code):
+	from gmail_clean.gmail import GmailError
+	aid = plan(app, seed(app))
+	def rejected(*args, **kwargs):
+		raise GmailError("data", "Synthetic explicit rejection", status=status_code)
+	app.mailbox.modify = rejected
+	app.actions.apply([aid])
+	assert state(app, aid)["state"] == ("conflict" if status_code in {400, 404, 422} else "retry")
+	assert app.store.one("SELECT state FROM attempts WHERE action_id=?", (aid,))["state"] == "not_applied"
 
 
 @pytest.mark.parametrize("reviewed", [False, True])
@@ -857,62 +916,3 @@ def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_m
 		assert state(app, aid)["state"] == "proposed"
 	assert not app.mailbox.calls
 	assert not app.store.one("SELECT id FROM attempts")
-
-
-def test_undo_history_scan_shared_by_batch(app):
-	ids = [plan(app, seed(app, f"m{i}")) for i in range(10)]
-	assert app.actions.apply(ids)["applied"] == 10
-	reads = []
-	original = app.mailbox.history
-	def history(start, page_token=None):
-		reads.append((start, page_token))
-		return original(start, page_token)
-	app.mailbox.history = history
-	assert app.actions.undo(ids)["applied"] == 10
-	# One shared indexed scan establishes intervening history; one other scan
-	# proves the inverse receipt interval. Rechecks reuse the same evidence.
-	assert len(reads) <= 2
-
-
-def test_unverified_undo_requires_confirmation_and_exact_recorded_after_state(app):
-	aid = plan(app, seed(app))
-	assert app.actions.apply([aid])["applied"] == 1
-	app.mailbox.expired_history = True
-	with pytest.raises(ValueError, match="explicit confirmation"):
-		app.actions.undo([aid], allow_unverified=True)
-	assert "INBOX" not in app.mailbox.messages["old"].labels
-	assert app.actions.undo([aid], allow_unverified=True, confirmed=True)["applied"] == 1
-	assert "INBOX" in app.mailbox.messages["old"].labels
-
-
-def test_unverified_undo_refuses_even_unrelated_label_changes(app):
-	aid = plan(app, seed(app))
-	app.actions.apply([aid])
-	app.mailbox.expired_history = True
-	app.mailbox.edit("old", add=["Label_other"])
-	app.actions.undo([aid], allow_unverified=True, confirmed=True)
-	assert "INBOX" not in app.mailbox.messages["old"].labels
-	inverse = app.store.one("SELECT * FROM actions WHERE undo_of=?", (aid,))
-	assert inverse["state"] == "conflict"
-	assert "exact recorded after-state" in inverse["reason"]
-
-
-def test_confirmation_error_keeps_content_free_ui_explanation(app):
-	from gmail_clean.runtime import safe_error
-	app.config.max_actions_per_run = 0
-	plan(app, seed(app))
-	with pytest.raises(ValueError) as caught:
-		app.actions.apply()
-	assert "exceeds the write cap" in safe_error(caught.value)
-
-
-def test_large_reviewed_snapshot_stays_below_sqlite_variable_limit(app):
-	import sqlite3
-	ids = [f"selected-{index:05}" for index in range(1200)]
-	with app.store.transaction():
-		app.store.conn.executemany("INSERT INTO actions(id,message_id,state) VALUES(?,?,'queued')", ((aid, aid) for aid in ids))
-	app.store.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 900)
-	forward = app.actions.plan_snapshot(ids)
-	reverse = app.actions.plan_snapshot(list(reversed(ids)))
-	assert forward["count"] == 1200
-	assert forward["hash"] == reverse["hash"]
