@@ -1,0 +1,494 @@
+"""Application services shared by the desktop UI, CLI, and offline tests."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from .actions import ActionExecutor
+from .ai import AIClient, AIError
+from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, eligible, protections, recommend, resolve_window
+from .jobs import JobRunner
+from .learning import Learning
+from .runtime import data_directory, digest, encode, identifier, insert, safe_error, stamp, utc_now
+from .storage import LeaseBusyError, Store
+
+
+class AppService:
+	def __init__(self, store=None, mailbox=None, config=None, data_dir=None, demo=False, count=3000, clock=utc_now, ai_factory=None):
+		self.demo = demo
+		self._closed = False
+		self.clock = clock
+		self.count = count
+		self.data_dir = Path(data_dir) if data_dir else data_directory(demo)
+		self.data_dir.mkdir(parents=True, exist_ok=True)
+		if os.name != "nt":
+			os.chmod(self.data_dir, 0o700)
+		self._mailbox = mailbox
+		from .gmail import GmailMailbox
+		self._supplied_mailbox = mailbox is not None and not isinstance(mailbox, GmailMailbox)
+		self._ai_factory = ai_factory
+		self._clients = {}
+		self._lease_depth = 0
+		self.current_job_id = None
+		if demo and mailbox is not None:
+			from .demo import DemoMailbox
+			if not isinstance(mailbox, DemoMailbox):
+				raise ValueError("Demo accepts only the offline DemoMailbox adapter")
+		if demo and mailbox is None:
+			from .demo import DemoMailbox
+			self._mailbox = DemoMailbox(self.data_dir / "demo-mailbox.json", count=count, anchor=clock())
+		if store is not None:
+			self.account_id = store.account_id
+			self.store = store
+		else:
+			self.account_id = self._identity_from_disk()
+			if self._mailbox is not None:
+				self.account_id = self._mailbox.identity().casefold()
+			self.store = Store(self._database(self.account_id), self.account_id)
+		self._connection_generation = self._connection_state().get("generation", "")
+		saved = self.store.checkpoint("effective_preferences")
+		self.config = Config.from_dict(config.to_dict()) if config is not None else Config.from_dict(saved or {})
+		if demo and saved is None:
+			self.config.label_meanings.setdefault("label_action", "requires_attention")
+		if demo and not self.config.ai_module:
+			self.config.ai_module = "gmail_clean.demo_ai"
+		self._validate_demo_ai(self.config)
+		self.config.validate()
+		if config is not None or saved is None:
+			self.store.set_checkpoint("effective_preferences", self.config.to_dict())
+		self._configure_services()
+		if self._mailbox is not None:
+			self._check_identity()
+			self.refresh_labels()
+
+	def _configure_services(self):
+		self.learning = Learning(self.store, enabled=self.config.learning_enabled)
+		self.actions = ActionExecutor(self)
+		self.jobs = JobRunner(self)
+
+	def _identity_from_disk(self):
+		if self.demo:
+			return "demo@example.invalid"
+		try:
+			return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))["account_id"].casefold()
+		except (FileNotFoundError, ValueError, KeyError):
+			return "unconnected"
+
+	def _database(self, account):
+		return self.data_dir / ("unconnected.sqlite" if account == "unconnected" else "mailbox-" + digest(account)[:12] + ".sqlite")
+
+	def _connection_state(self):
+		try:
+			return json.loads((self.data_dir / "account.json").read_text(encoding="utf-8"))
+		except (FileNotFoundError, ValueError):
+			return {}
+
+	def _write_identity(self, connected=True):
+		target = self.data_dir / "account.json"
+		temporary = target.with_suffix(".tmp")
+		generation = identifier()
+		temporary.write_text(encode({"account_id": self.account_id, "connected": connected, "generation": generation}), encoding="utf-8")
+		temporary.replace(target)
+		self._connection_generation = generation
+
+	def refresh_connection(self) -> bool:
+		account = self._identity_from_disk()
+		generation = self._connection_state().get("generation", "")
+		if account == self.account_id:
+			self.reload_config()
+			if generation == self._connection_generation:
+				return False
+			self._close_ai()
+			self._mailbox = None
+			self._connection_generation = generation
+			return True
+		self._close_ai()
+		self.store.close()
+		self._mailbox = None
+		self.account_id = account
+		self._connection_generation = generation
+		self.store = Store(self._database(account), account)
+		saved = self.store.checkpoint("effective_preferences")
+		if saved:
+			self.config = Config.from_dict(saved)
+		else:
+			self.store.set_checkpoint("effective_preferences", self.config.to_dict())
+		self._configure_services()
+		return True
+
+	@property
+	def mailbox(self):
+		if self._closed:
+			raise RuntimeError("This service has been closed")
+		if not self.demo:
+			state = self._connection_state()
+			if state and (not state.get("connected", True) or state.get("generation", "") != self._connection_generation or state.get("account_id", "").casefold() != self.account_id):
+				from .auth import AuthenticationError
+				raise AuthenticationError("The Gmail connection was disconnected or changed. Connect again or open a fresh worker.")
+		if self._mailbox is None:
+			from .auth import AuthManager
+			self._mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit).mailbox()
+			self._check_identity()
+		from .gmail import GmailMailbox
+		if isinstance(self._mailbox, GmailMailbox):
+			self._mailbox.body_limit = self.config.body_limit
+			self._mailbox.retrieval_batch_size = self.config.retrieval_batch_size
+			self._mailbox.execution_batch_size = self.config.execution_batch_size
+		return self._mailbox
+
+	def _check_identity(self):
+		if self.demo:
+			from .demo import DEMO_ACCOUNT, DemoMailbox
+			if not isinstance(self._mailbox, DemoMailbox) or self.account_id != DEMO_ACCOUNT:
+				raise ValueError("Demo cannot use a real mailbox")
+		if self._mailbox.identity().casefold() != self.account_id:
+			raise ValueError("The authenticated account differs from this database; reconnect explicitly")
+
+	@property
+	def ai(self):
+		return self.ai_for()
+
+	def ai_for(self, category=""):
+		self._validate_demo_ai(self.config)
+		model = self.config.optional_model_routes.get(category, self.config.ai_model)
+		key = (self.config.ai_module, model, self.config.ai_use_call_api_result, self.config.ai_timeout_seconds)
+		if key not in self._clients:
+			factory = self._ai_factory or AIClient
+			self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds)
+		return self._clients[key]
+
+	def _validate_demo_ai(self, config):
+		if self.demo and config.ai_module != "gmail_clean.demo_ai":
+			raise AIError("ConfigurationError", "Offline demo uses only gmail_clean.demo_ai. Launch Personal mode to configure an external AI module.")
+
+	def reload_config(self):
+		value = self.store.checkpoint("effective_preferences")
+		if value:
+			self.config = Config.from_dict(value)
+			self.learning.enabled = self.config.learning_enabled
+
+	def update_config(self, config):
+		if isinstance(config, dict):
+			config = Config.from_dict(config)
+		else:
+			config = Config.from_dict(config.to_dict())
+		config.validate()
+		self._validate_demo_ai(config)
+		resolve_window(config, self.clock())
+		previous = Config.from_dict(self.store.checkpoint("effective_preferences", self.config.to_dict()))
+		self.config = config
+		with self.store.transaction():
+			self.store.set_checkpoint("effective_preferences", config.to_dict())
+			if previous.revision != config.revision:
+				self.store.execute("UPDATE actions SET state='stale',reason='Settings changed; replan',updated_at=? WHERE state IN ('queued','proposed','retry')", (stamp(),))
+		self.learning.enabled = config.learning_enabled
+		if (previous.ai_module, previous.ai_model, previous.ai_use_call_api_result, previous.ai_timeout_seconds, previous.optional_model_routes) != (config.ai_module, config.ai_model, config.ai_use_call_api_result, config.ai_timeout_seconds, config.optional_model_routes):
+			self._close_ai()
+		return config.to_dict()
+
+	@contextlib.contextmanager
+	def worker(self):
+		"""Each Qt worker constructs fresh SQLite and Gmail clients on its own thread."""
+		mailbox = None
+		if self._supplied_mailbox and not self.demo:
+			# Dependency-injected transports are test-only; production clients are
+			# restored inside the worker and never cross thread ownership boundaries.
+			mailbox = self._mailbox
+		clone = AppService(config=None, data_dir=self.data_dir, demo=self.demo, count=self.count, clock=self.clock, mailbox=mailbox, ai_factory=self._ai_factory)
+		try:
+			yield clone
+		finally:
+			clone.close()
+
+	@contextlib.contextmanager
+	def execution_lease(self):
+		if self._lease_depth == 0 and not self.store.acquire_lease("mailbox_execution"):
+			raise LeaseBusyError("Another worker is using this mailbox; pause it before executing")
+		self._lease_depth += 1
+		try:
+			yield
+		finally:
+			self._lease_depth -= 1
+			if self._lease_depth == 0:
+				self.store.release_lease("mailbox_execution")
+
+	def heartbeat(self, job=None):
+		if self._lease_depth:
+			self.store.heartbeat("mailbox_execution")
+
+	def new_job(self):
+		self.reload_config()
+		self.current_job_id = self.jobs.new()
+		return self.current_job_id
+
+	def run_job(self, job_id, progress=None, should_stop=None):
+		with self.execution_lease():
+			self.reload_config()
+			self.refresh_labels()
+			self.current_job_id = job_id
+			return self.jobs.run(job_id, progress, should_stop)
+
+	def control_job(self, job_id, state):
+		state = {"pause": "paused", "resume": "pending", "stop": "stopped", "running": "pending"}.get(state, state)
+		if state not in {"paused", "pending", "stopped"}:
+			raise ValueError("Use pause, resume, or stop")
+		self.store.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job_id))
+		return state
+
+	def eligible(self, message, window):
+		if message.account_id and message.account_id.casefold() != self.account_id:
+			return False
+		current = resolve_window(self.config, window.anchor_utc)
+		return eligible(message, window) and eligible(message, current)
+
+	def excluded(self, message):
+		config = self.config
+		domain = message.sender.rpartition("@")[2]
+		row = self.store.one("SELECT category FROM messages WHERE id=?", (message.id,))
+		return (message.sender in {value.casefold() for value in config.excluded_senders}
+			or domain in {value.casefold().lstrip("@") for value in config.excluded_domains}
+			or bool(set(message.labels) & set(config.excluded_label_ids))
+			or bool(row and row["category"] in config.excluded_categories))
+
+	def override(self, message):
+		override = self.learning.manual_override(message)
+		if override and override["action"] == "defer" and override.get("defer_until_utc"):
+			if datetime.fromisoformat(override["defer_until_utc"].replace("Z", "+00:00")) <= self.clock():
+				self.store.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
+				self.store.execute("UPDATE messages SET defer_until_utc=NULL WHERE id=?", (message.id,))
+				return None
+		return override
+
+	def _bound_body(self, message, limit=None):
+		limit = min(self.config.body_limit, limit) if limit is not None else self.config.body_limit
+		if message.body is not None and len(message.body) > limit:
+			message.body = message.body[:limit]
+			message.truncated = True
+		return message
+
+	def examples(self, message):
+		return self.learning.examples_for(message, excluded_senders=self.config.excluded_senders, excluded_domains=self.config.excluded_domains, excluded_categories=self.config.excluded_categories, excluded_label_ids=self.config.excluded_label_ids)
+
+	def rules(self):
+		return self.learning.rules(include_disabled=False)
+
+	def refresh_labels(self):
+		labels = self.mailbox.labels()
+		for label in labels:
+			label["meaning"] = self.config.label_meanings.get(label["id"], "neutral")
+		self.store.replace_labels(labels)
+		return labels
+
+	def context_messages(self, message, window, config=None):
+		"""Optional context obeys the same body privacy bounds; never action targets."""
+		config = config or self.config
+		if not (config.sent_context_enabled or config.archived_context_enabled):
+			return []
+		result = []
+		for member in self.mailbox.thread_metadata(message.thread_id):
+			if member.id == message.id or not window.contains(member.internal_ms):
+				continue
+			if not resolve_window(self.config, window.anchor_utc).contains(member.internal_ms) or {"SPAM", "TRASH", "DRAFT"} & member.labels or self.excluded(member) or content_excluded(member, config):
+				continue
+			row = self.store.one("SELECT category FROM messages WHERE id=?", (member.id,))
+			if row and row["category"] in config.excluded_categories:
+				continue
+			if ("SENT" in member.labels and config.sent_context_enabled and self.config.sent_context_enabled) or ("INBOX" not in member.labels and "SENT" not in member.labels and config.archived_context_enabled and self.config.archived_context_enabled):
+				result.append(self._bound_body(self.mailbox.get_message(member.id, body=True), config.body_limit))
+			if len(result) >= 8:
+				break
+		return result
+
+	def download_bodies(self, ids):
+		window = resolve_window(self.config, self.clock())
+		count = 0
+		for mid in ids:
+			meta = self.mailbox.get_message(mid, body=False)
+			if not self.eligible(meta, window) or self.excluded(meta):
+				continue
+			message = self._bound_body(self.mailbox.get_message(mid, body=True))
+			message.context_version = context_hash(self.mailbox.thread_metadata(message.thread_id), self.config.sent_context_enabled)
+			message.content_hash = content_hash(message)
+			self.store.upsert_message(message)
+			count += 1
+		return {"downloaded": count}
+
+	def manual(self, ids, action, label_ids=None, reason="", scope="message", defer_until=None, displayed_revision=None, displayed_protections=None, displayed_contexts=None, displayed_context_versions=None):
+		displayed_config = self.config
+		displayed_revision = displayed_config.revision if displayed_revision is None else displayed_revision
+		displayed_contexts = displayed_contexts if displayed_contexts is not None else displayed_context_versions
+		self.reload_config()
+		if displayed_revision is not None and displayed_revision != self.config.revision:
+			raise ValueError("Settings changed since these items were displayed; refresh before reviewing")
+		if action not in {"archive", "keep", "defer", "label", "reject_label", "mistaken_archive", "unnecessary_keep"}:
+			raise ValueError("Unsupported manual action")
+		window = resolve_window(self.config, self.clock())
+		group = identifier()
+		result = []
+		undo_ids = []
+		# Explicit selections only: conversation scope describes feedback; it never
+		# silently expands the target list to recent or unreviewed thread members.
+		# Perform network preflight before opening the bulk feedback transaction:
+		# a slow provider must not hold SQLite's writer lock for the whole group.
+		validated = []
+		for mid in dict.fromkeys(ids):
+			message = self.store.get_message(mid)
+			original = self.store.one("SELECT id FROM actions WHERE message_id=? AND action='archive' AND undo_of IS NULL AND state IN ('applied','reconciled') ORDER BY updated_at DESC LIMIT 1", (mid,)) if action == "mistaken_archive" else None
+			# An explicitly identified mistaken app archive uses the ledger's narrow
+			# undo exception. It never fetches or classifies an out-of-window body.
+			if not message or (not original and not self.eligible(message, window)):
+				continue
+			live = self.mailbox.get_message(mid, body=False)
+			live.context_version = context_hash(self.mailbox.thread_metadata(live.thread_id), self.config.sent_context_enabled)
+			expected_context = displayed_contexts.get(mid, "") if displayed_contexts is not None else message.context_version
+			if not original and (not self.eligible(live, window) or live.context_version != expected_context or message.context_version != expected_context):
+				self.store.execute("UPDATE messages SET decision='review' WHERE id=?", (mid,))
+				continue
+			bypass = set(displayed_protections.get(mid, [])) if displayed_protections is not None else protections(message, displayed_config)
+			if not original and protections(live, self.config) - bypass:
+				self.store.execute("UPDATE messages SET decision='review' WHERE id=?", (mid,))
+				continue
+			validated.append((mid, message, original, bypass))
+		with self.learning.batch():
+			for mid, message, original, bypass in validated:
+				prediction = self.store.one("SELECT * FROM predictions WHERE message_id=? ORDER BY created_at DESC LIMIT 1", (mid,))
+				category = self.store.one("SELECT category FROM messages WHERE id=?", (mid,))["category"]
+				feedback_action = "label_correction" if action == "reject_label" else action
+				self.learning.record(message, feedback_action, reason=reason, scope=scope, group_id=group,
+					label_ids=[] if action == "reject_label" else (label_ids or []), negative_label_ids=label_ids if action == "reject_label" else [],
+					category=category, defer_until_utc=defer_until, previous_prediction=prediction,
+					policy_version=self.config.revision, protection_bypass=bypass, correction_of=original["id"] if original else None)
+				if original:
+					undo_ids.append(original["id"])
+				self.store.execute("UPDATE actions SET state='cancelled',reason='Superseded by explicit review',updated_at=? WHERE message_id=? AND state IN ('queued','proposed','stale','retry')", (stamp(), mid))
+				if action == "reject_label":
+					# Rejection edits local unapplied suggestions, never Gmail's labels.
+					for row in self.store.query("SELECT id,assessment_json FROM predictions WHERE message_id=? AND valid=1", (mid,)):
+						data = json.loads(row["assessment_json"])
+						data["suggested_label_ids"] = [item for item in data["suggested_label_ids"] if item not in (label_ids or [])]
+						self.store.execute("UPDATE predictions SET assessment_json=? WHERE id=?", (encode(data), row["id"]))
+					continue
+				decision = {"mistaken_archive": "keep", "unnecessary_keep": "archive"}.get(action, action)
+				self.store.execute("UPDATE messages SET decision=? WHERE id=?", (decision, mid))
+				if decision in {"archive", "label"}:
+					aid = self.actions.plan("", message, decision, label_ids or [], reason or "Explicit review", "manual", window, bypass)
+					if aid:
+						result.append(aid)
+		if undo_ids:
+			self.undo(undo_ids)
+			marks = ",".join("?" for _ in undo_ids)
+			result.extend(row["id"] for row in self.store.query(f"SELECT id FROM actions WHERE undo_of IN ({marks})", undo_ids))
+		if result and not self.config.dry_run:
+			self.apply_actions(result)
+		return result
+
+	def apply_actions(self, action_ids=None, job_id=None):
+		with self.execution_lease():
+			self.reload_config()
+			return self.actions.apply(action_ids, job_id)
+
+	def undo(self, action_ids):
+		with self.execution_lease():
+			return self.actions.undo(action_ids)
+
+	def replan(self):
+		self.reload_config()
+		count = 0
+		# Keep each original job's frozen target bounds. Replanning never restores
+		# earlier archives; only current inbox items receive new proposals.
+		rows = self.store.query("SELECT p.* FROM predictions p JOIN messages m ON p.message_id=m.id WHERE p.valid=1 AND m.in_inbox=1 ORDER BY p.created_at DESC")
+		seen = set()
+		for row in rows:
+			if row["message_id"] in seen:
+				continue
+			seen.add(row["message_id"])
+			job = self.store.one("SELECT window_json,config_json FROM jobs WHERE id=?", (row["job_id"],))
+			window = Window.from_dict(json.loads(job["window_json"])) if job else resolve_window(self.config, self.clock())
+			message = self.store.get_message(row["message_id"])
+			if not self.eligible(message, window):
+				continue
+			assessment = Assessment.from_dict(json.loads(row["assessment_json"]))
+			frozen = Config.from_dict(json.loads(job["config_json"])) if job else self.config
+			effective = self.jobs.effective_config(frozen)
+			override = self.override(message)
+			decision = recommend(message, assessment, effective, window, override, self.rules())
+			self.jobs.save_recommendation(row["job_id"], message, assessment, decision.action, decision.reason, window, row["model_version"], label_ids=decision.label_ids, approval="manual" if override and decision.evidence_source == "manual" else "automatic")
+			count += 1
+		return {"replanned": count, "ai_calls": 0}
+
+	def connect(self, credentials_path):
+		if self.demo:
+			raise ValueError("Demo cannot authenticate to Gmail; launch Personal mode")
+		from .auth import AuthManager
+		previous_store = self.store
+		previous_account = self.account_id
+		with self.execution_lease():
+			mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit).connect(credentials_path)
+			identity = mailbox.identity().casefold()
+			new_store = Store(self._database(identity), identity)
+			saved = new_store.checkpoint("effective_preferences")
+			if saved:
+				self.config = Config.from_dict(saved)
+			elif previous_account not in {"unconnected", identity}:
+				# User-label IDs have account-local identity. Carrying their meanings
+				# to a different account could protect or select an unrelated label.
+				self.config = Config.from_dict(self.config.to_dict())
+				self.config.label_meanings = {}
+				self.config.protected_label_ids = []
+				self.config.excluded_label_ids = []
+			new_store.set_checkpoint("effective_preferences", self.config.to_dict())
+			self._close_ai()
+			self.account_id = identity
+			self._mailbox = mailbox
+			self._supplied_mailbox = False
+			self._write_identity()
+		previous_store.close()
+		self.store = new_store
+		self._configure_services()
+		self.refresh_labels()
+		return {"account_id": identity}
+
+	def disconnect(self):
+		if self.demo:
+			return {"message": "Demo has no OAuth credentials"}
+		from .auth import AuthManager
+		with self.execution_lease():
+			AuthManager(self.data_dir).disconnect()
+			self._write_identity(connected=False)
+			self._mailbox = None
+			self._close_ai()
+		return {"message": "Disconnected; local data and undo history retained"}
+
+	def error(self, stage, exc, job_id="", message_id=""):
+		insert(self.store, "errors", {"id": identifier(), "job_id": job_id, "message_id": message_id, "stage": stage, "kind": getattr(exc, "category", getattr(exc, "kind", type(exc).__name__)), "class_name": getattr(exc, "exception_class", type(exc).__name__), "summary": safe_error(exc), "created_at": stamp(), "payload_json": encode({"exception_module": getattr(exc, "exception_module", type(exc).__module__)})})
+
+	def retry_errors(self):
+		self.store.execute("UPDATE work_items SET state='pending',next_attempt_utc=NULL,error='' WHERE state IN ('failed','retry')")
+		self.store.execute("UPDATE errors SET state='retry_requested' WHERE state='open'")
+		self.store.execute("UPDATE jobs SET state='pending' WHERE state IN ('paused','waiting')")
+		return {"message": "Failed work queued; resume its job. Unknown writes reconcile before retry."}
+
+	def retention(self):
+		before = stamp(self.clock() - timedelta(days=self.config.retention_days))
+		return {"bodies_removed": self.store.prune_cache(before)}
+
+	def backup(self, path):
+		return str(self.store.backup(path))
+
+	def _close_ai(self):
+		for client in self._clients.values():
+			client.close()
+		self._clients.clear()
+
+	def close(self):
+		if self._closed:
+			return
+		self._closed = True
+		try:
+			self._close_ai()
+		finally:
+			self.store.close()

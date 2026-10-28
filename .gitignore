@@ -1,0 +1,45 @@
+# Environments, caches, editor state, packaging output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/
+*.spec
+
+# Private runtime/configuration data must never be committed.
+.env
+.env.*
+credentials*.json
+client_secret*.json
+client_secrets*.json
+token*.json
+*.dpapi
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+logs/
+cache/
+private_ai/
+local_ai/
+app-data/
+demo-data/
+*-backup.sqlite*
+startup-error.txt
+
+# Sandboxed runtimes may place temporary pip/build/test files in the project.
+/pip-*/
+/build-env-*/
+/build-requirements-*.txt
+/pytest-of-*/

@@ -1,0 +1,11 @@
+include README.md pyproject.toml .gitignore
+recursive-include docs *.md *.txt
+recursive-include scripts *.py *.pyw *.ps1
+recursive-include tests *.py
+recursive-include .github/workflows *.yml
+prune .venv
+prune build
+prune dist
+prune private_ai
+prune local_ai
+global-exclude __pycache__ *.py[cod] *.db *.sqlite *.sqlite3 *.log *.dpapi

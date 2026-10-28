@@ -1,0 +1,402 @@
+Implement the complete project described below. Make reasonable implementation choices where details are unspecified, document them, and continue without asking routine clarification questions. External Gmail credentials and the user's private AI module are configuration dependencies, not reasons to leave application features unimplemented.
+1. PROJECT AND DELIVERABLES
+Build a personal Gmail inbox cleaning application named Gmail Inbox Cleaner, with Python package name gmail_clean.
+Required environment:
+Windows 10/11 PC, Python 3.11 or later, PyQt6, and a normal virtual environment suitable for PyCharm.
+One personal Gmail account, accessed directly through the Gmail API using installed-desktop OAuth.
+Initial cleanup of tens of thousands of inbox messages, followed by incremental maintenance when the application is run. No processing is required while the PC or application is off.
+An existing user-provided local AI module, integrated through the exact contract in section 8.
+QSettings for application preferences and SQLite for durable mailbox, job, action, and learning data.
+Deliver all source files, pyproject.toml with compatible dependencies and launch entry points, meaningful automated tests, realistic synthetic demo data, an offline demo mode, README, setup instructions, architecture/schema documentation, and user instructions. Support a documented Windows console-free launcher using the virtual environment's pythonw.exe. Add a Windows packaging configuration or script if practical.
+Use tabs for Python code indentation. Preserve useful comments and documentation when revising generated code. Keep credentials, tokens, private AI modules, email caches, databases, and logs out of source control. Do not leave TODO implementations, pseudocode, pass-only services, fake production integrations, or unimplemented GUI buttons. A real demo adapter is allowed and must be clearly distinguished from Gmail and external AI integrations.
+If you have filesystem/tools, create the project, run the available checks, and report results accurately. Work in coherent implementation stages and complete the project rather than stopping after planning.
+2. PRODUCT PURPOSE
+The inbox represents unfinished work or messages needing further attention. Lasting importance, urgency, category, and current need for inbox attention are separate properties.
+Examples:
+An important completed insurance or financial record can be labeled and archived.
+A routine request that still needs a reply belongs in the inbox.
+A newsletter, expired promotion, or obsolete notification may be archived.
+An existing label does not prove that work is complete.
+Archiving a completed request does not teach that its sender's future requests are unimportant.
+The application's Gmail write operations are limited to archiving explicit messages by removing INBOX, adding existing user labels selected by the user or an enabled policy, and reversing applicable application-owned changes. Keeping or deferring a message normally requires no Gmail mutation. Preserve read/unread state, stars, importance markers, and unrelated labels. Do not expose deletion, trashing, sending, automatic unsubscribing, automatic filter creation, or attachment execution as application actions. Archival retains the email in Gmail; do not describe it as freeing Gmail storage.
+3. TIME WINDOW AND AGE POLICY
+Implement two independent configurable concepts and make their distinction clear in Settings and the job preview.
+A. Examination window: which messages may be analyzed and changed.
+Earliest bound defaults to unlimited: represent it as no lower bound and omit the lower-bound Gmail search condition. Offer an optional inclusive start date. If a concrete fallback is genuinely required somewhere, use January 1, 2000 and explicitly document the limitation; otherwise do not impose that date.
+Latest bound defaults to a rolling cutoff 14 days before the job's anchor instant. Thus the most recent two weeks are excluded by default. Make the relative number of days configurable, including zero, and also offer an optional fixed latest calendar date.
+Use Gmail internalDate, not the sender's Date header, download time, or history ID, for message age and eligibility.
+Use timezone-aware datetimes and canonical UTC instants internally. Default the display/calendar-policy timezone to America/New_York and make it configurable. Include tzdata for Windows where needed.
+Define eligibility as earliest_inclusive <= internalDate < latest_exclusive, with an unset earliest bound allowed. For rolling mode, latest_exclusive = anchor_utc minus the configured number of 24-hour days. For a fixed latest calendar date, include that whole local date by converting the following local midnight into the exclusive UTC endpoint. Convert an earliest calendar date from local midnight into its inclusive UTC endpoint.
+Freeze the anchor and resolved bounds when a job is created. Resuming the job must preserve them. A new maintenance job receives a new anchor.
+Display the resolved interval and timezone, not just relative setting text. Validate malformed dates and empty/inverted windows.
+Gmail search dates have timezone/boundary behavior that must not determine correctness. Use epoch-second query bounds with a small deliberate overfetch margin where needed, and enforce the exact millisecond bounds locally against internalDate.
+Every rolling maintenance cycle must discover messages newly crossing the 14-day boundary even if they have had no new Gmail history events. Use persisted boundary sweeps and periodic inbox reconciliation, with deduplication and resumable checkpoints.
+Also schedule time-driven reevaluation when unchanged eligible messages cross an archival-age cutoff, reach a relevant deadline, or finish a deferral. Reuse valid stored assessments where possible; mailbox history alone cannot drive these transitions.
+B. Age-based archival policy: how eligible messages are handled.
+Enable a configurable archival-age policy with a default of two calendar months. This is independent of the latest examination cutoff of two weeks.
+Resolve the age cutoff from the job anchor in the configured timezone using calendar-month subtraction with end-of-month clamping, then compare UTC instants. Do not silently substitute 60 days. Define old as internalDate strictly earlier than that cutoff.
+Old messages with no outstanding attention requirement should have a lower threshold to be archived. Explicit protections and known unresolved work take precedence. Conflicting or insufficient evidence goes to review.
+Important completed mail can be archived whether labeled or unlabeled; an existing reference label may be suggested for unlabeled records. Importance or absence of a user label alone does not force completed correspondence to remain in the inbox.
+Important mail whose completion/action status is uncertain should be reviewed. A reference label alone does not establish completion. User-designated action/protective labels prevent automatic archival as configured.
+Use fast deterministic paths for clearly routine/expired material, and enough analysis to identify unresolved work or uncertain important messages. Do not archive unassessed messages solely because no model result or protection was available.
+Settings must also allow disabling the age policy and using category-specific age overrides. A category override can inherit the global policy, use its own calendar-month/day threshold, or disable age-based archival for that category. Resolve an applicable specific override before the global default; conflicting applicable overrides require review.
+Strict scope requirements:
+Default target scope is inbox messages within the examination window; exclude Spam, Trash, and drafts.
+Messages outside the examination window are not classification or forward-cleanup mutation targets. Do not send their bodies to AI. Minimal identifiers, dates, and state needed to establish eligibility or detect a newer reply may be fetched. Explicit undo of recorded previous app changes is the narrow exception described in section 10; it is never a way to expand a cleanup job.
+Optional Sent/archived context is read-only, separately configurable, subject to the examination/content-privacy limits, and never makes those messages action targets.
+Review may group messages by conversation, but all actions expand to explicit eligible message IDs. Never use thread-wide archive/label mutations that could affect recent excluded replies or other non-target messages.
+If a recent excluded reply makes older conversation conclusions stale, defer/review the eligible older items without touching or analyzing the excluded reply body.
+4. ARCHITECTURE AND PERSISTENCE
+Separate domain models/policy, Gmail integration, AI integration, learning, persistence, job scheduling, and presentation. Keep core services usable without the GUI for tests and maintenance commands. Use typed data structures and clear dependency injection for Gmail, AI, clocks, and storage.
+QSettings persists preferences such as:
+Examination bounds and timezone; two-month archival policy and category overrides.
+Protected senders/domains, stars, labels, and other selected protections.
+Meanings assigned to existing labels: requires attention/protected, reference/filed, or neutral.
+Classification thresholds, confidence requirements, review preferences, and automation settings.
+AI module/package location, default-or-explicit model selection, optional model routing choices, rate/cost estimates, and content-exclusion settings. Provider secrets remain the external module's responsibility.
+Maintenance interval, retrieval and execution batch sizes, retry settings, learning toggles, and cache/retention preferences.
+Window geometry, splitters, table columns, filters, shortcuts, and log level.
+Use SQLite for related operational data, not QSettings. Include schema migrations, transactions, indexes, safe connection ownership per worker, and a backup strategy. Use WAL where appropriate. Prevent two instances/workers from executing the same jobs simultaneously using a robust instance lock or leases with recovery.
+Implement logical records/tables for:
+Connected account identity and schema version.
+Gmail label catalog keyed by label ID, including system/user distinction and configured meanings.
+Messages, thread membership, relevant headers/state, optional normalized body cache, content hashes, and context versions.
+Jobs, frozen effective configuration, candidate manifests, per-stage work items, retry scheduling, and synchronization/boundary-sweep checkpoints.
+Predictions, policy/model/prompt/example versions, structured reasons, and pending review decisions.
+Proposed action plans, execution attempts, before/after relevant state, outcome receipts, undo records, and conflicts.
+Feedback events, manual overrides, examples, pattern statistics, explicit/learned rules, revisions, and suggested-rule review state.
+Store operational timestamps in UTC; distinguish Gmail message timestamps from locally observed change times. Retain account identity with all operational state so accidental authentication to a different account cannot mutate the wrong mailbox.
+5. GMAIL AUTHENTICATION, DISCOVERY, AND SYNCHRONIZATION
+Implement installed-desktop OAuth with Google client libraries, browser consent, token refresh, disconnect/re-authentication, account verification, and configuration errors shown clearly in the GUI. Use a sufficient scope for reading messages and changing message labels, such as gmail.modify. Do not request full mail access merely to expose unsupported destructive operations.
+Document personal-account setup using the appropriate external audience and Desktop app OAuth client, enabling Gmail API, selecting scopes/test users where applicable, and current testing-mode refresh-token/consent limitations. Do not copy Workspace-only Internal-audience assumptions into personal Gmail instructions. Verify current official requirements where possible and accurately document restrictions instead of promising universally verification-free deployment.
+Protect refresh tokens using Windows Credential Manager/keyring or equivalent Windows per-user encryption. Do not put tokens in QSettings, committed files, or logs. Keep user data in a documented per-user application-data directory with appropriate Windows access permissions. Explain the local cache's actual protection; do not claim SQLite/QSettings are inherently encrypted. Provide cache-retention controls and avoid logging bodies, credentials, or full AI prompts by default.
+Discovery and retrieval:
+Retrieve paginated inbox message IDs using the frozen window. Persist and deduplicate IDs before acting; do not mutate the result set while relying on a positional offset.
+Gmail listing is not an atomic mailbox snapshot. Capture synchronization state appropriately, reconcile changes during enumeration, recover from invalid/expired page tokens by safe re-enumeration, and avoid claiming snapshot guarantees Gmail does not provide.
+Fetch metadata first: account/message/thread IDs, internalDate, labels, sender/recipients, subject, relevant reply/list headers, snippet, and attachment names/types where needed.
+Retrieve and cache full text bodies only where needed for analysis/review. Support downloading all eligible bodies as an explicit option. Do not download attachment contents by default.
+Correctly parse MIME multipart/alternative and multipart/mixed, base64url, charsets, empty/plain/HTML bodies, and nested text parts. Retrieve selected text parts referenced through Gmail attachment IDs when necessary, without enabling arbitrary attachment analysis. Normalize text, strip scripts/trackers, bound size, and preserve enough useful content. Record truncation or missing context so uncertainty cannot become an automatic archive.
+Downloading or previewing must not mark messages read.
+Incremental synchronization:
+Persist Gmail history checkpoints and process label/message changes durably before advancing them. Use the appropriate specific history event fields and deduplicate replays.
+Do not filter history in a way that loses removal-from-inbox events. Filter targets after retrieving sufficient changes.
+History is finite; expired/invalid startHistoryId requires a resumable reconciliation, not data deletion or an endless retry loop.
+Refresh label names/IDs and handle renamed or deleted labels without inventing replacements. Labels use IDs as identity. Gmail category/system labels do not count as organizational user labels.
+Gmail exposes current read/unread state and finite change history, not a complete timeline of email opens. Do not invent historical read timestamps or attribute all observed label changes to the user.
+6. ANALYSIS AND DECISION POLICY
+Keep these assessments distinct:
+Message type/category and zero or more suggested existing user labels.
+Lasting importance/value.
+Outstanding action/completion status, urgency, and any supported deadline evidence.
+Current need to remain in the inbox.
+Uncertainty, missing context, and evidence source.
+Pipeline:
+1. Enforce eligibility, explicit protections, and applicable prior manual decisions.
+2. Apply enabled explicit rules and approved narrow recurring-pattern rules.
+3. Use cached assessments where their content/context/policy dependencies remain valid.
+4. Use relevant feedback examples and AI for items needing interpretation.
+5. Calculate a policy recommendation separately from the underlying assessment.
+For automated decisions, configured protections and explicit applicable user decisions outrank inferred behavior. Conflicting rules or ambiguous scope go to review. A direct manual action selected in the interface is an explicit instruction for its displayed targets; record its scope and which displayed protections it deliberately overrides rather than treating an automated protection as an absolute prohibition on user control. A new or previously undisplayed protection invalidates that old bypass during preflight.
+Make the final automatic outcome deterministic: ineligible items are skipped; protected or explicitly retained unchanged items stay; known outstanding attention stays; uncertain attention/conflicting evidence goes to review. For remaining items with established no outstanding attention, apply an applicable approved rule or the resolved category/global age policy. If neither supplies a decision, use the score thresholds below. An age policy does not override unresolved work, a prior applicable manual decision, or a protection. A contradictory AI assessment, such as no attention needed alongside a high attention score, requires review rather than arbitrary field selection.
+Provide two adjustable cutoffs for the need-to-remain-in-inbox score, with a review band between them. Reasonable initial values are archive below 25 and keep at or above 70 on a 0-100 scale, with the middle requiring review; these are implementation defaults, not validated probabilities. High uncertainty, incomplete content, contradictory evidence, or inadequate confidence requires review regardless of score. Do not equate a model's self-reported confidence with a calibrated correctness probability. Deterministic approved rules and validated reviewed examples can support confidence; show the actual basis honestly.
+Policy/threshold changes should recompute recommendations from stored assessments without unnecessary AI calls. Changes to content, conversation context, applicable rules, model/prompt schema, or relevant examples may invalidate affected assessments. Reprocess affected pending items, not the entire cache indiscriminately. Do not automatically reverse previously executed archival simply because the model or slider changed.
+Provide sender/list/template/category grouping using normalized sender, List-ID when available, recurring subject/content structure, and message type. Preserve exceptions; a sender/domain alone is not proof all their messages should receive one action. Basic local matching, hashing, and text search are sufficient; an embeddings service must not be required.
+7. HUMAN REVIEW AND LEARNING
+Implement durable feedback plus scoped rules and selected examples, not a requirement for provider fine-tuning.
+Feedback semantics:
+Applying a label is a positive category example, not evidence that all other labels are wrong.
+Explicitly correcting/removing an incorrect suggested label can provide a negative example for that label.
+Archive means no further inbox attention is currently required; it does not mean low lasting importance.
+Completed, expired, and irrelevant are different optional reasons.
+Keep/needs-attention applies to that item's current context; it does not mean always retain every message from the sender.
+Correcting a mistaken automatic archive is strong feedback when explicitly identified as such.
+Read/unread and unconfirmed Gmail-side changes are weak observations.
+Ordinary review actions should remain fast and require no reason dialog. Offer optional reason shortcuts and future-scope choices: this message, the currently reviewed eligible items in this conversation, this recurring message type/list, or a carefully specified sender-plus-condition rule. A normal click defaults to the displayed items, not all future sender mail.
+Rejecting/correcting an unapplied suggested label changes local feedback/proposals; it does not remove an existing Gmail label. Removal of a label previously added by this app uses the ownership/conflict-aware undo mechanism. Do not silently broaden a label correction into removal of unrelated preexisting labels.
+Defer is local and persistent: store a defer-until instant, suppress repeated review and automatic execution for that item/context, and requeue when due even without a Gmail history event. It does not invoke Gmail Snooze or mutate the mailbox. Meaningful new conversation context invalidates the defer and returns the eligible item for reconsideration; distinguish that from irrelevant metadata updates.
+Learning layers:
+1. Immediate persistent manual overrides for unchanged reviewed messages. A new reply or meaningful context change triggers reconsideration; never extend an old decision automatically to new messages.
+2. Explicit reusable rules and inferred narrow-rule suggestions. Show support, counterexamples, sample matches, affected counts, conditions, actions, and revisions. Explicitly choosing a future rule may enable it immediately. Inferred archive rules default to suggestions requiring user enablement. An optional advanced setting may auto-enable narrowly scoped rules meeting documented reviewed-evidence requirements; broad inferred archive rules always require explicit user enablement.
+3. Relevant reviewed examples selected for future AI prompts by sender/list/type/subject/content similarity. Include counterexamples where useful. Use a bounded representative selection rather than sending the entire feedback database. Apply current content-sharing exclusions to historical examples as well as the target email.
+Persist feedback action, source, optional reason, scope, group/batch event ID, relevant context version, previous prediction, applicable policy/model version, and supersession/correction links. Bulk feedback must not masquerade as thousands of independent confirmations. Recent explicit corrections should outweigh conflicting older inferred patterns; never decay or silently override explicit protection settings.
+Gmail-side observations must be reconciled with the app's action ledger. Gmail history does not identify the actor. Do not treat app-generated changes, automatic age-policy archives, silence after automation, or mere continued inbox presence as confirmed training examples. A return to the inbox can reflect a new reply or another client, so detect context before calling it an error.
+Provide a Learning/Rules interface to inspect why a suggestion was made, edit/disable rules, correct or forget examples, reset learning for a sender/type/category, export/import rules, and inspect conflicts. Forget/reset must actually remove or rebuild affected derived statistics and invalidate affected example/prediction caches; hiding the source row is insufficient. Keep undo history separate from learning retention.
+Disabling learning preserves direct manual decisions, audit/undo records, and their current-item overrides. It stops adding new feedback to the learning-example pool, updating learned statistics, suggesting inferred rules, and supplying learned examples to AI; already enabled explicit/approved rules remain active until separately disabled. Previously learned data remains available for later re-enablement. Feedback from the disabled period enters future learning only through an explicit include/import choice. Pausing learning is distinct from deleting/resetting its data.
+Track reviewed category corrections, unnecessary keeps, and explicitly mistaken archives by rule/type. Include sampling of proposed archives, including apparently high-confidence groups. Do not report unreviewed automatic decisions as accuracy successes. If maintaining validation examples, keep near-duplicate template families from leaking between training/support and validation groups.
+8. EXACT EXTERNAL AI MODULE CONTRACT
+The user's existing private AI module is an external dependency. Implement a configurable integration adapter and a deterministic synthetic demo module. You are not given the private module's source, actual import name, provider routing, keys, supported models, or exception-export paths; do not pretend to reconstruct them or hard-code a provider SDK as a substitute.
+The authoritative interface is:
+def call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
+"""
+Call the routed provider and return only the response text.
+Raises:
+        UnsupportedModelError, MissingAPIKeyError, RateLimitError, APIResponseError,
+        and any underlying provider exceptions.
+"""
+Contract and integration requirements:
+The function is synchronous/blocking and returns a Python string or raises. It is not an awaitable, stream, callback, future, provider response object, or token-usage envelope.
+prompt is the complete Unicode text for the request. The application owns instructions, policy/context assembly, selected learning examples, email content, separators, output requirements, and size limits.
+Model selection is either module default or an exact user-configured supported identifier. To use the default, call ai.call_api(prompt) and omit model entirely. An empty UI field is a default-selection instruction to the adapter; do not pass None, an empty string, or the literal string DEFAULT_MODEL to the external function.
+For explicit selection call ai.call_api(prompt, model=configured_identifier). Do not assume identifier normalization, aliases, supported names, or a model-discovery API.
+The module owns provider selection/routing, credentials, provider request construction, response-text extraction, and provider-specific configuration. Do not pass API keys, endpoint/client objects, temperature, JSON-mode arguments, timeouts, callbacks, or other unsupported keyword arguments to call_api.
+Configure any module-required environment/deployment settings before import when needed. Prefer a normal package import for modules with package dependencies. Also support selecting a standalone .py file using importlib, validating the path and callable, registering the module appropriately in sys.modules, and cleaning up a failed load. File loading does not install dependencies or create a package context for relative imports.
+Load once and reuse the module in its owning worker. Do not silently reload it for every request. Apply a changed module path/configuration by explicitly restarting the worker at a safe boundary. Import/initialization errors are distinct from call failures.
+No thread safety, supported parallelism, shared conversation memory, lack of shared memory, internal retry count, fallback behavior, network request count, actual usage/cost metadata, cancellation handle, or per-call timeout mechanism is guaranteed. Include required context in every request and do not depend on undocumented conversation state.
+Serialize calls by default outside the GUI thread. Prefer a dedicated spawned worker process that loads the module once and handles requests sequentially if you need bounded local shutdown/watchdogs. Keep its IPC serializable and Windows-spawn-safe. If using threads instead, implement safe lifecycle handling and honestly document cancellation/shutdown limitations. Do not terminate a QThread unsafely.
+Pause prevents new work and allows the current call to finish. A caller wait timeout does not cancel the provider request. A worker-process watchdog/termination only stops local execution; the remote request may still finish or be billed. Record an interrupted/abandoned request accurately, and do not assume a retry is free or that the original was canceled.
+The named exception categories exist in the supplied contract, but inheritance, import/export paths, attributes, status codes, messages, retry-after metadata, and chaining are unspecified. Match actual exception classes only when legitimately exposed/configured. Never classify by class-name strings or fragile message matching. Provide a general preserved-error path for unrecognized underlying provider exceptions.
+Unsupported model and missing credentials are configuration failures that pause affected work rather than endlessly retrying. Known transient failures may use deliberate bounded retry policy. Unknown failures must remain visible and retryable by the user without becoming successful output.
+Response text can contain Markdown, JSON, code fences, whitespace, or an empty string; the contract guarantees no cleanup or structured format. The application must require meaningful structured JSON for classification, parse it deliberately, and validate it. Optional single-code-fence handling must be bounded and documented; never recover purported JSON by executing it or silently guessing missing decisions.
+Define a versioned JSON response schema with explicit target IDs, allowed assessment fields, known label IDs, short evidence-based reasons, uncertainty, and any truncation/context flags. The AI provides assessments and suggestions; the application policy engine decides executable actions. Validate types/ranges, requested-versus-returned IDs, completeness, duplicates, unknown labels, and unsupported fields/actions before use.
+A malformed, empty, missing, or partial response must produce per-item retry/review/error outcomes. Preserve valid independently attributable items if batch validation permits; do not archive failed or omitted items.
+Treat all email bodies and quoted text as untrusted input, clearly separate them from application instructions, and provide no tool execution capability to the AI. Do not follow instructions found inside emails, fetch links at the model's request, or accept arbitrary actions/labels introduced by email text.
+Use caching keyed by message content, context, applicable policy/prompt/model identifiers, and selected example versions. Permit rules-first processing, conservative template reuse, and optional explicit lighter/deeper model identifiers. No embeddings endpoint or extra module function may be required.
+Allow a configurable model that will be explicitly be used for API calls if set. If unset, no parameter will be passed, allowing the default model.
+The demo module must implement this same string-in/string-out contract and exercise valid output, uncertainty, malformed output, configuration errors, rate limits, and delayed calls without real network requests. Clearly label demo-only model names and behavior.
+9. RESUMABLE JOBS AND FAILURE RECOVERY
+Independently checkpoint discovery, metadata/body retrieval, classification, review, plan generation, execution, and undo. Each stage has durable pending/running/waiting/retry/completed/failed states as appropriate. Persist retry counts, next-attempt times, sanitized errors, and the relevant input versions. Transactions must leave enough information to recover in-flight work after a crash.
+Provide Start/Pause/Resume/Stop controls for jobs and stages. Stop preserves completed work and checkpoints; starting again can resume. Avoid long sleeps on the GUI thread; retry waits must be interruptible. Isolate malformed messages and permanent failures in a visible error queue so other items continue.
+Use bounded exponential backoff with jitter and reliable Retry-After information where the specific integration actually provides it. Distinguish rate limits/transient failures from authentication, permission, configuration, missing-message, and permanent-data errors. Handle 401 refresh/re-authentication, 403 reason distinctions, 429 and transient 5xx responses, offline operation, and expired history/page tokens deliberately. Keep Gmail retrieval, AI processing, and Gmail writes independently throttleable.
+Use conservative configurable batches and concurrency. Honor current documented Gmail limits. Distinguish an HTTP multipart batch of separate requests from messages.batchModify; these have different limits and result behavior. Batching does not make quota charges disappear. Group only compatible label deltas for batchModify and reconcile per-message outcomes.
+10. ACTION PLANNING, EXECUTION, AND UNDO
+Create an inspectable action ledger before any Gmail write. Store job/account, explicit message IDs, context/precondition version, label additions/removals, reason and evidence source, policy/model version, manual/automatic approval source, attempt ID, and execution state. Never upload replacement email bodies or recreate messages.
+Before sending changes, re-fetch relevant live state and check action-specific preconditions:
+Correct account, message existence, appropriate current inbox state, target eligibility, and current protections. Forward archival requires current INBOX; an undo of archival normally expects the recorded app-owned INBOX removal and may restore INBOX when absent. Already-satisfied effects are reconciled rather than treated as fresh changes.
+Current label catalog and required label IDs.
+Applicable manual decisions and configuration revisions.
+Meaningful conversation changes/new replies since analysis/review.
+Frozen job bounds make a resumed run reproducible. Current settings that tighten scope/protections must also be honored: apply only items valid under both the frozen scope and current restrictions. A changed policy invalidates incompatible pending actions. Loosening settings does not silently expand an existing job; create/replan an appropriate job. Clearly display stale items and why they need reconsideration.
+Persist an execution attempt before the network write. Apply only minimal deltas to the live message: archive removes INBOX; labeling adds the approved existing label IDs. Do not restore an old whole-label snapshot. A new incoming reply is never silently added to an approved target list.
+Handle unknown outcomes: if Gmail may have committed a write before a timeout/crash, mark the result uncertain and inspect live state before replaying. Idempotent label effects and durable deduplication provide safe recovery, but do not claim exactly-once network execution or atomic compare-and-modify. A preflight read cannot eliminate concurrent user changes; minimize the interval and reconcile conflicts honestly. Do not mark an entire batch successful just because the transport succeeded; validate the integration's actual result semantics and reconcile affected messages as needed.
+Undo individual actions or a cleanup batch using recorded app-owned deltas. If an action is still queued, undo cancels the proposal and records any feedback correction. For executed changes, reverse only applicable app changes, preserving subsequent unrelated manual state. Detect intervening changes, missing/deleted labels/messages, and ambiguous histories; surface conflicts rather than blindly restoring a stale snapshot. Label existence alone does not prove app ownership if later edits are ambiguous.
+Explicit undo uses only the original recorded message IDs and inverse deltas, even if the current cleanup date window has since narrowed. Show any such out-of-current-window targets in the undo preview/count. Recheck current conflicts/protections; restoring inbox visibility is different from undoing a label that now carries a protected/manual meaning. Never remove a newly protected or subsequently user-owned state blindly. Automatic jobs remain bound by current restrictions, and undo never targets a new reply or unrecorded message. Apply no AI classification to out-of-window undo targets.
+11. PYQT6 USER INTERFACE
+Use responsive model/view tables with paged/lazy database access, sorting/filtering, and efficient group summaries. Do not instantiate tens of thousands of widgets or load every body into memory. Run Gmail I/O, AI work, large parsing, and expensive database work outside the GUI thread. Use signals/slots for safe GUI updates, worker-owned connections/clients, and a clean shutdown lifecycle.
+Provide these coherent views or tabs:
+Overview/Jobs: account, resolved examination window and age cutoff, per-stage counts, progress, throughput where measurable, next retry, failures, and start/pause/resume/stop controls.
+Review: individual or grouped decisions, sender/type/date/count summaries, representative examples plus exceptions, current/suggested labels, attention/importance/uncertainty, and short explanations.
+Plan/Simulation: proposed archive/keep/review and label counts by category/sender/age, samples, affected message IDs on demand, stale/conflicting actions, and apply selected/all-approved actions.
+Learning/Rules: explicit and suggested rules, supporting/counterexamples, corrections, reset/forget controls, and review-based quality metrics.
+History/Undo: action receipts, outcomes, batch history, conflicts, and undo.
+Settings and a useful filtered log/error view.
+Review controls:
+Fast Archive, Keep/Needs attention, Defer, assign multiple existing labels, undo, and open in Gmail.
+Searchable multi-select label picker that preserves existing labels and distinguishes additions from explicit corrections.
+Keyboard shortcuts that work from the focused app, avoid conflicting with typing in editors, are shown in the UI, and can be customized/persisted.
+Group actions show scope, count, date range, representative examples, and exceptions. Apply only to displayed/selected eligible IDs, never an implicit entire sender/domain/mailbox.
+Keep reasons optional. Provide optional Completed/Expired/Not relevant reasons and an explicit future-rule scope control.
+Sanitized plain-text or tightly controlled HTML email preview with scripts, remote images/resources, and active content blocked. Fetch no tracking resources. Opening external links is an explicit user action.
+A Gmail navigation link uses the connected account context and the appropriate message/thread identifier; document limitations rather than relying on an unrelated hard-coded browser account index.
+Automation behavior:
+Initial default is simulation/dry run. The user can inspect and enable live execution/automatic processing in Settings. In dry run, show proposals and save review feedback without changing Gmail. The interface must make queued versus applied actions clear.
+In live mode, manual review commands queue prompt asynchronous execution; avoid a confirmation dialog on every normal archive or label action. Broad inferred-rule enablement is reviewed as a rule decision.
+Ongoing maintenance will occur via manual additional runs at uncertain future times. Do not create a service, scheduled task, or cloud automation without an explicit feature/user choice.
+Learning can be enabled/disabled separately from execution. Changing protections, windows, and thresholds persists and correctly invalidates/replans affected pending work.
+Persist window geometry and useful layout/filter settings. Show useful errors without exposing raw email or secret-bearing exception payloads.
+12. DEMO, TESTING, AND ACCEPTANCE CRITERIA
+Deliver a functional offline demo with thousands of reproducible synthetic messages and realistic groups: newsletters, receipts, important completed correspondence, outstanding requests, expired events, mixed-type messages from one sender, protected labels, and conversations spanning the examination cutoff. Include a scale-data generator for at least 50,000 messages. Demo mode must use separate state and make real Gmail mutations impossible.
+Write focused tests for real behavior and invariants, not trivial implementation mirrors. Use fake Gmail transports, the deterministic AI module, an injectable clock, temporary SQLite databases, and Qt tests where useful. Tests and demo require no real account, AI keys, or external network.
+Acceptance coverage must include:
+1. Unlimited earliest default, rolling 14-day latest default, fixed inclusive calendar dates, exact endpoints, timezone/DST conversion, and two-calendar-month clamping. Resuming a job preserves its anchor. A quiet message becoming 14 days old is discovered without a new history event.
+2. The examination window and archive-age policy remain independent. Recent excluded messages and out-of-scope context bodies never reach classification or mutation. Mixed-age threads cannot cause excluded replies to be archived/labeled.
+3. Important completed mail can archive; unresolved work stays/reviews regardless of reference labels. Configured protections and explicit manual choices have the intended precedence. Conflicting rules go to review.
+4. MIME/charset/base64url/text-part handling, bounded content, empty/missing bodies, HTML sanitization, and no mark-read side effects.
+5. Correct default-model argument omission, explicit model forwarding, one-time module loading, import errors, actual available exception-class handling, unknown provider failures, sequential worker behavior, and honest timeout/pause/shutdown behavior.
+6. Invalid/partial JSON, unknown label IDs, duplicate/wrong target IDs, unsupported actions, and prompt-injection content cannot cause unauthorized or unvalidated Gmail changes.
+7. Archive/completion/category feedback remain distinct. Added labels are not negatives for other labels. Bulk and app-generated actions do not create false independent training confirmations. Counterexamples and corrections influence relevant future prompts/rules. Forget/reset rebuilds derived state.
+8. Crash/pause/resume at each stage, duplicate enumeration and history replay, invalid page tokens, expired history, retry exhaustion, offline operation, missing messages, and configuration/authentication pauses preserve progress.
+9. A Gmail write that succeeds before a simulated lost response/crash is reconciled safely. Pending actions become stale after relevant new replies/settings changes. Minimal label deltas preserve read/unread, stars, importance, and unrelated labels.
+10. Undo cancels queued actions and reverses applicable executed changes without overwriting later manual state; ambiguous conflicts and deleted labels are visible.
+11. Account mismatch, separate demo data, secret redaction, persistence/migrations, worker-safe database access, and duplicate-instance/job-execution protection.
+12. Responsive paged/lazy table behavior at 50,000 records, working review shortcuts and multiple-label selection, and UI updates that stay on the GUI thread. Report measurements honestly and do not invent performance claims.
+13. DOCUMENTATION AND HANDOFF
+Include:
+Windows virtual-environment/PyCharm installation and python/pythonw launch instructions.
+Gmail OAuth setup, local token protection, reconnect/disconnect, and current personal-account consent caveats.
+Configuring the external AI module by package or .py path, dependency installation in the same environment, default versus explicit model behavior, module-owned credentials, error handling, and truthful cancellation/usage limitations.
+All settings/defaults, exact date semantics, dry run versus live actions, policy precedence, review workflow, learning rules/examples, and how to reset learning without losing undo history.
+Database/schema/versioning overview, job/state transitions, synchronization recovery, local cache/log locations and actual security properties, backup/restore, and retention.
+Demo mode, test commands, packaging instructions, and troubleshooting common OAuth, network, rate-limit, malformed-output, and stale-action cases.
+A concise architecture diagram if it helps, plus a requirements-to-implementation/acceptance checklist.
+Use official documentation to verify integration details during implementation, including:
+https://developers.google.com/workspace/gmail/api/quickstart/python
+https://developers.google.com/workspace/gmail/api/guides/filtering
+https://developers.google.com/workspace/gmail/api/guides/sync
+https://developers.google.com/workspace/gmail/api/guides/labels
+https://developers.google.com/workspace/gmail/api/guides/batch
+https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/batchModify
+https://developers.google.com/workspace/gmail/api/guides/handle-errors
+https://developers.google.com/workspace/gmail/api/auth/scopes
+https://doc.qt.io/qt-6/qsettings.html
+In your final handoff, explain what was implemented, how to launch/demo/test it, which checks actually ran, and any genuine environment-dependent limitations. Do not substitute descriptions for missing required implementations. Actual account credentials and the private AI module are supplied by the user through configuration; the application and offline demo must be complete without them.
+
+
+14. IMPLEMENTATION ADDENDUM AND RESOLVED TECHNICAL CHOICES
+
+The following binding technical decisions clarify and extend Sections 1–13:
+
+14.1 External AI Module Top-Level Definitions, Exception Binding, and Call Contract (Section 8)
+- The user's external AI module and the synthetic demo AI module expose the following top-level definitions:
+
+```python
+from dataclasses import dataclass
+
+class AIAPIsError(Exception):
+	"""Base exception for this module."""
+
+
+class UnsupportedModelError(AIAPIsError):
+	"""Raised when an unknown/unsupported model identifier is provided."""
+
+
+class MissingAPIKeyError(AIAPIsError):
+	"""Raised when an API key is not found or is empty."""
+
+
+class APIResponseError(AIAPIsError):
+	"""Raised when the provider response does not contain expected content."""
+
+
+class RateLimitError(AIAPIsError):
+	"""Raised when a provider indicates a rate limit (HTTP 429) condition."""
+
+
+@dataclass(frozen=True)
+class ModelResult:
+	"""Structured result for a model call."""
+	text: str
+	model: str
+	provider: str
+	duration_s: float
+
+
+def call_api(prompt: str, model: str = DEFAULT_MODEL) -> str:
+	"""
+	Call the routed provider and return only the response text.
+
+	Raises:
+		UnsupportedModelError, MissingAPIKeyError, RateLimitError, APIResponseError,
+		and any underlying provider exceptions.
+	"""
+	return call_api_result(prompt=prompt, model=model).text
+
+
+def call_api_result(prompt: str, model: str = DEFAULT_MODEL) -> ModelResult:
+	"""
+	Call the routed provider and return a structured result (text + metadata).
+
+	Raises:
+		UnsupportedModelError, MissingAPIKeyError, RateLimitError, APIResponseError,
+		and any underlying provider exceptions.
+	"""
+
+Exception Binding & Handling:
+
+Upon loading the external AI module mod, the adapter inspects getattr(mod, name, None) for AIAPIsError, UnsupportedModelError, MissingAPIKeyError, APIResponseError, and RateLimitError, binding each attribute where isinstance(obj, type) and issubclass(obj, BaseException).
+
+If a minimalistic test double does not export all five classes, the adapter safely falls back to an empty tuple () for any missing exception class in except clauses so isinstance/except checks never fail with TypeError.
+
+UnsupportedModelError and MissingAPIKeyError are treated as configuration failures that immediately pause the AI stage and surface a clear status in the GUI without automatic retries.
+
+RateLimitError is treated as a transient rate-limit condition using bounded exponential backoff with jitter.
+
+APIResponseError is treated as an empty/invalid model response eligible for bounded per-item retry and then routed to the error/review queue.
+
+Any other AIAPIsError or unrecognized underlying provider Exception is caught via a general except Exception as exc block, preserving the exception class identity and sanitized error summary in the error queue so the user can inspect and retry it.
+
+call_api vs. call_api_result Usage:
+
+To satisfy Section 8's requirement that no extra module function beyond call_api is strictly required, the adapter defaults to calling mod.call_api(prompt) (when no explicit model is configured) or mod.call_api(prompt, model=configured_identifier) (when an explicit model is configured).
+
+Include an optional setting (ai/use_call_api_result, defaulting to False for strict call_api contract compliance, or selectable in Settings when hasattr(mod, "call_api_result") is true) that calls mod.call_api_result(...) with the exact same model-argument omission semantics to record ModelResult.model, ModelResult.provider, and ModelResult.duration_s in local telemetry/prediction metadata.
+
+The synthetic demo AI module must implement the full surface above (AIAPIsError hierarchy, ModelResult, DEFAULT_MODEL, call_api, and call_api_result).
+
+14.2 Subprocess Isolation and SQLite Ownership (Sections 4 & 8)
+
+Run the external AI module inside a dedicated multiprocessing child process (spawn start method on Windows) that holds NO SQLite connections. Communicate via serializable IPC messages over multiprocessing.Pipe or Queue.
+
+When catching exceptions inside the AI worker process, serialize the matched exception category (UnsupportedModelError, MissingAPIKeyError, RateLimitError, APIResponseError, AIAPIsError, or UnknownProviderError), actual exception class name/module, and sanitized message across IPC so the main process handles recovery deterministically.
+
+Keep all SQLite connections inside the main application process using WAL mode, busy_timeout = 5000, foreign_keys = ON, and strict per-thread connection ownership.
+
+Prevent concurrent job execution across multiple application instances using both a QLockFile in the per-user app data directory and a job_leases SQLite table with PID and heartbeat timestamps.
+
+14.3 Canonical AI JSON Response Schema v1 (Section 8)
+
+Require the AI response text (after optional stripping of a single outer json ... code fence) to parse as a JSON object matching schema_version: "1.0":
+
+JSON
+{
+        "schema_version": "1.0",
+        "assessments": [
+                {
+                        "message_id": "<exact Gmail message ID>",
+                        "category": "newsletter|promotion|notification|receipt|financial|medical|legal|personal|work_request|event|other",
+                        "suggested_label_ids": ["<existing user label ID>"],
+                        "importance": "low|medium|high|critical",
+                        "outstanding_action": "none|reply_needed|task_pending|waiting_on_other|uncertain",
+                        "urgency": "none|low|medium|high",
+                        "deadline_utc": "<ISO-8601 UTC null or string>",
+                        "keep_in_inbox_score": 0,
+                        "uncertainty": "low|medium|high",
+                        "missing_context": false,
+                        "evidence_reason": "<short factual explanation>"
+                }
+        ]
+}
+Default to 1 message per call_api request for reliability, with a configurable prompt batch size (1–10 messages per call) in Settings.
+
+14.4 Deterministic Age Policy vs. Score Threshold Resolution (Sections 3B & 6)
+
+After evaluating eligibility, explicit protections, prior manual overrides, and enabled deterministic rules:
+
+Route any item with outstanding_action != "none", uncertainty != "low", missing_context == true, truncated/unparsed body, or contradictory signals (e.g., outstanding_action == "none" paired with keep_in_inbox_score >= keep_threshold) to REVIEW.
+
+For remaining items where outstanding_action == "none" and uncertainty == "low":
+
+If age-based archival is active for the resolved category/global policy and internalDate < resolved_age_cutoff_utc, recommend ARCHIVE when keep_in_inbox_score < age_archive_max_score (default 65, configurable), else REVIEW (or KEEP if >= keep_threshold).
+
+If age-based archival is disabled or internalDate >= resolved_age_cutoff_utc, recommend ARCHIVE when keep_in_inbox_score < archive_threshold (default 25), KEEP when keep_in_inbox_score >= keep_threshold (default 70), and REVIEW for scores in 25..69.
+
+14.5 Incremental Sync, Boundary Sweep, and Thread Context Discovery (Sections 3A & 5)
+
+Three-Step Maintenance Discovery:
+
+1. Fetch users.history.list from the persisted startHistoryId to reconcile label changes, removals from INBOX, and newly arrived messages.
+
+2. Perform an examination-boundary sweep between the previous job's latest_exclusive (T_prev) and the current job's latest_exclusive (T_curr) using epoch-second Gmail query bounds with a 24-hour safety margin (label:INBOX after:{T_prev_epoch - 86400} before:{T_curr_epoch + 86400}), filtering locally against exact millisecond internalDate.
+
+3. Query local SQLite state for existing INBOX messages that have crossed resolved_age_cutoff_utc, passed defer_until_utc <= anchor_utc, or reached a recorded deadline.
+
+Thread Context Without Leaking Excluded Bodies:
+
+1. Use users.threads.get(userId="me", id=thread_id, format="metadata", metadataHeaders=["From", "To", "Cc", "Date", "Subject", "Message-ID", "In-Reply-To", "References"]) to inspect thread membership, internalDate, and labelIds (INBOX, SENT, DRAFT) across the conversation without downloading out-of-window message bodies.
+
+14.6 Canonical Hashes and Calendar-Month DST Arithmetic (Sections 3, 4, 6, 8, & 10)
+
+Hash Definitions:
+
+content_hash: SHA-256 of canonical JSON containing message_id, internalDate, normalized From/To/Cc/Subject/List-ID, normalized body text, and is_truncated.
+
+context_version: SHA-256 of canonical JSON listing thread messages as (message_id, internalDate, has_INBOX, has_SENT) plus the sent_context_enabled flag.
+
+precondition_version: SHA-256 of message_id, sorted relevant labelIds, context_version, and active protection/policy revision ID.
+
+Calendar-Month Subtraction:
+
+Convert anchor_utc to the configured zoneinfo.ZoneInfo timezone, subtract N calendar months, and clamp day = min(local_dt.day, calendar.monthrange(target_year, target_month)[1]) while preserving (hour, minute, second, microsecond).
+
+Resolve nonexistent spring-forward wall times by advancing to the post-transition instant, and resolve ambiguous fall-back wall times with fold=0 before converting back to UTC.
+
+14.7 Gmail Batching and Windows Credential Protection (Sections 5 & 9)
+
+Batching: Default HTTP multipart metadata/body retrieval batches to 25 messages (configurable 1–50) with per-part response handling. Group live execution mutations by identical (tuple(sorted(add_label_ids)), tuple(sorted(remove_label_ids))) into users.messages.batchModify calls of up to 100 messages (configurable up to 500) after preflight checks.
+
+Token Security: Store a compact JSON credential payload (refresh_token, token_uri, client_id, client_secret, scopes) in Windows Credential Manager via keyring (staying well within the 2,560-byte win32cred limit), with automatic fallback to a per-user file encrypted via Windows DPAPI (CryptProtectData / CryptUnprotectData via ctypes.windll.crypt32).
+
+14.8 PyQt6 50k-Row Virtualized Tables and Safe HTML Preview (Sections 11 & 12)
+
+Back large tables (Review, Plan/Simulation, History/Undo) with SQL-driven QAbstractTableModel subclasses that push sorting (ORDER BY), filtering (WHERE), and grouping to indexed SQLite queries with an LRU row page cache rather than loading 50,000+ rows into an in-memory QSortFilterProxyModel.
+
+Render email previews in a subclassed QTextBrowser with loadResource() overridden to block all external/remote URLs, setOpenExternalLinks(False) with explicit user handling on anchorClicked, and strict HTML allowlist sanitization prior to rendering.
