@@ -11,7 +11,7 @@ try {
 		if ($LASTEXITCODE -ne 0) { throw 'Creating the Python 3.11 virtual environment failed.' }
 	}
 	$Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
-	& $Python -m pip install -e '.[dev,package]'
+	& $Python -m pip install -c constraints.txt -e '.[dev,package]'
 	if ($LASTEXITCODE -ne 0) { throw 'Installing build dependencies failed.' }
 	$BuildArgs = @('-m', 'PyInstaller', '--noconfirm', '--clean', '--windowed', '--onedir', '--name', 'GmailInboxCleaner', '--paths', '.', '--collect-all', 'keyring', '--collect-all', 'tzdata', '--collect-data', 'googleapiclient', '--hidden-import', 'gmail_clean.demo_ai')
 	foreach ($Module in $HiddenImports) { $BuildArgs += @('--hidden-import', $Module) }

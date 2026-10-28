@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, cast
 
 from .domain import Message, as_utc, content_hash, epoch_ms, iso_utc
 from .gmail import GmailError, HistoryExpired, PageTokenExpired
@@ -187,7 +187,7 @@ class DemoMailbox:
 	def _load_from_disk(self) -> None:
 		# fstat refers to the file actually read, even if another adapter replaces
 		# the target concurrently. Its next signature check then sees that replace.
-		with self.path.open("r", encoding="utf-8") as stream:
+		with cast(Path, self.path).open("r", encoding="utf-8") as stream:
 			payload = json.load(stream)
 			stat = os.fstat(stream.fileno())
 		if payload.get("account_id") != DEMO_ACCOUNT:
@@ -243,7 +243,7 @@ class DemoMailbox:
 				stream.seek(0)
 				if os.name == "nt":
 					import msvcrt
-					msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+					getattr(msvcrt, "locking")(stream.fileno(), getattr(msvcrt, "LK_LOCK"), 1)  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
 				else:
 					import fcntl
 					fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -254,7 +254,7 @@ class DemoMailbox:
 					self._write_depth -= 1
 					stream.seek(0)
 					if os.name == "nt":
-						msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+						getattr(msvcrt, "locking")(stream.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
 					else:
 						fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
@@ -356,7 +356,7 @@ class DemoMailbox:
 		for message_id in dict.fromkeys(ids):
 			try:
 				result[message_id] = self.get_message(message_id, body)
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - per-item mailbox protocol returns independent failures
 				result[message_id] = exc
 		return result
 

@@ -9,7 +9,7 @@ from collections import deque
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .domain import Message
 from .mime import parse_body
@@ -31,7 +31,7 @@ class QuotaLimiter:
 		self.limit = max(1, int(units_per_minute))
 		self.clock = clock
 		self.sleep = sleep
-		self._events = deque()
+		self._events: deque[tuple[float, int]] = deque()
 		self._lock = threading.Lock()
 		self.consumed = 0
 
@@ -159,7 +159,7 @@ class GmailMailbox:
 		self.quota_limiter = quota_limiter or QuotaLimiter()
 		self._sleep = time.sleep
 		self._random = random.random  # noqa: S311 -- retry jitter is not security-sensitive randomness.
-		self.on_label_error = None
+		self.on_label_error: Callable[[], None] | None = None
 
 	def _execute(self, request: Any, operation: str = "request", has_page: bool = False,
 			*, idempotent: bool = True, quota_units: int = 1) -> dict:

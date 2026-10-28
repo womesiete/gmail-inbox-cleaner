@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-qt>=4.4,<5", "pytest-cov>=6,<8", "ruff>=0.9,<1", "build>=1.2,<2"]
+dev = ["pytest>=8,<10", "pytest-qt>=4.4,<5", "pytest-cov>=6,<8", "ruff>=0.9,<1", "build>=1.2,<2", "mypy>=1.14,<2", "pip-audit>=2.8,<3"]
 package = ["pyinstaller>=6.6,<7"]
 
 [project.scripts]
@@ -43,7 +43,12 @@ target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B", "BLE", "S", "PERF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pytest assertions, synthetic secrets, fixed subprocess fixtures and seeded fuzz
+# generators are intentional in offline tests; production retains these checks.
+"tests/*" = ["S101", "S105", "S106", "S311", "S603"]
 
 [tool.ruff.format]
 indent-style = "tab"
@@ -55,3 +60,12 @@ relative_files = true
 [tool.coverage.report]
 fail_under = 75
 show_missing = true
+
+[tool.mypy]
+python_version = "3.11"
+files = ["gmail_clean"]
+exclude = ["gmail_clean/(gui[^/]*|table_model|app)\\.py$"]
+follow_imports = "silent"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true

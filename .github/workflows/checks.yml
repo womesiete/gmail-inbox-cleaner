@@ -15,8 +15,8 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -26,7 +26,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libegl1 libopengl0 libgl1 libxkbcommon0
       - name: Install
-        run: python -m pip install -e '.[dev]'
+        run: python -m pip install -c constraints.txt -e '.[dev]'
+      - name: Audit pinned dependencies
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: python -m pip_audit --requirement constraints.txt --no-deps --disable-pip
+      - name: Check typed core modules
+        run: python -m mypy
       - name: Check offscreen Qt startup
         run: python -c "from PyQt6.QtWidgets import QApplication; app = QApplication([]); print('Offscreen Qt startup succeeded')"
       - name: Compile
@@ -37,15 +42,24 @@ jobs:
         run: python scripts/ci_tests.py
       - name: Upload failed test diagnostics
         if: failure()
-        uses: actions/upload-artifact@v7.0.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-diagnostics-${{ matrix.os }}-${{ matrix.python }}
           path: |
             test-results.xml
             test-output.log
+            coverage.xml
           if-no-files-found: ignore
           retention-days: 7
       - name: Offline workflow
         run: python -m gmail_clean --demo --headless --count 100
       - name: Package source and wheel
         run: python -m build
+      - name: Build and smoke-test Windows executable
+        if: runner.os == 'Windows' && matrix.python == '3.11'
+        shell: pwsh
+        run: |
+          ./scripts/package_windows.ps1
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP 'gmail-clean-frozen-smoke'
+          $Process = Start-Process -FilePath './dist/GmailInboxCleaner/GmailInboxCleaner.exe' -ArgumentList @('--demo', '--headless', '--count', '20', '--data-dir', $SmokeRoot) -Wait -PassThru
+          if ($Process.ExitCode -ne 0) { throw "Frozen offline smoke test failed: $($Process.ExitCode)" }

@@ -84,10 +84,10 @@ class SqlTableModel(QAbstractTableModel):
 		self._where, self._params = where, tuple(params)
 		self.refresh()
 
-	def rowCount(self, parent=QModelIndex()):
+	def rowCount(self, parent=QModelIndex()):  # noqa: B008 - Qt virtual signature uses an immutable QModelIndex default
 		return 0 if parent.isValid() else self._count
 
-	def columnCount(self, parent=QModelIndex()):
+	def columnCount(self, parent=QModelIndex()):  # noqa: B008 - Qt virtual signature uses an immutable QModelIndex default
 		return 0 if parent.isValid() else len(self.columns)
 
 	def record(self, row: int) -> dict[str, Any]:

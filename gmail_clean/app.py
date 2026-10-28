@@ -53,7 +53,8 @@ def benchmark(count: int, directory: Path) -> dict:
 	from PyQt6.QtCore import QCoreApplication
 	application = QCoreApplication.instance() or QCoreApplication([])
 	# Keep an owned Qt application alive for the whole model measurement.
-	assert application is not None
+	if application is None:
+		raise RuntimeError("A Qt application is required for the model benchmark")
 	path = directory / f"scale-{count}.sqlite"
 	store = Store(path, "demo@example.invalid")
 	start = time.perf_counter()
@@ -183,7 +184,7 @@ def main(argv=None) -> int:
 				raise ValueError("Lease repair is a standalone metadata operation; omit execution, connection and restore options")
 			print(json.dumps(break_lease_metadata(directory, demo=args.demo, confirmed=args.confirm_break_lease), indent=2))
 			return 0
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - standalone repair boundary emits sanitized startup failure only
 			from .runtime import safe_error
 			print(str(exc) if isinstance(exc, ValueError) else safe_error(exc), file=sys.stderr)
 			return 1
@@ -285,7 +286,7 @@ def main(argv=None) -> int:
 		if args.headless:
 			print("Interrupted; completed work and retry checkpoints are retained.", file=sys.stderr)
 		return 130
-	except Exception as exc:
+	except Exception as exc:  # noqa: BLE001 - top-level process boundary emits a sanitized startup diagnostic
 		from .runtime import safe_error
 		message = safe_error(exc)
 		if isinstance(exc, ValueError):
@@ -297,7 +298,7 @@ def main(argv=None) -> int:
 				from PyQt6.QtWidgets import QApplication, QMessageBox
 				application = QApplication.instance() or QApplication(sys.argv[:1])
 				QMessageBox.critical(None, "Gmail Inbox Cleaner", message)
-			except Exception:
+			except Exception:  # noqa: BLE001 - top-level process boundary emits a sanitized startup diagnostic
 				# pythonw has no console; keep a bounded content-free startup diagnostic.
 				(directory / "startup-error.log").write_text(message, encoding="utf-8")
 		return 1

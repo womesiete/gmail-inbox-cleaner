@@ -16,7 +16,7 @@ def main(argv=None) -> int:
 	arguments = sys.argv[1:] if argv is None else argv
 	command = [sys.executable, "-m", "pytest", "-q", "--junitxml=test-results.xml", "--cov=gmail_clean", "--cov-report=term-missing:skip-covered", "--cov-report=xml:coverage.xml", *arguments]
 	environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-	result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+	result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # noqa: S603 - fixed Python executable runs pytest with explicit local command-line arguments
 		encoding="utf-8", errors="replace", env=environment, check=False)
 	Path("test-output.log").write_text(result.stdout, encoding="utf-8")
 	print(result.stdout, end="", flush=True)

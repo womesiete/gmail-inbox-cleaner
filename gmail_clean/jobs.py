@@ -7,7 +7,7 @@ import json
 import random
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .ai import PROMPT_VERSION
 from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
@@ -215,7 +215,7 @@ class JobRunner:
 			self.set_checkpoint("boundary_prompt_version", completed_inputs.get("prompt_version", PROMPT_VERSION))
 			if self.s.config.auto_execute and not self.s.config.dry_run:
 				self.s.apply_actions(job_id=job, should_stop=should_stop)
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - job boundary persists a kind-aware resumable pause
 			self.s.error("job", exc, job_id=job)
 			self.handle_exception(job, exc, config)
 			if progress:
@@ -369,7 +369,7 @@ class JobRunner:
 				continue
 			try:
 				threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - thread transport failures are returned as per-thread evidence
 				threads[message.thread_id] = exc
 		return threads
 
@@ -410,7 +410,7 @@ class JobRunner:
 					# Recheck before requesting any content, not after downloading it.
 					try:
 						live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 - metadata transport failure is assigned to unresolved work only
 						live_metadata = {row["message_id"]: exc for row in rows}
 					allowed = []
 					threads = self._prefetch_threads(
@@ -466,7 +466,7 @@ class JobRunner:
 									else:
 										self.done(job, message.id, stage)
 									continue
-							except Exception as exc:
+							except Exception as exc:  # noqa: BLE001 - per-item safety check failure enters the kind-aware work queue
 								self.fail(job, row, exc, effective)
 								continue
 							direct = recommend(message, None, effective, window, manual_override=self.s.override(message), rules=self.s.rules())
@@ -491,7 +491,7 @@ class JobRunner:
 				if stage in {"metadata", "body"}:
 					try:
 						results = self.s.mailbox.get_messages(ids, body=stage == "body")
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 - multipart failure produces independent per-item error results
 						results = {mid: exc for mid in ids}
 					threads = self._prefetch_threads(
 						message for message in results.values()
@@ -520,7 +520,7 @@ class JobRunner:
 											if not json.loads(row["payload_json"]).get("download_only", False):
 												self.queue(job, mid, "classification")
 									self.done(job, mid, stage)
-							except Exception as exc:
+							except Exception as exc:  # noqa: BLE001 - one persistence failure must not discard prior completed rows
 								self.fail(job, row, exc, effective)
 				else:
 					self.classify(job, rows, window, effective)
@@ -633,7 +633,7 @@ class JobRunner:
 		pending = defaultdict(list)
 		try:
 			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - classification metadata transport failure remains per-item evidence
 			live_metadata = {row["message_id"]: exc for row in rows}
 		threads = {}
 		for row in rows:
@@ -666,7 +666,7 @@ class JobRunner:
 					self.save_recommendation(job, message, None, "review", "Conversation/content changed or is incomplete before AI submission", window)
 					self.done(job, message.id, "classification")
 					continue
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - one classification preflight failure must preserve other targets
 				self.fail(job, row, exc, config)
 				continue
 			direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
@@ -692,7 +692,7 @@ class JobRunner:
 		if not pending:
 			return
 		exclusions = {"senders": config.excluded_senders, "domains": config.excluded_domains, "label_ids": config.excluded_label_ids, "categories": config.excluded_categories}
-		context_options = {"config": config}
+		context_options: dict[str, Any] = {"config": config}
 		if getattr(self.s, "supports_context_cache", False):
 			context_options.update(threads=threads, bodies={})
 		for (route, _), group in pending.items():
@@ -707,7 +707,7 @@ class JobRunner:
 					self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND stage='classification' AND state='running'", (job,))
 					return
 				batch = self.s.ai_for(route).assess([p[1] for p in group], self.db.labels(), examples=examples, exclusions=exclusions, sent_context_enabled=config.sent_context_enabled, context_messages=list(contexts.values()))
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - provider group failure enters kind-aware job backoff without losing receipts
 				for row, _, _, _ in group:
 					self.fail(job, row, exc, config)
 				continue
@@ -721,7 +721,7 @@ class JobRunner:
 					with self.db.transaction():
 						self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
 						self.done(job, message.id, "classification")
-				except Exception as exc:
+				except Exception as exc:  # noqa: BLE001 - save failure retries only the unresolved classification item
 					self.fail(job, row, exc, config)
 
 	def save_recommendation(self, job, message, assessment, action, reason, window, version="", telemetry=None, label_ids=None, approval="automatic"):
@@ -775,14 +775,14 @@ class JobRunner:
 		if kind == "quota":
 			now = self.s.clock()
 			reset = float(getattr(exc, "retry_after", 0) or 0)
-			due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
-			self.pause_system(job, kind, reason, due=due)
+			quota_due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+			self.pause_system(job, kind, reason, due=quota_due)
 			return
 		payload = self.payload(job)
 		attempt = int(payload.get("system_retries", 0)) + 1
 		payload["system_retries"] = attempt
 		self.save_payload(job, payload)
-		delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())
+		delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 		due = stamp(self.s.clock() + timedelta(seconds=delay)) if attempt <= config.max_retries else None
 		self.pause_system(job, kind, reason, due=due, attempts=attempt)
 
@@ -818,7 +818,7 @@ class JobRunner:
 			backoff = payload.get("backoff", {})
 			if not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
 				round_number = int(backoff.get("attempts", 0)) + 1
-				delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())
+				delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 				batch_size = config.ai_batch_size if row["stage"] == "classification" else config.retrieval_batch_size
 				sizes = payload.setdefault("batch_sizes", {})
 				sizes[row["stage"]] = max(1, sizes.get(row["stage"], batch_size) // 2)
@@ -835,7 +835,7 @@ class JobRunner:
 			attempt += 1
 			unknown = getattr(exc, "category", "") in {"AIAPIsError", "UnknownProviderError", "InterruptedRequest"}
 			retry = kind != "data" and not unknown and attempt <= config.max_retries
-			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())
+			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 			due = stamp(self.s.clock() + timedelta(seconds=delay)) if retry else None
 			state = "retry" if retry else "failed"
 		self.db.execute("UPDATE work_items SET state=?,attempts=?,next_attempt_utc=?,error=? WHERE id=?", (state, attempt, due, reason, row["id"]))

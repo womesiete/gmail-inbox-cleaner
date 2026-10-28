@@ -127,7 +127,7 @@ def parse_body(payload: dict, fetch_text_attachment: Callable[[str], dict] | Non
 				return ""
 			try:
 				data = fetch_text_attachment(str(body["attachmentId"])).get("data")
-			except Exception:
+			except Exception:  # noqa: BLE001 - attachment callback boundary marks unavailable content without leaking errors
 				result.missing = True
 				return ""
 		if data is None:

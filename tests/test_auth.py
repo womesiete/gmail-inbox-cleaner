@@ -7,7 +7,7 @@ import pytest
 from gmail_clean.auth import AuthManager, AuthenticationError, TokenStore
 
 
-def credential(token="refresh"):
+def credential(token="refresh"):  # noqa: S107 - synthetic refresh-token fixture never authorizes a real account
 	return SimpleNamespace(refresh_token=token, token_uri="https://oauth.example/token", client_id="desktop", client_secret="secret", scopes=["modify"], valid=False)
 
 

@@ -69,7 +69,8 @@ class TokenStore:
 		buffer = ctypes.create_string_buffer(data)
 		source = DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
 		target = DataBlob()
-		crypt = ctypes.windll.crypt32
+		windows_api = getattr(ctypes, "windll")  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
+		crypt = windows_api.crypt32
 		fn = crypt.CryptProtectData if encrypt else crypt.CryptUnprotectData
 		fn.argtypes = [ctypes.POINTER(DataBlob), ctypes.c_void_p, ctypes.c_void_p,
 			ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DataBlob)]
@@ -80,8 +81,8 @@ class TokenStore:
 		try:
 			return ctypes.string_at(target.pbData, target.cbData)
 		finally:
-			ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-			ctypes.windll.kernel32.LocalFree(target.pbData)
+			windows_api.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+			windows_api.kernel32.LocalFree(target.pbData)
 
 	@staticmethod
 	def payload(credential: Any) -> dict:

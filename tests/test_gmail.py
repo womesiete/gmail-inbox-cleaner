@@ -89,7 +89,7 @@ class FakeGoogle:
 				for message_id, request in self.entries:
 					try:
 						callback(message_id, request.execute(), None)
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 - emulate Google's per-part failure callback
 						callback(message_id, None, exc)
 		return Batch()
 

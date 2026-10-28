@@ -260,7 +260,7 @@ def test_closing_nonowner_store_does_not_wait_for_another_writer(tmp_path):
 					store.execute("INSERT INTO jobs(id) VALUES('held')")
 					ready.set()
 					finish.wait(10)
-		except BaseException as exc:
+		except BaseException as exc:  # noqa: BLE001 - relay thread failures to the asserting test thread
 			errors.append(exc)
 	worker = threading.Thread(target=writer)
 	worker.start()

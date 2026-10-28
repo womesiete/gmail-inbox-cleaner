@@ -429,7 +429,7 @@ def thread_context_hash(messages: Iterable[Message | dict[str, Any]], sent_conte
 		if isinstance(message, Message):
 			mid, millis, labels = message.id, message.internal_ms, message.labels
 		else:
-			mid = message.get("id", message.get("message_id"))
+			mid = str(message.get("id", message.get("message_id", "")))
 			millis = int(message.get("internal_ms", message.get("internalDate", 0)))
 			labels = set(message.get("labels", message.get("labelIds", [])))
 		items.append((mid, millis, "INBOX" in labels, "SENT" in labels))

@@ -245,7 +245,7 @@ class Store:
 		self._thread_id = threading.get_ident()
 		self._owner_token = uuid.uuid4().hex
 		self._savepoints = 0
-		if self.path != ":memory:":
+		if isinstance(self.path, Path):
 			self.path.parent.mkdir(parents=True, exist_ok=True)
 		self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=5.0)
 		self.conn.row_factory = sqlite3.Row
@@ -276,8 +276,9 @@ class Store:
 			raise RuntimeError("Store connection belongs to another thread; open a separate Store")
 
 	def _migrate(self) -> None:
-		# Read the version only after the write lock is held. Two starting workers
-		# must not both decide to apply the same migration from a stale version.
+		# Back up an older schema before taking the migration write lock. Re-read
+		# its authoritative version under the lock so concurrent starting workers
+		# cannot both apply a migration based on the pre-backup version snapshot.
 		version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
 		if 0 < version < SCHEMA_VERSION and self.path != ":memory:":
 			self.backup(Path(str(self.path) + f".pre-migration-v{version}-{uuid.uuid4().hex}.sqlite3"))
@@ -430,7 +431,7 @@ class Store:
 		ids = list(dict.fromkeys(ids))
 		for chunk in chunks(ids):
 			marks = placeholders(chunk)
-			for row in self.query(f"SELECT * FROM messages WHERE id IN ({marks})", chunk):
+			for row in self.query(f"SELECT * FROM messages WHERE id IN ({marks})", chunk):  # noqa: S608 - placeholder helper emits bind markers only; message IDs stay bound
 				result[row["id"]] = self.message_from_row(row)
 		return result
 
@@ -520,7 +521,7 @@ class Store:
 						connection.commit()
 						if cursor.rowcount != 1:
 							raise LeaseBusyError("Execution lease was lost")
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - heartbeat thread relays lease loss to its owner for safe cleanup
 				error.append(exc)
 		thread = None
 		if self.path != ":memory:":
@@ -694,7 +695,7 @@ def _pid_alive(pid: int) -> bool:
 def _windows_process_api():
 	"""Load Win32 functions lazily so importing the store stays portable."""
 	import ctypes
-	return ctypes.WinDLL("kernel32", use_last_error=True), ctypes.get_last_error
+	return getattr(ctypes, "WinDLL")("kernel32", use_last_error=True), getattr(ctypes, "get_last_error")  # noqa: B009 - platform API is absent from other-platform type stubs and loaded lazily
 
 
 def _windows_pid_alive(pid: int) -> bool:
@@ -759,7 +760,7 @@ def _process_start(pid: int) -> str | None:
 			if path.exists():
 				# The command name may itself contain spaces and parentheses.
 				return path.read_text().rsplit(")", 1)[1].split()[19]
-			return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], text=True, stderr=subprocess.DEVNULL, timeout=2).strip() or None
+			return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], text=True, stderr=subprocess.DEVNULL, timeout=2).strip() or None  # noqa: S603,S607 - fixed OS process inspection command with integer PID and no shell
 	except (OSError, ValueError, IndexError, subprocess.SubprocessError):
 		return _PROCESS_FALLBACK if pid == os.getpid() else None
 	return _PROCESS_FALLBACK if pid == os.getpid() else None

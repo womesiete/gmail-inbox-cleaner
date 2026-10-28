@@ -50,3 +50,5 @@ oauth.dpapi.*.tmp
 /build-env-*/
 /build-requirements-*.txt
 /pytest-of-*/
+coverage.xml
+.coverage*

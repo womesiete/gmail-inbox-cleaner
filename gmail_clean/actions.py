@@ -28,16 +28,16 @@ class ActionExecutor:
 	def __init__(self, service: AppService):
 		self.s = service
 		self.db = service.store
-		self._history_evidence_cache = {}
+		self._history_evidence_cache: dict[tuple[str, str], tuple[bool, list[tuple[int, str, str, str]]]] = {}
 		self._prefetched_messages: dict[str, Message] = {}
 		self._prefetched_threads: dict[str, list[Message]] = {}
 		self._batch_identity_cache = False
 		self._identity_verified = False
 		self._should_stop: Callable[[], bool] | None = None
-		self._undo_history_start = None
-		self._undo_history_evidence = None
-		self._reviewed_scope = None
-		self._expected_dry_run = None
+		self._undo_history_start: int | None = None
+		self._undo_history_evidence: tuple[bool, dict[str, list[tuple[int, str, str]]]] | None = None
+		self._reviewed_scope: tuple[list[str] | None, str | None, set[str]] | None = None
+		self._expected_dry_run: bool | None = None
 
 	def _stop_requested(self) -> bool:
 		return bool(self._should_stop and self._should_stop())
@@ -58,7 +58,7 @@ class ActionExecutor:
 		if len(message_ids) > 1 and callable(getattr(self.s.mailbox, "get_messages", None)):
 			try:
 				results = self.s.mailbox.get_messages(message_ids, body=False)
-			except Exception:
+			except Exception:  # noqa: BLE001 - multipart failure is isolated before independent preflight readback
 				# A failed multipart transport does not establish any item's state.
 				# Individual preflight reads isolate and report affected failures.
 				return
@@ -297,7 +297,7 @@ class ActionExecutor:
 					self.mark(action["id"], "satisfied", "Effects already present; no new ownership claimed")
 					continue
 				groups[(add, remove)].append((action, message))
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - per-action preflight failures become sanitized conflicts
 				self.s.error("preflight", exc, job_id=action["job_id"], message_id=action["message_id"])
 				self.mark(action["id"], "conflict", safe_error(exc))
 		for (add, remove), group in groups.items():
@@ -317,7 +317,7 @@ class ActionExecutor:
 						message = self.preflight(action)
 						if message is not None:
 							ready.append((action, message))
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 - one final preflight failure must not abort unrelated actions
 						self.mark(action["id"], "conflict", safe_error(exc))
 				if not ready:
 					continue
@@ -383,7 +383,7 @@ class ActionExecutor:
 								self.mark(action["id"], "queued", "Stopped before the network write")
 						return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 					self.s.mailbox.modify([action["message_id"] for action, _ in ready], list(add), list(remove))
-				except Exception as exc:
+				except Exception as exc:  # noqa: BLE001 - write transport failure must preserve definite or uncertain durable outcomes
 					status = getattr(exc, "status", None)
 					if status is not None and 400 <= status < 500 and status != 408:
 						# An explicit rejection has no successful response to own. Cheap
@@ -422,7 +422,7 @@ class ActionExecutor:
 					return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 				try:
 					after_write_history_id = self._checkpoint()
-				except Exception as exc:
+				except Exception as exc:  # noqa: BLE001 - a failed post-write checkpoint leaves durable attempts uncertain
 					for action, _ in ready:
 						self.mark(action["id"], "uncertain", safe_error(exc))
 					continue
@@ -441,7 +441,7 @@ class ActionExecutor:
 							applied += 1
 						else:
 							self.mark(action["id"], "conflict", "Readback did not confirm all requested effects")
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 - post-write receipt failure must retain reconciliation rather than replay
 						self.mark(action["id"], "uncertain", safe_error(exc))
 		return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": self._stop_requested()}
 
@@ -485,7 +485,7 @@ class ActionExecutor:
 				tokens.add(token)
 			else:
 				raise ValueError("History interval exceeds the bounded receipt inspection")
-		except Exception:
+		except Exception:  # noqa: BLE001 - unavailable ownership evidence must fail closed for undo
 			result = (False, [])
 		if self._stop_requested():
 			return result
@@ -619,7 +619,7 @@ class ActionExecutor:
 		if self._undo_history_evidence is None:
 			start = self._undo_history_start if self._undo_history_start is not None else int(checkpoint)
 			reliable, events = self._history_interval(start, self._checkpoint())
-			index = defaultdict(list)
+			index: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
 			for number, kind, mid, label in events:
 				index[mid].append((number, kind, label))
 			self._undo_history_evidence = (reliable, index)

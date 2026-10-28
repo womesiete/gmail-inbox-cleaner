@@ -13,7 +13,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TypedDict, cast
 
 from .domain import CATEGORIES, Message, domain_matches, template_key
 from .runtime import chunks, placeholders
@@ -24,6 +24,13 @@ _RULE_ACTIONS = {"archive", "keep", "review", "label"}
 _RULE_CONDITIONS = {"sender", "domain", "list_id", "subject_contains", "category", "template"}
 _REVIEW_SOURCES = {"manual", "review", "correction"}
 _ATTENTION_ACTIONS = {"archive", "keep", "defer", "mistaken_archive", "unnecessary_keep"}
+
+
+class _PatternStats(TypedDict):
+	pattern_key: str
+	action: str
+	support: int
+	counterexamples: int
 
 
 class Learning:
@@ -103,7 +110,7 @@ class Learning:
 		event_id = group_id or feedback_id
 		now = utc_now()
 		eligible_learning = bool(self.enabled and source in _REVIEW_SOURCES)
-		payload = {
+		payload: dict[str, Any] = {
 			"negative_label_ids": negative_labels, "protection_bypass": sorted(set(protection_bypass)),
 			"sender": message.sender, "list_id": message.header("List-ID").strip().casefold(),
 			"category": category, "pattern_key": template_key(message),
@@ -261,12 +268,12 @@ class Learning:
 				rows.extend(self.store.query(f"SELECT pattern_key,action,group_id,sender,list_id,subject,created_at,id FROM examples WHERE pattern_key IN ({marks}) ORDER BY created_at DESC,id DESC", chunk))  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 				rules.extend(self.store.query(f"SELECT * FROM rules WHERE json_extract(payload_json,'$.pattern_key') IN ({marks})", chunk))  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 		groups: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
-		samples = {}
+		samples: dict[str, dict[str, Any]] = {}
 		for row in rows:
 			action = {"mistaken_archive": "keep", "unnecessary_keep": "archive"}.get(row["action"], row["action"])
 			groups[row["pattern_key"]][action].add(row["group_id"])
 			samples.setdefault(row["pattern_key"], row)
-		statistics = {}
+		statistics: dict[tuple[str, str], _PatternStats] = {}
 		for pattern, actions in groups.items():
 			for action, events in actions.items():
 				conflicts = set().union(*(items for other, items in actions.items() if other in {"archive", "keep"} and action in {"archive", "keep"} and other != action))
@@ -390,7 +397,7 @@ class Learning:
 		clauses, params = _rule_sql(conditions)
 		where = "in_inbox=1 AND " + " AND ".join(clauses or ["1"])
 		sample_limit = max(0, min(limit, 100))
-		samples = []
+		samples: list[dict[str, Any]] = []
 		if "template" in conditions:
 			count, earliest, latest = 0, None, None
 			# Stream metadata only; templates never require loading each cached body.
@@ -404,7 +411,7 @@ class Learning:
 				if len(samples) < sample_limit:
 					samples.append({key: row[key] for key in ("id", "internal_ms", "subject", "sender")})
 		else:
-			bounds = self.store.one("SELECT COUNT(*) n,MIN(internal_ms) earliest,MAX(internal_ms) latest FROM messages WHERE " + where, params)  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
+			bounds = cast(dict[str, Any], self.store.one("SELECT COUNT(*) n,MIN(internal_ms) earliest,MAX(internal_ms) latest FROM messages WHERE " + where, params))  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
 			count, earliest, latest = bounds["n"], bounds["earliest"], bounds["latest"]
 			if sample_limit:
 				samples = self.store.query("SELECT id,internal_ms,subject,sender FROM messages WHERE " + where + " ORDER BY internal_ms,id LIMIT ?", [*params, sample_limit])  # noqa: S608 -- internal predicate builders and fixed column allowlists; values stay bound
@@ -490,8 +497,8 @@ class Learning:
 			"basis": "Explicit reviewed events only; no estimate of unreviewed automatic accuracy",
 			"counts": {row["action"]: row["count"] for row in rows},
 			"independent_events": {row["action"]: row["independent_events"] for row in rows},
-			"examples": self.store.one("SELECT COUNT(*) AS n FROM examples")["n"],
-			"enabled_rules": self.store.one("SELECT COUNT(*) AS n FROM rules WHERE enabled=1")["n"],
+			"examples": cast(dict[str, Any], self.store.one("SELECT COUNT(*) AS n FROM examples"))["n"],
+			"enabled_rules": cast(dict[str, Any], self.store.one("SELECT COUNT(*) AS n FROM rules WHERE enabled=1"))["n"],
 			"reviewed_by_type": self.store.query("SELECT category,action,COUNT(DISTINCT group_id) AS events FROM examples GROUP BY category,action ORDER BY category,action"),
 		}
 

@@ -195,11 +195,11 @@ class ServiceTask(QRunnable):
 					if hasattr(worker, "error"):
 						try:
 							worker.error("interface", exc)
-						except Exception:
+						except Exception:  # noqa: S110,BLE001 - secondary reporting failure must not mask the original task error; secondary error reporting must preserve the original task exception
 							pass  # Failure reporting must preserve the original exception.
 					raise
 			self.signals.result.emit(self.task_id, result)
-		except Exception as exc:
+		except Exception as exc:  # noqa: BLE001 - Qt worker boundary emits only a sanitized failure signal
 			# Raw exception payloads may contain provider request text or credentials.
 			from .runtime import safe_error
 			self.signals.error.emit(self.task_id, safe_error(exc))

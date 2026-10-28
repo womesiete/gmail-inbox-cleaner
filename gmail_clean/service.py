@@ -10,6 +10,7 @@ import warnings
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, TypedDict
 
 from .actions import ActionExecutor
 from .ai import AIClient, AIError, module_trust_details, verify_module_trust
@@ -18,6 +19,10 @@ from .jobs import JobRunner
 from .learning import Learning
 from .runtime import chunks, placeholders, data_directory, digest, encode, identifier, insert, path_lock, safe_error, stamp, utc_now
 from .storage import LeaseBusyError, Store
+
+
+class _TrustOptions(TypedDict, total=False):
+	expected_sha256: str
 
 
 class AppService:
@@ -47,7 +52,7 @@ class AppService:
 		# owns and closes its SQLite connection on the thread that opened it.
 		self._resource_owner = _worker_owner._resource_owner if _worker_owner is not None else self
 		if _worker_owner is None:
-			self._clients = {}
+			self._clients: dict[tuple[Any, ...], Any] = {}
 			self._clients_lock = threading.RLock()
 			self._active_workers = set()
 			self._workers_lock = threading.RLock()
@@ -231,7 +236,7 @@ class AppService:
 		with self._clients_lock:
 			if key not in self._clients:
 				factory = self._ai_factory or AIClient
-				trust = {"expected_sha256": self.config.ai_module_sha256} if not self.demo and self.config.ai_module and self.config.ai_module != "gmail_clean.demo_ai" else {}
+				trust: _TrustOptions = {"expected_sha256": self.config.ai_module_sha256} if not self.demo and self.config.ai_module and self.config.ai_module != "gmail_clean.demo_ai" else {}
 				self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds, **trust)
 			return self._clients[key]
 
@@ -395,7 +400,7 @@ class AppService:
 			event(self.logger, "job_started", job_id=job_id, stage="discovery")
 			try:
 				self.refresh_labels()
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 - label discovery failure becomes a stored system pause before job entry
 				self.error("discovery", exc, job_id=job_id)
 				self.jobs.handle_exception(job_id, exc, self.config)
 				return self.jobs.summary(job_id)
