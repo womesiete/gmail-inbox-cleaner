@@ -58,6 +58,9 @@ class JobRunner:
 		row = self.db.one("SELECT state FROM jobs WHERE id=?", (job,))
 		if row["state"] in {"paused", "stopped"}:
 			return True
+		backoff = self.payload(job).get("backoff", {})
+		if row["state"] == "waiting" and backoff.get("due") and datetime.fromisoformat(backoff["due"]) > self.s.clock():
+			return True
 		signal = should_stop() if callable(should_stop) else False
 		if signal:
 			state = signal if signal in {"paused", "stopped"} else "paused"
@@ -174,6 +177,9 @@ class JobRunner:
 		row = self.db.one("SELECT * FROM jobs WHERE id=?", (job,))
 		if not row or row["account_id"] != self.s.account_id:
 			raise ValueError("Job belongs to a different account or does not exist")
+		backoff = json.loads(row["payload_json"]).get("backoff", {})
+		if row["state"] == "waiting" and backoff.get("due") and datetime.fromisoformat(backoff["due"]) > self.s.clock():
+			return self.summary(job)
 		window = Window.from_dict(json.loads(row["window_json"]))
 		config = Config.from_dict(json.loads(row["config_json"]))
 		# Recovered running items were never acknowledged; stages are idempotent.
@@ -336,10 +342,12 @@ class JobRunner:
 				return False
 			self.s.reload_config()
 			effective = self.effective_config(config)
+			batch_size = effective.retrieval_batch_size if stage != "classification" else effective.ai_batch_size
+			batch_size = min(batch_size, self.payload(job).get("batch_sizes", {}).get(stage, batch_size))
 			rows = self.db.query(
 				"SELECT * FROM work_items WHERE job_id=? AND stage=? AND state IN ('pending','retry') "
 				"AND (next_attempt_utc IS NULL OR next_attempt_utc<=?) ORDER BY message_id LIMIT ?",
-				(job, stage, stamp(self.s.clock()), effective.retrieval_batch_size if stage != "classification" else effective.ai_batch_size),
+				(job, stage, stamp(self.s.clock()), batch_size),
 			)
 			if not rows:
 				waiting = self.db.one("SELECT count(*) n FROM work_items WHERE job_id=? AND stage=? AND state='retry'", (job, stage))["n"]
@@ -640,23 +648,61 @@ class JobRunner:
 	def done(self, job: str, mid: str, stage: str) -> None:
 		self.db.execute("UPDATE work_items SET state='completed',error='',next_attempt_utc=NULL WHERE job_id=? AND message_id=? AND stage=?", (job, mid, stage))
 
+	def pause_system(self, job: str, kind: str, reason: str, *, due=None) -> None:
+		payload = self.payload(job)
+		payload["pause"] = {"origin": "system", "kind": kind, "reason": reason, "due": due}
+		self.save_payload(job, payload)
+		self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(self.s.clock()), job))
+
 	def fail(self, job: str, row: dict, exc: Exception, config: Config) -> None:
+		current = self.db.one("SELECT state,attempts FROM work_items WHERE id=?", (row["id"],))
+		if not current or current["state"] == "completed":
+			return
 		kind = getattr(exc, "kind", "")
+		if getattr(exc, "configuration", False):
+			kind = "configuration"
 		if kind == "missing":
 			self.db.execute("UPDATE messages SET in_inbox=0,decision='skip' WHERE id=?", (row["message_id"],))
 			self.done(job, row["message_id"], row["stage"])
 			return
-		attempt = row["attempts"] + 1
-		configuration = getattr(exc, "configuration", False) or kind in {"auth", "permission", "configuration"}
-		unknown = getattr(exc, "category", "") in {"AIAPIsError", "UnknownProviderError", "InterruptedRequest"}
-		retry = not configuration and not unknown and attempt <= config.max_retries
-		delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())
-		due = stamp(self.s.clock() + timedelta(seconds=delay)) if retry else None
-		self.db.execute("UPDATE work_items SET state=?,attempts=?,next_attempt_utc=?,error=? WHERE job_id=? AND message_id=? AND stage=?", ("retry" if retry else "failed", attempt, due, safe_error(exc), job, row["message_id"], row["stage"]))
-		self.db.execute("UPDATE messages SET decision='review' WHERE id=?", (row["message_id"],))
+		reason = safe_error(exc)
+		attempt = current["attempts"]
+		due = None
+		state = "pending"
+		if kind in {"auth", "permission", "account", "configuration", "quota"}:
+			if kind == "quota":
+				reset = float(getattr(exc, "retry_after", 0) or 0)
+				now = self.s.clock()
+				due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+			self.pause_system(job, kind, reason, due=due)
+		elif kind == "rate_limit":
+			payload = self.payload(job)
+			backoff = payload.get("backoff", {})
+			if not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
+				round_number = int(backoff.get("attempts", 0)) + 1
+				delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())
+				batch_size = config.ai_batch_size if row["stage"] == "classification" else config.retrieval_batch_size
+				sizes = payload.setdefault("batch_sizes", {})
+				sizes[row["stage"]] = max(1, sizes.get(row["stage"], batch_size) // 2)
+				backoff = {"kind": kind, "due": stamp(self.s.clock() + timedelta(seconds=delay)), "attempts": round_number, "batch_size": sizes[row["stage"]]}
+				payload["backoff"] = backoff
+				self.save_payload(job, payload)
+			due = backoff["due"]
+			state = "retry"
+			if backoff["attempts"] > config.max_retries:
+				self.pause_system(job, kind, "Rate-limit retry budget exhausted; retry this job after checking quota")
+			else:
+				self.db.execute("UPDATE jobs SET state='waiting' WHERE id=?", (job,))
+		else:
+			attempt += 1
+			unknown = getattr(exc, "category", "") in {"AIAPIsError", "UnknownProviderError", "InterruptedRequest"}
+			retry = kind != "data" and not unknown and attempt <= config.max_retries
+			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())
+			due = stamp(self.s.clock() + timedelta(seconds=delay)) if retry else None
+			state = "retry" if retry else "failed"
+		self.db.execute("UPDATE work_items SET state=?,attempts=?,next_attempt_utc=?,error=? WHERE id=?", (state, attempt, due, reason, row["id"]))
+		self.db.execute("UPDATE messages SET decision='review' WHERE id=? AND (decision IS NULL OR decision='pending')", (row["message_id"],))
 		self.s.error(row["stage"], exc, job_id=job, message_id=row["message_id"])
-		if configuration:
-			self.db.execute("UPDATE jobs SET state='paused' WHERE id=?", (job,))
 
 	def summary(self, job: str) -> dict:
 		result = {"id": job, "completed": 0, "failed": 0, "pending": 0, "retry": 0}

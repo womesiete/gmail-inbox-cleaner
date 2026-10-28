@@ -389,7 +389,7 @@ def test_configuration_failure_pauses_without_retry_loop(service):
 	service.mailbox.messages = {"old": mail()}
 	_, _, summary = run_new(service)
 	assert summary["state"] == "paused"
-	assert summary["failed"] == 1
+	assert summary["failed"] == 0 and summary["pending"] == 1
 	assert summary["retry"] == 0
 	assert not service.actions.planned
 
@@ -657,3 +657,30 @@ def test_classification_save_failure_retries_only_unresolved_item(service, monke
 	states = {row["message_id"]: row["state"] for row in service.store.query("SELECT message_id,state FROM work_items WHERE stage='classification'")}
 	assert states == {"0": "completed", "1": "completed", "2": "retry", "3": "completed"}
 	assert len(service.ai.calls) == 1
+
+
+@pytest.mark.parametrize("kind", ["auth", "permission", "account", "quota", "rate_limit", "data", "network"])
+def test_fail_policy_preserves_decisions_and_separates_job_blocks(service, kind):
+	runner = JobRunner(service)
+	job = runner.new()
+	service.store.upsert_message(mail())
+	service.store.execute("UPDATE messages SET decision='archive' WHERE id='old'")
+	runner.queue(job, "old", "classification")
+	row = service.store.one("SELECT * FROM work_items WHERE job_id=?", (job,))
+	runner.fail(job, row, GmailError(kind, "Synthetic policy failure", retry_after=75), service.config)
+	work = service.store.one("SELECT * FROM work_items WHERE id=?", (row["id"],))
+	assert service.store.one("SELECT decision FROM messages WHERE id='old'")["decision"] == "archive"
+	if kind in {"auth", "permission", "account", "quota"}:
+		assert work["state"] == "pending" and work["attempts"] == 0
+		assert runner.summary(job)["state"] == "paused"
+		assert runner.payload(job)["pause"]["kind"] == kind
+	elif kind == "rate_limit":
+		assert work["state"] == "retry" and work["attempts"] == 0
+		assert runner.summary(job)["state"] == "waiting"
+		backoff = runner.payload(job)["backoff"]
+		assert datetime.fromisoformat(backoff["due"]) >= service.now + timedelta(seconds=75)
+		assert backoff["batch_size"] < service.config.retrieval_batch_size
+	elif kind == "data":
+		assert work["state"] == "failed" and work["attempts"] == 1
+	else:
+		assert work["state"] == "retry" and work["attempts"] == 1
