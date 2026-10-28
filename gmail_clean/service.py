@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .storage import LeaseBusyError, Store
 
 
 class AppService:
-	def __init__(self, store=None, mailbox=None, config=None, data_dir=None, demo=False, count=3000, clock=utc_now, ai_factory=None):
+	def __init__(self, store=None, mailbox=None, config=None, data_dir=None, demo=False, count=3000, clock=utc_now, ai_factory=None, _worker_owner=None):
 		self.demo = demo
 		self._closed = False
 		self.clock = clock
@@ -31,7 +32,19 @@ class AppService:
 		from .gmail import GmailMailbox
 		self._supplied_mailbox = mailbox is not None and not isinstance(mailbox, GmailMailbox)
 		self._ai_factory = ai_factory
-		self._clients = {}
+		# Only isolated AI processes are reused between Qt tasks. Each task still
+		# owns and closes its SQLite connection on the thread that opened it.
+		self._resource_owner = _worker_owner._resource_owner if _worker_owner is not None else self
+		if _worker_owner is None:
+			self._clients = {}
+			self._clients_lock = threading.RLock()
+			self._active_workers = set()
+			self._workers_lock = threading.RLock()
+			self._abort_event = threading.Event()
+		else:
+			self._clients = self._resource_owner._clients
+			self._clients_lock = self._resource_owner._clients_lock
+		self._cancel_event = threading.Event()
 		self._lease_depth = 0
 		self.current_job_id = None
 		if demo and mailbox is not None:
@@ -89,10 +102,16 @@ class AppService:
 
 	def _write_identity(self, connected=True):
 		target = self.data_dir / "account.json"
-		temporary = target.with_suffix(".tmp")
+		temporary = target.with_name(f"{target.name}.{os.getpid()}.{identifier()[:8]}.tmp")
 		generation = identifier()
-		temporary.write_text(encode({"account_id": self.account_id, "connected": connected, "generation": generation}), encoding="utf-8")
-		temporary.replace(target)
+		try:
+			with temporary.open("w", encoding="utf-8") as stream:
+				stream.write(encode({"account_id": self.account_id, "connected": connected, "generation": generation}))
+				stream.flush()
+				os.fsync(stream.fileno())
+			temporary.replace(target)
+		finally:
+			temporary.unlink(missing_ok=True)
 		self._connection_generation = generation
 
 	def refresh_connection(self) -> bool:
@@ -154,12 +173,15 @@ class AppService:
 
 	def ai_for(self, category=""):
 		self._validate_demo_ai(self.config)
+		if self._closed or self._resource_owner._abort_event.is_set():
+			raise AIError("InterruptedRequest", "Application shutdown stopped new local AI work; remote completion of an active request remains unknown.")
 		model = self.config.optional_model_routes.get(category, self.config.ai_model)
 		key = (self.config.ai_module, model, self.config.ai_use_call_api_result, self.config.ai_timeout_seconds)
-		if key not in self._clients:
-			factory = self._ai_factory or AIClient
-			self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds)
-		return self._clients[key]
+		with self._clients_lock:
+			if key not in self._clients:
+				factory = self._ai_factory or AIClient
+				self._clients[key] = factory(self.config.ai_module, model=model, use_call_api_result=self.config.ai_use_call_api_result, timeout_s=self.config.ai_timeout_seconds)
+			return self._clients[key]
 
 	def _validate_demo_ai(self, config):
 		if self.demo and config.ai_module != "gmail_clean.demo_ai":
@@ -193,16 +215,62 @@ class AppService:
 	@contextlib.contextmanager
 	def worker(self):
 		"""Each Qt worker constructs fresh SQLite and Gmail clients on its own thread."""
+		owner = self._resource_owner
+		if self._closed or owner._abort_event.is_set():
+			raise RuntimeError("Application shutdown has stopped new worker operations")
 		mailbox = None
-		if self._supplied_mailbox and not self.demo:
+		if self._supplied_mailbox:
 			# Dependency-injected transports are test-only; production clients are
 			# restored inside the worker and never cross thread ownership boundaries.
 			mailbox = self._mailbox
-		clone = AppService(config=None, data_dir=self.data_dir, demo=self.demo, count=self.count, clock=self.clock, mailbox=mailbox, ai_factory=self._ai_factory)
+			# DemoMailbox synchronizes its public API, so sharing it avoids parsing
+			# a 50,000-message state file for every short desktop operation.
+		if self.demo:
+			mailbox = self.mailbox
+		clone = AppService(config=None, data_dir=self.data_dir, demo=self.demo, count=self.count, clock=self.clock, mailbox=mailbox, ai_factory=self._ai_factory, _worker_owner=owner)
+		with owner._workers_lock:
+			owner._active_workers.add(clone)
 		try:
+			if owner._abort_event.is_set():
+				clone._cancel_event.set()
+				raise RuntimeError("Application shutdown stopped this worker before execution")
 			yield clone
 		finally:
-			clone.close()
+			try:
+				clone.close()
+			finally:
+				with owner._workers_lock:
+					owner._active_workers.discard(clone)
+
+	def _stop_callback(self, should_stop=None):
+		"""Preserve explicit pause/stop signals while adding local shutdown."""
+		def requested():
+			signal = should_stop() if should_stop is not None else False
+			return signal or self._cancel_event.is_set() or self._resource_owner._abort_event.is_set()
+		return requested
+
+	def abort_workers(self):
+		"""Stop local AI children without closing worker-owned SQLite connections.
+
+		Network requests can outlive the GUI. Workers retain their connections and
+		clean them up on their owning threads; durable attempts cover lost replies.
+		"""
+		owner = self._resource_owner
+		owner._abort_event.set()
+		with owner._workers_lock:
+			for worker in owner._active_workers:
+				worker._cancel_event.set()
+		with owner._clients_lock:
+			clients = list(owner._clients.values())
+		for client in clients:
+			abort = getattr(client, "abort", None)
+			if abort is not None:
+				abort(grace_s=0.1)
+
+	def active_worker_count(self):
+		owner = self._resource_owner
+		with owner._workers_lock:
+			return len(owner._active_workers)
 
 	@contextlib.contextmanager
 	def execution_lease(self):
@@ -226,6 +294,11 @@ class AppService:
 		return self.current_job_id
 
 	def run_job(self, job_id, progress=None, should_stop=None):
+		should_stop = self._stop_callback(should_stop)
+		if should_stop():
+			signal = should_stop()
+			self.control_job(job_id, signal if signal in {"paused", "stopped"} else "paused")
+			return self.jobs.summary(job_id)
 		with self.execution_lease():
 			self.reload_config()
 			self.refresh_labels()
@@ -247,11 +320,8 @@ class AppService:
 
 	def excluded(self, message):
 		config = self.config
-		domain = message.sender.rpartition("@")[2]
 		row = self.store.one("SELECT category FROM messages WHERE id=?", (message.id,))
-		return (message.sender in {value.casefold() for value in config.excluded_senders}
-			or domain in {value.casefold().lstrip("@") for value in config.excluded_domains}
-			or bool(set(message.labels) & set(config.excluded_label_ids))
+		return (content_excluded(message, config)
 			or bool(row and row["category"] in config.excluded_categories))
 
 	def override(self, message):
@@ -303,10 +373,13 @@ class AppService:
 				break
 		return result
 
-	def download_bodies(self, ids):
+	def download_bodies(self, ids, should_stop=None):
+		should_stop = self._stop_callback(should_stop)
 		window = resolve_window(self.config, self.clock())
 		count = 0
 		for mid in ids:
+			if should_stop():
+				break
 			meta = self.mailbox.get_message(mid, body=False)
 			if not self.eligible(meta, window) or self.excluded(meta):
 				continue
@@ -317,7 +390,8 @@ class AppService:
 			count += 1
 		return {"downloaded": count}
 
-	def manual(self, ids, action, label_ids=None, reason="", scope="message", defer_until=None, displayed_revision=None, displayed_protections=None, displayed_contexts=None, displayed_context_versions=None):
+	def manual(self, ids, action, label_ids=None, reason="", scope="message", defer_until=None, displayed_revision=None, displayed_protections=None, displayed_contexts=None, displayed_context_versions=None, should_stop=None):
+		should_stop = self._stop_callback(should_stop)
 		displayed_config = self.config
 		displayed_revision = displayed_config.revision if displayed_revision is None else displayed_revision
 		displayed_contexts = displayed_contexts if displayed_contexts is not None else displayed_context_versions
@@ -336,6 +410,8 @@ class AppService:
 		# a slow provider must not hold SQLite's writer lock for the whole group.
 		validated = []
 		for mid in dict.fromkeys(ids):
+			if should_stop():
+				break
 			message = self.store.get_message(mid)
 			original = self.store.one("SELECT id FROM actions WHERE message_id=? AND action='archive' AND undo_of IS NULL AND state IN ('applied','reconciled') ORDER BY updated_at DESC LIMIT 1", (mid,)) if action == "mistaken_archive" else None
 			# An explicitly identified mistaken app archive uses the ledger's narrow
@@ -355,6 +431,8 @@ class AppService:
 			validated.append((mid, message, original, bypass))
 		with self.learning.batch():
 			for mid, message, original, bypass in validated:
+				if should_stop():
+					break
 				prediction = self.store.one("SELECT * FROM predictions WHERE message_id=? ORDER BY created_at DESC LIMIT 1", (mid,))
 				category = self.store.one("SELECT category FROM messages WHERE id=?", (mid,))["category"]
 				feedback_action = "label_correction" if action == "reject_label" else action
@@ -378,24 +456,25 @@ class AppService:
 					aid = self.actions.plan("", message, decision, label_ids or [], reason or "Explicit review", "manual", window, bypass)
 					if aid:
 						result.append(aid)
-		if undo_ids:
-			self.undo(undo_ids)
+		if undo_ids and not should_stop():
+			self.undo(undo_ids, should_stop=should_stop)
 			marks = ",".join("?" for _ in undo_ids)
 			result.extend(row["id"] for row in self.store.query(f"SELECT id FROM actions WHERE undo_of IN ({marks})", undo_ids))
-		if result and not self.config.dry_run:
-			self.apply_actions(result)
+		if result and not self.config.dry_run and not should_stop():
+			self.apply_actions(result, should_stop=should_stop)
 		return result
 
-	def apply_actions(self, action_ids=None, job_id=None):
+	def apply_actions(self, action_ids=None, job_id=None, should_stop=None):
 		with self.execution_lease():
 			self.reload_config()
-			return self.actions.apply(action_ids, job_id)
+			return self.actions.apply(action_ids, job_id, should_stop=self._stop_callback(should_stop))
 
-	def undo(self, action_ids):
+	def undo(self, action_ids, should_stop=None):
 		with self.execution_lease():
-			return self.actions.undo(action_ids)
+			return self.actions.undo(action_ids, should_stop=self._stop_callback(should_stop))
 
-	def replan(self):
+	def replan(self, should_stop=None):
+		should_stop = self._stop_callback(should_stop)
 		self.reload_config()
 		count = 0
 		# Keep each original job's frozen target bounds. Replanning never restores
@@ -403,6 +482,8 @@ class AppService:
 		rows = self.store.query("SELECT p.* FROM predictions p JOIN messages m ON p.message_id=m.id WHERE p.valid=1 AND m.in_inbox=1 ORDER BY p.created_at DESC")
 		seen = set()
 		for row in rows:
+			if should_stop():
+				break
 			if row["message_id"] in seen:
 				continue
 			seen.add(row["message_id"])
@@ -479,16 +560,24 @@ class AppService:
 	def backup(self, path):
 		return str(self.store.backup(path))
 
-	def _close_ai(self):
-		for client in self._clients.values():
-			client.close()
-		self._clients.clear()
+	def _close_ai(self, grace_s=2):
+		with self._clients_lock:
+			clients = list(self._clients.values())
+			self._clients.clear()
+		for client in clients:
+			if isinstance(client, AIClient):
+				client.close(grace_s=grace_s)
+			else:
+				# Injected offline test adapters need only the original close method.
+				client.close()
 
 	def close(self):
 		if self._closed:
 			return
 		self._closed = True
 		try:
-			self._close_ai()
+			if self._resource_owner is self:
+				self.abort_workers()
+				self._close_ai(grace_s=0.1)
 		finally:
 			self.store.close()

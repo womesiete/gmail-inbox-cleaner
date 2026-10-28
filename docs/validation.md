@@ -7,8 +7,8 @@ Checks recorded on **2026-10-28**, using **Linux and Python 3.12** in a project 
 | Check | Result |
 | --- | --- |
 | Editable installation, `python -m pip install -e '.[dev]'` | Passed. |
-| Complete suite, `QT_QPA_PLATFORM=offscreen python scripts/ci_tests.py` | 220 tests passed in 13.94 seconds after the hosted-CI portability corrections below. |
-| Cross-component offline acceptance, `python -m pytest tests/test_acceptance.py -q` | 4 passed in 1.94 seconds. |
+| Complete suite, `QT_QPA_PLATFORM=offscreen python scripts/ci_tests.py` | 314 tests passed in 28.38 seconds after the 18-issue reliability/performance follow-up. |
+| Cross-component offline acceptance | All four acceptance workflows passed as part of the complete suite. |
 | Full lint, `python -m ruff check gmail_clean tests scripts` | Passed with Ruff 0.9.10. |
 | Compile checks, `python -m compileall -q gmail_clean tests scripts` | Passed. |
 | Dependency consistency, `python -m pip check` | Passed; no broken requirements. |
@@ -28,7 +28,15 @@ The follow-up correction adds:
 - A test wrapper that preserves failures, emits a bounded traceback annotation, and saves JUnit/output files. Failed hosted jobs upload these diagnostics. The wrapper's failure path was separately checked with an intentionally failing synthetic test.
 - Current Node24-based versions of the checkout, Python setup, and artifact actions. The original Node20 deprecation annotations were warnings, not evidence of the test failure's cause.
 
-The local 220-test result above exercises all regressions. Native Windows behavior and the complete hosted matrix must additionally be assessed from the follow-up workflow run; a local result does not establish hosted success.
+The portability correction passed its 220-test local suite and [all four hosted Windows/Linux Python 3.11/3.12 jobs](https://github.com/womesiete/gmail-inbox-cleaner/actions/runs/40699101132). A local result alone does not establish hosted success.
+
+## Reliability and performance follow-up
+
+The [18-issue implementation checklist](reliability-fixes.md) maps changes to their regressions. The current local suite contains 314 passing tests, including due-retry recovery, per-conversation context uncertainty, bounded undo pagination, pooled AI cleanup, blocked-network standalone closure, atomic demo writes, and rule/control race regressions.
+
+The required fresh 60-message headless demo completed with 57 metadata candidates and 155 completed stage items: zero failed, pending, or retry items, ending at Completed / Review. The final source/wheel build and dependency check passed. Wheel inspection confirmed complete parseable `service.py`, `storage.py`, and `table_model.py` modules, an explicit Requests requirement, and no Bleach requirement. The Windows packaging script collects Gmail static discovery data; a native frozen executable has not been built on this Linux host.
+
+Performance tests include a 1,000-action shared-conversation transport-count regression and a 50,000-row learning/template lookup regression. They measure synthetic behavior and query/request counts, not live Gmail latency or provider cost. Current hosted workflow results are reported separately from these local checks.
 
 ## Offline 3,000-message pipeline
 

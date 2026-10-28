@@ -1,12 +1,16 @@
 """Exercise the real action ledger against a deterministic message-scoped transport."""
 from copy import deepcopy
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+import json
+import threading
 from types import SimpleNamespace
 
 import pytest
 
 from gmail_clean.actions import ActionExecutor
 from gmail_clean.domain import Config, Message, context_hash, epoch_ms, resolve_window
+from gmail_clean.learning import Learning
 from gmail_clean.storage import Store
 
 ANCHOR = datetime(2026, 10, 28, 15, 30, tzinfo=UTC)
@@ -466,3 +470,194 @@ def test_receipt_deduplicates_history_replays_without_losing_normal_undo(app):
 	assert app.actions.apply([aid])["applied"] == 1
 	assert app.actions.undo([aid])["applied"] == 1
 	assert state(app, aid)["state"] == "undone"
+
+
+@pytest.mark.parametrize("pagination,expected_requests", [("cycle", 2), ("unbounded", 100)])
+def test_undo_history_inspection_has_bounded_requests_and_rejects_token_cycles(app, pagination, expected_requests):
+	aid = plan(app, seed(app), ["Label_added"])
+	assert app.actions.apply([aid])["applied"] == 1
+	requests = []
+	def incomplete_history(start, page_token=None):
+		requests.append(page_token)
+		return {"history": [], "historyId": str(app.mailbox.history_id),
+			"nextPageToken": "repeated-token" if pagination == "cycle" else str(len(requests))}
+	app.mailbox.history = incomplete_history
+	app.actions.undo([aid])
+	inverse = app.store.one("SELECT * FROM actions WHERE undo_of=?", (aid,))
+	assert inverse["state"] == "conflict"
+	assert "cannot establish safe undo ownership" in inverse["reason"]
+	assert len(requests) == expected_requests
+	assert len(app.mailbox.calls) == 1
+	assert "Label_added" in app.mailbox.messages["old"].labels
+
+
+def test_thousand_actions_use_bulk_reads_thread_deduplication_and_shared_receipt_checkpoints(app):
+	# Label additions leave thread membership unchanged, allowing a large single
+	# conversation to exercise both preflight safety phases without stale targets.
+	count = 1000
+	messages = [Message(f"bulk-{n}", "shared-thread", epoch_ms(ANCHOR - timedelta(days=100)),
+		labels={"INBOX", "UNREAD"}, headers={"From": "sender@example.invalid", "Subject": "Completed record"},
+		body="Complete.", account_id=ACCOUNT) for n in range(count)]
+	for message in messages:
+		app.mailbox.messages[message.id] = deepcopy(message)
+	context = context_hash(messages, False)
+	ids = []
+	with app.store.transaction():
+		for message in messages:
+			message.context_version = context
+			app.store.upsert_message(message)
+			ids.append(plan(app, message, ["Label_added"], action="label"))
+	requests = Counter()
+	def get_messages(message_ids, body=False):
+		requests["bulk"] += 1
+		return {mid: MemoryMailbox.get_message(app.mailbox, mid, body) for mid in message_ids}
+	def get_message(mid, body=False):
+		requests["single"] += 1
+		return MemoryMailbox.get_message(app.mailbox, mid, body)
+	def thread_metadata(thread_id):
+		requests["thread"] += 1
+		return [MemoryMailbox.get_message(app.mailbox, mid) for mid, message in app.mailbox.messages.items()
+			if message.thread_id == thread_id]
+	def profile():
+		requests["profile"] += 1
+		return MemoryMailbox.profile(app.mailbox)
+	def history(start, page_token=None):
+		requests["history"] += 1
+		return MemoryMailbox.history(app.mailbox, start, page_token)
+	app.mailbox.get_messages = get_messages
+	app.mailbox.get_message = get_message
+	app.mailbox.thread_metadata = thread_metadata
+	app.mailbox.profile = profile
+	app.mailbox.identity = lambda: app.mailbox.profile()["emailAddress"]
+	app.mailbox.history = history
+	assert app.actions.apply(ids)["applied"] == count
+	assert requests["single"] == 0
+	assert requests["bulk"] == 21  # Initial grouping, then preflight/readback per chunk.
+	assert requests["thread"] == 11
+	assert requests["profile"] == 32  # Identity + before/after checkpoints, not per item.
+	assert requests["history"] == 10
+	assert len(app.mailbox.calls) == 10
+	checkpoints = Counter(json.loads(row["payload_json"])["receipt_history_id"]
+		for row in app.store.query("SELECT payload_json FROM actions WHERE state='applied'"))
+	assert len(checkpoints) == 10 and set(checkpoints.values()) == {100}
+	assert not app.actions._prefetched_messages and not app.actions._prefetched_threads
+
+
+def test_bulk_part_error_falls_back_per_message_without_touching_other_targets(app):
+	ids = [plan(app, seed(app, mid), ["Label_added"]) for mid in ("valid", "missing")]
+	del app.mailbox.messages["missing"]
+	def get_messages(message_ids, body=False):
+		return {mid: (MemoryMailbox.get_message(app.mailbox, mid, body) if mid in app.mailbox.messages else KeyError(mid))
+			for mid in message_ids}
+	app.mailbox.get_messages = get_messages
+	assert app.actions.apply(ids)["applied"] == 1
+	assert state(app, ids[0])["state"] == "applied"
+	assert state(app, ids[1])["state"] == "conflict"
+	assert app.mailbox.calls == [(["valid"], ["Label_added"], ["INBOX"])]
+
+
+def test_cancellation_before_write_preserves_queue_and_clears_live_caches(app):
+	ids = [plan(app, seed(app, f"item-{n}"), ["Label_added"]) for n in range(2)]
+	stop = threading.Event()
+	bulk_calls = 0
+	def get_messages(message_ids, body=False):
+		nonlocal bulk_calls
+		bulk_calls += 1
+		if bulk_calls == 2:  # The final safety preflight's metadata batch.
+			stop.set()
+		return {mid: MemoryMailbox.get_message(app.mailbox, mid, body) for mid in message_ids}
+	app.mailbox.get_messages = get_messages
+	assert app.actions.apply(ids, should_stop=stop.is_set)["stopped"]
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")
+	assert all(state(app, aid)["state"] == "queued" for aid in ids)
+	assert not app.actions._prefetched_messages and not app.actions._prefetched_threads
+	stop.clear()
+	assert app.actions.apply(ids)["applied"] == 2
+
+
+def test_cancellation_after_write_records_unknown_receipt_then_resumes_without_duplicate(app):
+	app.config.execution_batch_size = 1
+	ids = [plan(app, seed(app, f"item-{n}"), ["Label_added"]) for n in range(2)]
+	stop = threading.Event()
+	original_modify = app.mailbox.modify
+	def modify_and_stop(message_ids, add, remove):
+		original_modify(message_ids, add, remove)
+		stop.set()
+	app.mailbox.modify = modify_and_stop
+	assert app.actions.apply(ids, should_stop=stop.is_set)["stopped"]
+	assert len(app.mailbox.calls) == 1
+	assert sorted(state(app, aid)["state"] for aid in ids) == ["queued", "uncertain"]
+	app.mailbox.modify = original_modify
+	stop.clear()
+	app.actions.apply(ids)
+	assert len(app.mailbox.calls) == 2
+	assert {mid for call in app.mailbox.calls for mid in call[0]} == {"item-0", "item-1"}
+	assert sorted(state(app, aid)["state"] for aid in ids) == ["applied", "reconciled"]
+
+
+def test_undo_history_cooperates_with_stop_and_can_resume_original_inverse(app):
+	aid = plan(app, seed(app), ["Label_added"])
+	assert app.actions.apply([aid])["applied"] == 1
+	stop = threading.Event()
+	requests = []
+	original_history = app.mailbox.history
+	def slow_history(start, page_token=None):
+		requests.append(page_token)
+		stop.set()
+		return {"history": [], "historyId": str(app.mailbox.history_id), "nextPageToken": "more"}
+	app.mailbox.history = slow_history
+	assert app.actions.undo([aid], should_stop=stop.is_set)["stopped"]
+	inverse = app.store.one("SELECT * FROM actions WHERE undo_of=?", (aid,))
+	assert inverse["state"] == "queued"
+	assert len(requests) == 1 and len(app.mailbox.calls) == 1
+	stop.clear()
+	app.mailbox.history = original_history
+	assert app.actions.apply([inverse["id"]])["applied"] == 1
+	assert state(app, aid)["state"] == "undone"
+
+
+def test_account_change_after_cached_preflight_is_caught_by_prewrite_checkpoint(app):
+	ids = [plan(app, seed(app, f"item-{n}")) for n in range(2)]
+	original_preflight = app.actions.preflight
+	checks = 0
+	def preflight_and_switch(action):
+		nonlocal checks
+		result = original_preflight(action)
+		checks += 1
+		if checks == 4:
+			app.mailbox.account = "different@example.invalid"
+		return result
+	app.actions.preflight = preflight_and_switch
+	with pytest.raises(ValueError, match="account"):
+		app.actions.apply(ids)
+	assert not app.mailbox.calls
+	assert not app.actions._prefetched_messages and not app.actions._prefetched_threads
+
+
+@pytest.mark.parametrize("edit_during", ["preflight", "checkpoint"])
+def test_enabled_keep_rule_edit_invalidates_already_loaded_automatic_archive(app, edit_during):
+	ids = [plan(app, seed(app, f"item-{n}")) for n in range(2)]
+	learning = Learning(app.store)
+	def edit_rule():
+		learning.save_rule({"conditions": {"sender": "sender@example.invalid", "subject_contains": "Completed"},
+			"action": "keep", "enabled": True, "source": "explicit"})
+	if edit_during == "preflight":
+		reloads = 0
+		def reload_config():
+			nonlocal reloads
+			reloads += 1
+			if reloads == 5:
+				edit_rule()
+		app.reload_config = reload_config
+	else:
+		profile = app.mailbox.profile
+		def profile_and_edit():
+			edit_rule()
+			return profile()
+		app.mailbox.profile = profile_and_edit
+	assert app.actions.apply(ids)["applied"] == 0
+	assert all(state(app, aid)["state"] == "stale" for aid in ids)
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")
+	assert all("INBOX" in item.labels for item in app.mailbox.messages.values())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -209,3 +210,131 @@ def test_rule_preview_exposes_sample_ids_and_effective_local_count(setup):
 	assert preview["count"] == 5
 	assert len(preview["sample_ids"]) == 2
 	assert preview["revision"] == 1
+
+
+def test_reviewing_one_sender_preserves_other_senders_in_the_same_category(setup):
+	store, learning = setup
+	first = add(store, mail("first"))
+	shared_list = add(store, replace(mail("shared-list", sender="other@example.invalid"), headers={"From": "other@example.invalid", "Subject": "Different issue", "List-ID": first.header("List-ID")}))
+	unrelated = add(store, replace(mail("unrelated", sender="person@elsewhere.invalid"), headers={"From": "person@elsewhere.invalid", "Subject": "Another newsletter", "List-ID": "different.example.invalid"}))
+	for item in (first, shared_list, unrelated):
+		store.execute("INSERT INTO predictions(id,message_id,valid) VALUES(?,?,1)", (item.id, item.id))
+	learning.record(first, "keep", category="newsletter")
+	assert store.one("SELECT valid FROM predictions WHERE id='first'")["valid"] == 0
+	assert store.one("SELECT valid FROM predictions WHERE id='shared-list'")["valid"] == 0
+	assert store.one("SELECT valid FROM predictions WHERE id='unrelated'")["valid"] == 1
+	plan = store.query("EXPLAIN QUERY PLAN SELECT id FROM messages WHERE id=? OR sender=? OR list_id=?", (first.id, first.sender, first.header("List-ID")))
+	assert any("idx_messages_list_id" in row["detail"] for row in plan)
+
+
+def test_examples_join_current_privacy_state_without_n_plus_one_queries(setup):
+	store, learning = setup
+	with learning.batch():
+		for index in range(120):
+			learning.record(add(store, mail(f"example-{index}")), "keep", category="newsletter")
+	target = add(store, mail("target"))
+	statements = []
+	store.conn.set_trace_callback(statements.append)
+	try:
+		assert learning.examples_for(target)
+	finally:
+		store.conn.set_trace_callback(None)
+	selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+	assert len(selects) == 2
+	assert "LEFT JOIN messages" in selects[1]
+	store.execute("UPDATE messages SET category='medical' WHERE id LIKE 'example-%'")
+	assert not learning.examples_for(target, excluded_categories=["medical"])
+	# Deleted current cache rows still retain their historical privacy markings.
+	store.execute("UPDATE examples SET payload_json=json_set(payload_json,'$.labels',json('[\"L2\"]'))")
+	store.execute("DELETE FROM messages WHERE id LIKE 'example-%'")
+	assert not learning.examples_for(target, excluded_labels=["L2"])
+
+
+@pytest.mark.parametrize("subject", ["", "1234", "Re: 123", "Fw: Fwd: 7", "AB 100"])
+def test_blank_or_number_only_subjects_do_not_infer_archive_rules(setup, subject):
+	store, learning = setup
+	for index in range(3):
+		message = replace(mail(f"unsafe-{index}", subject=subject), headers={"From": "news@example.invalid", "Subject": subject})
+		learning.record(add(store, message), "archive", category="newsletter")
+	assert not learning.pattern_suggestions()
+	assert store.one("SELECT support FROM pattern_stats WHERE action='archive'")["support"] == 3
+
+
+def test_list_identity_supports_archive_suggestion_even_without_a_subject(setup):
+	store, learning = setup
+	for index in range(3):
+		learning.record(add(store, mail(f"known-list-{index}", subject="")), "archive", category="newsletter")
+	assert len(learning.pattern_suggestions()) == 1
+	assert not learning.pattern_suggestions()[0]["enabled"]
+
+
+def test_stats_rebuild_only_touched_patterns_and_bulk_event_support_stays_independent(setup):
+	store, learning = setup
+	with learning.batch():
+		for index in range(40):
+			learning.record(add(store, mail(f"family-{index}", subject=f"Template family {chr(65 + index)}")), "keep", category="newsletter")
+	untouched = template_key(mail("family-0", subject="Template family A"))
+	store.execute("UPDATE pattern_stats SET updated_at='untouched-marker' WHERE pattern_key=?", (untouched,))
+	statements = []
+	store.conn.set_trace_callback(statements.append)
+	try:
+		with learning.batch():
+			for index in range(10):
+				learning.record(add(store, mail(f"bulk-{index}", subject=f"Independent digest {index}")), "archive", group_id="one-event", category="newsletter")
+	finally:
+		store.conn.set_trace_callback(None)
+	assert store.one("SELECT updated_at FROM pattern_stats WHERE pattern_key=?", (untouched,))["updated_at"] == "untouched-marker"
+	assert store.one("SELECT support FROM pattern_stats WHERE pattern_key=? AND action='archive'", (template_key(mail(subject="Independent digest 1")),))["support"] == 1
+	assert "DELETE FROM pattern_stats" not in [sql.strip() for sql in statements]
+	assert not any(sql.startswith("SELECT pattern_key,action,group_id") and "WHERE pattern_key IN" not in sql for sql in statements)
+	assert sum(sql.startswith("UPDATE predictions SET valid=0") for sql in statements) == 3  # IDs, sender, and list, each once.
+
+
+def test_domain_rule_sql_preview_and_invalidation_match_subdomains_without_wildcards(setup):
+	store, learning = setup
+	addresses = ["a@example.invalid", "b@sub.example.invalid", "c@evil-example.invalid", "d@example.invalid.evil"]
+	for index, sender in enumerate(addresses):
+		message = add(store, mail(str(index), sender=sender))
+		store.execute("INSERT INTO predictions(id,message_id,valid) VALUES(?,?,1)", (message.id, message.id))
+	rule = {"conditions": {"domain": " @EXAMPLE.invalid "}, "action": "keep"}
+	assert learning.rule_preview(rule)["sample_ids"] == ["0", "1"]
+	learning.save_rule(rule)
+	assert [row["valid"] for row in store.query("SELECT valid FROM predictions ORDER BY id")] == [0, 0, 1, 1]
+	assert not learning.examples_for(mail("privacy-target", sender="a@sub.example.invalid"), excluded_domains=["example.invalid"])
+	add(store, mail("wild-a", sender="a@foo_bar.invalid"))
+	add(store, mail("wild-b", sender="a@fooxbar.invalid"))
+	assert learning.rule_preview({"conditions": {"domain": "foo_bar.invalid"}, "action": "keep"})["sample_ids"] == ["wild-a"]
+
+
+def test_template_rule_preview_at_scale_never_loads_cached_bodies(setup, monkeypatch):
+	store, learning = setup
+	headers = json.dumps(mail().headers)
+	with store.transaction():
+		store.conn.executemany("INSERT INTO messages(id,sender,subject,headers_json,internal_ms,body) VALUES(?,?,?,?,?,?)", ((f"scale-{index:05}", "news@example.invalid", "Monthly issue 42", headers, index, "private-cached-body") for index in range(50000)))
+	monkeypatch.setattr(store, "get_message", lambda mid: pytest.fail("Template matching must not fetch full message rows"))
+	rule = {"conditions": {"sender": "news@example.invalid", "template": template_key(mail())}, "action": "archive"}
+	statements = []
+	store.conn.set_trace_callback(statements.append)
+	try:
+		preview = learning.rule_preview(rule, limit=3)
+		learning._invalidate_rule_matches(rule["conditions"])
+	finally:
+		store.conn.set_trace_callback(None)
+	assert preview["count"] == 50000
+	assert len(preview["sample_ids"]) == 3
+	selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+	assert len(selects) == 2
+	assert all("body" not in sql.casefold() for sql in selects)
+
+
+def test_rule_edit_stales_only_automatic_pending_matches_including_old_scope(setup):
+	store, learning = setup
+	for mid, sender in (("old", "a@old.invalid"), ("new", "b@new.invalid"), ("other", "c@other.invalid")):
+		add(store, mail(mid, sender=sender))
+		store.execute("INSERT INTO actions(id,message_id,state,approval) VALUES(?,?,'queued','automatic')", (mid, mid))
+	store.execute("INSERT INTO actions(id,message_id,state,approval) VALUES('manual','old','queued','manual')")
+	store.execute("INSERT INTO actions(id,message_id,state,approval) VALUES('applied','old','applied','automatic')")
+	rule_id = learning.save_rule({"conditions": {"sender": "a@old.invalid"}, "action": "keep"})
+	store.execute("UPDATE actions SET state='queued' WHERE id='old'")
+	learning.save_rule({"id": rule_id, "conditions": {"sender": "b@new.invalid"}, "action": "keep"})
+	assert {row["id"]: row["state"] for row in store.query("SELECT id,state FROM actions")} == {"old": "stale", "new": "stale", "other": "queued", "manual": "queued", "applied": "applied"}

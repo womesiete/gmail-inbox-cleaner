@@ -1,0 +1,295 @@
+Use the following implementation plan to address all 18 stability, reliability, performance, and hygiene issues in gmail-inbox-cleaner.
+
+Detailed Implementation Plan
+1. Automatically Resume 'waiting' Jobs When Retry Timers Expire (gmail_clean/gui.py, gmail_clean/app.py, gmail_clean/jobs.py)
+
+Preserve JobRunner Test Contract: Keep JobRunner.process_stage() in gmail_clean/jobs.py transitioning the job to state='waiting' and returning False when remaining stage items have state='retry' and future next_attempt_utc timestamps, as asserted by test_retry_wait_and_retry_exhaustion_preserve_per_item_progress in tests/test_jobs.py.
+
+Desktop GUI Auto-Resume (gmail_clean/gui.py):
+
+In MainWindow.refresh(), when not self.tasks and not self._running_job and not self._closing, query self._reader for any job in state='waiting' (preferring self.current_job_id) that has at least one due retry item (SELECT job_id FROM work_items WHERE job_id=? AND state='retry' AND (next_attempt_utc IS NULL OR next_attempt_utc <= ?) LIMIT 1 using datetime.now(UTC).isoformat()). If a waiting job has due retry items, select it as self.current_job_id and invoke self.resume_job().
+
+In MainWindow._maintenance_tick(), before bailing out on state IN ('pending','running','paused','waiting','retry'), check if any job in 'waiting' or 'retry' has due retry items (next_attempt_utc <= now); if so, resume that job instead of permanently blocking future maintenance runs.
+
+Headless CLI Retry Wait (gmail_clean/app.py):
+
+In main(), when running in --headless mode and summary["state"] == "waiting", loop while summary["state"] == "waiting": query service.store.one("SELECT MIN(next_attempt_utc) AS due FROM work_items WHERE job_id=? AND state='retry'", (job_id,)).
+
+Parse due and calculate the remaining delay relative to service.clock(). If the delay is positive and bounded (e.g., <= 300 seconds), sleep for min(delay, 300) seconds and call summary = service.run_job(job_id, progress=report) again; break if no due timestamp exists or if the job transitions out of 'waiting'.
+
+2. Bound History Pagination and Detect Page-Token Cycles in ActionExecutor.preflight_undo (gmail_clean/actions.py)
+
+Target: ActionExecutor.preflight_undo() in gmail_clean/actions.py.
+
+Changes:
+
+Replace the unbounded while True: pagination loop over self.s.mailbox.history(str(checkpoint), token) with a bounded loop (for _ in range(100):) and initialize tokens = set() before the loop, matching the safety pattern in ActionExecutor._history_interval().
+
+When token = page.get("nextPageToken") is non-empty, check if token in tokens: raise ValueError("Repeated Gmail history page token") and add token to tokens.
+
+Add an else: clause to the for _ in range(100): loop that raises ValueError("History interval exceeds bounded undo inspection") so the enclosing except Exception: block marks the undo action as 'conflict' with "Gmail history cannot establish safe undo ownership" and returns None.
+
+3. Scope context_incomplete Per Conversation Thread Instead of Globally Across the Batch (gmail_clean/ai.py)
+
+Target: build_prompt() and AIClient.assess() in gmail_clean/ai.py.
+
+Changes:
+
+In build_prompt(), include "thread_id": str(_attr(message, "thread_id", "")) on each dict appended to payload_messages.
+
+Track per-thread context drops in build_prompt(): when len(context_messages or []) > 20 truncates the context list at [:20], or when the while len(instructions) + len(serialized) + 40 > MAX_PROMPT_CHARS: loop pops items from payload["read_only_context"], record the thread_id of each dropped context message in a sorted list payload["incomplete_context_threads"] (and set a boolean payload["unscoped_context_incomplete"] = True if any dropped context item had an empty thread_id or if all context messages were dropped indiscriminately).
+
+In AIClient.assess(), determine context incompleteness per target message m based on its mid and tid = str(_attr(m, "thread_id", "")):
+
+Build a set of incomplete thread_ids from:
+
+1. transmitted.get("incomplete_context_threads", []),
+
+2. Any item in transmitted["read_only_context"] where item["body_truncated"] or item["missing_content"] is true, and
+
+3. Any context in context_messages or [] that was excluded (_excluded(context, exclusions or {})), truncated, missing content, over 4,000 chars, or dropped beyond index 20.
+
+If a problematic context message has an empty thread_id or matches tid (or if tid is empty and any context message is incomplete), mark that target message's assessment with missing_context = True and uncertainty = "high".
+
+Verification: Confirm that test_read_only_context_privacy_and_truncation_are_enforced and test_context_dropped_for_total_budget_marks_targets_incomplete in tests/test_ai.py (where target and context share thread_id="thread") continue to pass, while a new test with two targets in different threads (thread-1 with truncated context, thread-2 with no context) only marks thread-1 as missing_context=True.
+
+4. Prevent Window Close Hangs and Support Cooperative Stop Across Worker Operations (gmail_clean/gui.py, gmail_clean/service.py, gmail_clean/actions.py)
+
+Target: MainWindow.closeEvent() in gmail_clean/gui.py, AppService in gmail_clean/service.py, and ActionExecutor in gmail_clean/actions.py.
+
+Changes:
+
+Add an optional should_stop: Callable[[], bool] | None = None parameter to ActionExecutor.apply(), ActionExecutor.undo(), AppService.apply_actions(), AppService.replan(), and AppService.manual(). Check if should_stop and should_stop(): break between items/chunks so long preflight or replan loops stop promptly when requested.
+
+Track active worker AppService clones in AppService (e.g., a thread-safe self._active_workers: set[AppService] populated in AppService.worker()) and add AppService.abort_workers() which calls _close_ai(grace_s=0.1) on active workers to terminate any blocked AI child process immediately upon app exit.
+
+In MainWindow.closeEvent(), when self.tasks is non-empty on the first close request, set self._closing = True, self.stop_event.set(), call self.service.abort_workers() if available, and start a single-shot fallback timer (QTimer.singleShot(3000, self._force_close)) that forces resource cleanup and self.close() if a background network thread still has not exited after 3 seconds.
+
+5. Eliminate Main-Thread SQLite Write Contention in MainWindow._control (gmail_clean/gui.py, gmail_clean/jobs.py)
+
+Target: MainWindow._control() in gmail_clean/gui.py and JobRunner.held() in gmail_clean/jobs.py.
+
+Changes:
+
+In MainWindow.__init__(), add self._requested_control_state: str | None = None.
+
+In MainWindow.start_job() and MainWindow.resume_job(), clear self._requested_control_state = None alongside self.stop_event.clear(), and pass should_stop=lambda: self._requested_control_state or self.stop_event.is_set() to svc.run_job().
+
+In JobRunner.held(self, job: str, should_stop: Callable | None) -> bool (gmail_clean/jobs.py), if should_stop is callable, evaluate signal = should_stop(). When signal is truthy, determine target_state = signal if signal in {"paused", "stopped"} else "paused", update the job state to target_state on the worker's own SQLite connection (UPDATE jobs SET state=?,updated_at=? WHERE id=?), and return True.
+
+In MainWindow._control(self, state), set self._requested_control_state = state and self.stop_event.set(). Only call self.service.control_job(job_id, state) directly if not self.tasks (when no worker thread holds a write lock on the database).
+
+6. Fix AIClient Memory Leak from atexit.register (gmail_clean/ai.py)
+
+Target: AIClient.__init__(), AIClient._ensure_worker(), AIClient._terminate(), and AIClient.close() in gmail_clean/ai.py.
+
+Changes:
+
+Remove atexit.register(self.close) from AIClient.__init__().
+
+Register atexit.register(self.close) in AIClient._ensure_worker() only when a child process is actually started (self._process.start()), and call atexit.unregister(self.close) inside AIClient._terminate() and AIClient.close() so closed AIClient instances are not retained in Python's global atexit registry across worker runs.
+
+7. Fix DemoMailbox State Divergence and Atomic .tmp File Collisions (gmail_clean/demo.py, gmail_clean/auth.py, gmail_clean/service.py)
+
+Target: DemoMailbox in gmail_clean/demo.py, TokenStore.save() in gmail_clean/auth.py, and AppService._write_identity() in gmail_clean/service.py.
+
+Changes:
+
+Unique Temporary Files: In DemoMailbox._save(), TokenStore.save(), and AppService._write_identity(), write to a unique sibling temporary path target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"), flush and os.fsync(), and wrap os.replace(temporary, target) in a try...finally block that unlinks temporary (missing_ok=True) if an exception occurs.
+
+DemoMailbox Disk Sync: In DemoMailbox, record self._stat_sig: tuple[int, int] | None ((stat.st_mtime_ns, stat.st_size)) whenever self.path is loaded or saved. Add a helper self._sync_from_disk() that checks self.path.stat() when self.path is not None and self.path.exists(); if (st_mtime_ns, st_size) != self._stat_sig, reload messages, _history, _history_id, _labels, and rebuild _threads from self.path. Call self._sync_from_disk() at the start of profile(), labels(), list_messages(), get_message(), get_messages(), thread_metadata(), history(), and modify() so the parent AppService.mailbox and worker DemoMailbox instances always observe each other's committed mutations without redundant parsing when unchanged.
+
+8. Make decode_base64url Resilient to Whitespace and Standard Base64 Alphabet (gmail_clean/mime.py)
+
+Target: decode_base64url(data: str) -> bytes in gmail_clean/mime.py.
+
+Changes:
+
+Strip ASCII whitespace characters (data = "".join(data.split())) and translate standard base64 alphabet characters (data = data.replace("+", "-").replace("/", "_")) before computing padding (data + "=" * (-len(data) % 4)) and calling base64.b64decode(..., altchars=b"-_", validate=True).
+
+If cleaned is empty after stripping whitespace when the input was non-empty, or if len(cleaned) % 4 == 1, raise ValueError("Invalid base64url data") so invalid inputs like "!!!" in tests/test_mime.py continue to set result.missing = True.
+
+9. Batch-Prefetch Messages and Cache Thread Metadata in ActionExecutor.apply (gmail_clean/actions.py)
+
+Target: ActionExecutor.live_state(), ActionExecutor.preflight(), and ActionExecutor.apply() in gmail_clean/actions.py.
+
+Changes:
+
+Add short-lived instance caches on ActionExecutor: self._prefetched_messages: dict[str, Message] = {} and self._prefetched_threads: dict[str, list[Message]] = {}.
+
+Add a helper _prefetch(self, message_ids: list[str]) -> None that clears both caches and, if len(message_ids) > 1 and hasattr(self.s.mailbox, "get_messages"), calls self.s.mailbox.get_messages(message_ids, body=False) and stores non-Exception Message results in self._prefetched_messages.
+
+In live_state(self, action), pop action["message_id"] from self._prefetched_messages if present, otherwise call self.s.mailbox.get_message(action["message_id"], body=False). For members, look up message.thread_id in self._prefetched_threads; if absent, fetch self.s.mailbox.thread_metadata(message.thread_id) and cache it in self._prefetched_threads[message.thread_id].
+
+In apply(), call self._prefetch([a["message_id"] for a in actions if a["state"] not in {"uncertain", "executing"}]) before the initial grouping loop; call self._prefetch([a["message_id"] for a, _ in chunk]) at the start of each chunk before the second preflight() loop; and after self.s.mailbox.modify(...) succeeds, call self._prefetch([a["message_id"] for a, _ in ready]) and use self._prefetched_messages.pop(action["message_id"], None) or self.s.mailbox.get_message(action["message_id"], body=False) in the readback verification loop. Clear both caches at the end of apply().
+
+Test Compatibility Invariant: Do not alter the number or placement of self.s.reload_config() calls inside apply() and preflight(), as test_simulation_enabled_mid_chunk_holds_all_already_ready_items and test_policy_changed_mid_chunk_invalidates_every_old_ready_item in tests/test_actions.py trigger state changes on the exact 5th reload_config() invocation.
+
+10. Share a Single Post-Write historyId Checkpoint Across Each Batch Chunk in ActionExecutor (gmail_clean/actions.py)
+
+Target: ActionExecutor.apply() and ActionExecutor.receipt() in gmail_clean/actions.py.
+
+Changes:
+
+Add an optional parameter end_history_id: str | None = None to ActionExecutor.receipt(self, action, before, after, state, ownership, *, end_history_id: str | None = None). Inside receipt(), use end = str(end_history_id) if end_history_id is not None else str(self.s.mailbox.profile()["historyId"]).
+
+In ActionExecutor.apply(), immediately after self.s.mailbox.modify(...) succeeds for a ready chunk, capture after_write_history_id = str(self.s.mailbox.profile()["historyId"]) once for the chunk, and pass end_history_id=after_write_history_id to self.receipt(...) for every confirmed item in that chunk.
+
+Verification: Because self.s.mailbox.profile() is still called after self.s.mailbox.modify(), ReceiptRaceMailbox in tests/test_security.py (test_undo_cannot_claim_a_user_readded_label_hidden_before_receipt_checkpoint) will still intervene on profile() and its intervened history will be inspected once and cached in self._history_evidence_cache for the entire chunk.
+
+11. Optimize Incremental Discovery Re-Evaluation and Deduplicate thread_metadata Calls in JobRunner (gmail_clean/jobs.py)
+
+Target: JobRunner.discover(), JobRunner.process_stage(), and JobRunner.metadata() in gmail_clean/jobs.py.
+
+Changes:
+
+Batch-Scoped Thread Metadata Cache in metadata Stage: In JobRunner.process_stage(), when stage == "metadata", maintain a per-batch threads: dict[str, list[Message]] = {} dict (matching the pattern already used in the "body" and "classification" stages) and pass threads into self.metadata(job, result, window, effective, threads=threads) so self.s.mailbox.thread_metadata(message.thread_id) is only called once per unique thread_id in the batch.
+
+Incremental Local Time-Boundary Evaluation: In JobRunner.discover(), when payload.get("full") is True, continue queuing all SELECT id FROM messages WHERE in_inbox=1 into "metadata". When payload.get("full") is False (an incremental run), for each local row in SELECT id, internal_ms, category, decision, defer_until_utc, content_hash, context_version FROM messages WHERE in_inbox=1 that is not already queued in work_items for job:
+
+Check whether the message needs re-evaluation due to:
+
+1. An active or expired deferral (defer_until_utc IS NOT NULL),
+
+2. Missing decision (decision IS NULL OR decision = ''), or
+
+3. Having decision = 'review' where the message's internal_ms is now older than resolve_age_cutoff(config, window.anchor_utc, category).
+
+Queue those matching message IDs (or, if no valid predictions row exists for the current policy/config, queue them) into "metadata", avoiding redundant Gmail API metadata fetches for already-decided inbox messages whose age/deferral state has not crossed any policy boundary.
+
+Verification: Ensure test_deferral_finishes_without_gmail_event_and_survives_service_restart (tests/test_acceptance.py), test_quiet_message_crosses_examination_boundary_without_history_event (tests/test_jobs.py), test_age_policy_transition_reuses_valid_assessment_without_history (tests/test_jobs.py), and test_threshold_changes_recommend_from_cache_without_new_ai (tests/test_jobs.py) all pass (note: also trigger full local re-evaluation if self.checkpoint("boundary_policy_revision") != self.s.config.revision and save boundary_policy_revision on job completion so threshold/rule changes always re-evaluate all local inbox items!).
+
+12. Stop AI Prediction Cache Thrashing from Rule Stats and Wire PROMPT_VERSION (gmail_clean/jobs.py, gmail_clean/ai.py)
+
+Target: JobRunner.classify() and JobRunner.save_recommendation() in gmail_clean/jobs.py.
+
+Changes:
+
+Import PROMPT_VERSION from .ai in gmail_clean/jobs.py.
+
+In JobRunner.classify(), construct a stable example_digest from only the prompt-relevant fields of examples ([{"id": e.get("id"), "message_id": e.get("message_id"), "action": e.get("action"), "reason": e.get("reason"), "label_ids": e.get("label_ids"), "negative_label_ids": e.get("negative_label_ids"), "context_version": e.get("context_version")} for e in examples]).
+
+Compute version = digest({"module": config.ai_module, "model": model, "examples": example_digest, "prompt": PROMPT_VERSION, "sent_context_enabled": config.sent_context_enabled, "archived_context_enabled": config.archived_context_enabled}), removing "rules": self.s.rules() so updates to rule support/counterexamples/updated_at do not invalidate cached AI assessments.
+
+In JobRunner.save_recommendation(), set "prompt_version": PROMPT_VERSION instead of "1.0" when inserting into predictions.
+
+13. Eliminate Category-Wide Prediction Invalidation and N+1 Queries in Learning (gmail_clean/learning.py)
+
+Target: Learning._invalidate_related(), Learning.examples_for(), Learning.rule_preview(), and Learning._invalidate_rule_matches() in gmail_clean/learning.py.
+
+Changes:
+
+Narrow _invalidate_related(): In Learning._invalidate_related(self, sender: str, category: str, list_id: str, message_id: str), always include id=? (message_id) and, when non-empty, sender=? and list_id matches. Only add category=? as an OR condition if both sender and list_id are empty, preventing a single reviewed message from invalidating cached AI predictions for every message of the same category from unrelated senders.
+
+Single-Query examples_for(): In Learning.examples_for(), replace the N+1 self.store.one("SELECT labels_json,category FROM messages WHERE id=?", (row["message_id"],)) inside the candidate loop by joining messages in the initial query: SELECT e.*, m.labels_json AS current_labels_json, m.category AS current_category FROM examples e LEFT JOIN messages m ON m.id=e.message_id WHERE e.message_id!=? AND (e.sender=? OR e.pattern_key=? OR (e.list_id!='' AND e.list_id=?) OR (e.category!='' AND e.category=?)) ORDER BY e.weight DESC, e.created_at DESC LIMIT 300.
+
+Eliminate N+1 get_message() in rule_preview() and _invalidate_rule_matches():
+
+In Learning.rule_preview(), select SELECT id, internal_ms, subject, sender, headers_json FROM messages WHERE ... and, when "template" in conditions, evaluate template_key(Message(id=row["id"], thread_id="", internal_ms=row["internal_ms"], headers=json.loads(row["headers_json"] or "{}"))) directly from the row without calling self.store.get_message(row["id"]).
+
+In Learning._invalidate_rule_matches(), select SELECT id, headers_json FROM messages ... and evaluate template_key(Message(id=row["id"], thread_id="", internal_ms=0, headers=json.loads(row["headers_json"] or "{}"))) instead of calling self.store.get_message(row["id"]).
+
+14. Decouple Interactive UI Previews from Long-Running Cleanup Jobs (gmail_clean/gui.py)
+
+Target: MainWindow.__init__(), MainWindow._submit(), MainWindow._preview_rule(), and MainWindow.closeEvent() in gmail_clean/gui.py.
+
+Changes:
+
+In MainWindow.__init__(), create a second thread pool self.preview_pool = QThreadPool(self) with self.preview_pool.setMaxThreadCount(1) for read-only interactive tasks.
+
+Add an optional keyword parameter pool: QThreadPool | None = None to MainWindow._submit(self, title, operation, callback=None, *, pool=None) that defaults to self.pool.
+
+In MainWindow._preview_rule(), pass pool=self.preview_pool to self._submit(...) so rule match previews execute immediately even while a long cleanup job is running on self.pool.
+
+15. Prevent Overly Broad Suggested Archive Rules from Blank or Numeric Subjects (gmail_clean/learning.py)
+
+Target: Learning._rebuild_stats() in gmail_clean/learning.py.
+
+Changes:
+
+When iterating over pattern_stats rows to create source="suggested" rules, if stats["action"] == "archive", check that sample["list_id"].strip() is non-empty OR that sample["subject"] (after stripping leading Re:/Fw:/Fwd: prefixes and digits) contains at least 4 alphabetic characters (sum(ch.isalpha() for ch in cleaned_subject) >= 4). If neither condition holds, skip auto-generating the "archive" suggestion for that pattern.
+
+16. Unify Subdomain-Aware Domain Matching Across Domain, AI, and Learning (gmail_clean/domain.py, gmail_clean/ai.py, gmail_clean/learning.py)
+
+Target: gmail_clean/domain.py, gmail_clean/ai.py, and gmail_clean/learning.py.
+
+Changes:
+
+In gmail_clean/domain.py, define a helper function domain_matches(sender_or_domain: str, target_domain: str) -> bool:
+
+Extract the domain portion of sender_or_domain (sender_or_domain.rpartition("@")[2].casefold().strip() if "@" in sender_or_domain else sender_or_domain.casefold().strip().lstrip("@")).
+
+Normalize target = str(target_domain).casefold().strip().lstrip("@").
+
+Return bool(domain and target and (domain == target or domain.endswith("." + target))).
+
+Use domain_matches() in protections(), content_excluded(), and rule_matches() (for key == "domain") in gmail_clean/domain.py.
+
+Use domain_matches() in _excluded() in gmail_clean/ai.py and _excluded() in gmail_clean/learning.py.
+
+In Learning.rule_preview() and Learning._invalidate_rule_matches() (gmail_clean/learning.py), update the SQL clause for key == "domain" to (substr(sender, instr(sender, '@') + 1) = ? OR sender LIKE ?) with parameters [dom, f"%@{'.' + dom}"] (or substr(sender, instr(sender, '@') + 1) LIKE ? with f"%.{dom}") so both exact domains and subdomains match consistently.
+
+17. Remove Deprecated bleach Dependency and Use Single-Pass BeautifulSoup Sanitization (pyproject.toml, gmail_clean/gui.py)
+
+Target: pyproject.toml and sanitize_preview_html() in gmail_clean/gui.py.
+
+Changes:
+
+Remove "bleach>=6.1,<7", from dependencies in pyproject.toml.
+
+Remove import bleach from gmail_clean/gui.py and import Comment from bs4 and urlsplit from urllib.parse.
+
+Rewrite sanitize_preview_html(value: str) -> str in gmail_clean/gui.py using BeautifulSoup(value, "html.parser"):
+
+Decompose all tags in ("script", "style", "iframe", "object", "embed", "form", "input", "img", "svg", "math", "link", "meta", "head", "noscript").
+
+Extract/remove all Comment nodes (for comment in soup.find_all(string=lambda s: isinstance(s, Comment)): comment.extract()).
+
+Define allowed_tags = {"p", "br", "b", "i", "strong", "em", "ul", "ol", "li", "blockquote", "pre", "code", "table", "thead", "tbody", "tr", "td", "th", "a", "hr", "h1", "h2", "h3"}.
+
+Iterate over list(soup.find_all(True)): if tag.name not in allowed_tags, call tag.unwrap(); otherwise, if tag.name == "a", keep only "href" and "title" attributes and delete "href" if urlsplit(str(tag["href"]).strip()).scheme.lower() not in {"https", "http", "mailto"}; for all other allowed tags, clear tag.attrs = {}.
+
+Return str(soup).
+
+Verification: Ensure test_preview_strips_scripts_trackers_and_blocks_resources in tests/test_gui.py passes.
+
+18. Fix Packaging, Dependency Declarations, Cross-Platform Data Paths, and Complete Source Modules (pyproject.toml, scripts/package_windows.ps1, gmail_clean/runtime.py, gmail_clean/service.py, gmail_clean/storage.py, gmail_clean/table_model.py)
+
+Dependencies (pyproject.toml):
+
+Add "requests>=2.31,<3", to dependencies in pyproject.toml because AuthManager.disconnect() in gmail_clean/auth.py directly imports requests to revoke OAuth tokens.
+
+PyInstaller Packaging (scripts/package_windows.ps1):
+
+Add '--collect-data', 'googleapiclient' to $BuildArgs in scripts/package_windows.ps1 so static discovery documents are bundled for build("gmail", "v1", ..., cache_discovery=False).
+
+Cross-Platform Data Directory (gmail_clean/runtime.py):
+
+In data_directory(demo: bool = False) -> Path (gmail_clean/runtime.py), resolve the base directory as:
+
+Path(os.environ["LOCALAPPDATA"]) if "LOCALAPPDATA" is in os.environ,
+
+Path.home() / "Library" / "Application Support" if sys.platform == "darwin",
+
+Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) otherwise.
+
+Append "GmailInboxCleaner" / ("demo" if demo else "live").
+
+Verify/Complete gmail_clean/service.py, gmail_clean/storage.py, and gmail_clean/table_model.py:
+
+Ensure gmail_clean/service.py is complete after def eligible(self, message, window): (implementing eligible, excluded, override, rules, examples, context_messages, refresh_labels, connect, disconnect, download_bodies, manual, replan, apply_actions, undo, backup, retention, error, retry_errors, _close_ai, and close to satisfy tests/test_service.py, tests/test_acceptance.py, tests/test_security.py, and tests/test_app.py).
+
+Ensure gmail_clean/storage.py defines SCHEMA_VERSION, AccountMismatchError, LeaseBusyError, Store, canonical_json, utc_now, _MIGRATIONS, _pid_alive, _windows_pid_alive, and _windows_process_api to satisfy tests/test_storage.py.
+
+Ensure gmail_clean/table_model.py defines Column and SqlTableModel (rowCount, columnCount, data, headerData, record, set_filter, sort, rows_for_ids, refresh, close, last_error, max_pages, _pages) to satisfy tests/test_gui.py and gmail_clean/app.py.
+
+Post-Implementation Verification Steps
+After enacting all 18 changes, run the following verification suite:
+
+1. QT_QPA_PLATFORM=offscreen python -m pytest — verify all tests in tests/ pass with zero failures.
+
+2. python -m ruff check gmail_clean tests scripts — verify zero lint errors under the configured E4, E7, E9, F rules and 120 char line-length limit.
+
+3. python -m compileall -q gmail_clean scripts — verify clean bytecode compilation across all modules.
+
+4. python -m gmail_clean --demo --headless --count 60 — verify the end-to-end offline CLI pipeline completes cleanly.

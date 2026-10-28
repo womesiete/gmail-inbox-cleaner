@@ -36,6 +36,7 @@ class RecordingMailbox:
 		self.queries = []
 		self.events = []
 		self.history_requests = []
+		self.thread_fetches = []
 		self.expired_history = set()
 		self.expire_page_once = False
 		self.page_expired = False
@@ -84,6 +85,7 @@ class RecordingMailbox:
 		return result
 
 	def thread_metadata(self, thread_id):
+		self.thread_fetches.append(thread_id)
 		return [replace(message, body="", missing_content=True) for message in self.messages.values() if message.thread_id == thread_id]
 
 	def get_message(self, mid, body=False):
@@ -486,3 +488,155 @@ def test_public_app_service_runs_real_ledger_and_replans_without_an_ai_call(tmp_
 		assert store.one("SELECT action,state FROM actions") == {"action": "archive", "state": "proposed"}
 	finally:
 		app.close()
+
+
+def test_control_signal_preserves_requested_stop_state_on_worker_connection(service):
+	runner = JobRunner(service)
+	job = runner.new()
+	assert runner.run(job, should_stop=lambda: "stopped")["state"] == "stopped"
+	assert service.store.one("SELECT state FROM jobs WHERE id=?", (job,))["state"] == "stopped"
+
+
+def test_quiet_incremental_cycle_does_not_refetch_decided_inbox(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"old": mail()}
+	_, _, first = run_new(service)
+	assert first["state"] == "completed"
+	assert len(service.ai.calls) == 1
+	service.mailbox.metadata_fetches.clear()
+	service.mailbox.thread_fetches.clear()
+	service.now += timedelta(hours=1)
+	_, job, second = run_new(service)
+	assert second["state"] == "completed"
+	assert not service.mailbox.metadata_fetches
+	assert not service.mailbox.thread_fetches
+	assert not service.store.query("SELECT * FROM work_items WHERE job_id=?", (job,))
+	assert len(service.ai.calls) == 1
+
+
+def test_metadata_stage_fetches_shared_thread_once_per_retrieval_batch(service):
+	service.mailbox.messages = {mid: mail(mid, thread="conversation") for mid in ("first", "second")}
+	runner = JobRunner(service)
+	job = runner.new()
+	window = resolve_window(service.config, service.now)
+	assert runner.discover(job, window, service.config, None, None)
+	assert runner.process_stage(job, "metadata", window, service.config, None, None)
+	assert service.mailbox.thread_fetches == ["conversation"]
+
+
+def test_incremental_age_crossing_revisits_only_newly_old_review(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"aging": mail("aging", age_days=40), "decided": mail("decided", age_days=100)}
+	_, _, first = run_new(service)
+	assert first["state"] == "completed"
+	initial_calls = len(service.ai.calls)
+	service.mailbox.metadata_fetches.clear()
+	service.now += timedelta(days=40)
+	_, _, second = run_new(service)
+	assert second["state"] == "completed"
+	assert set(service.mailbox.metadata_fetches) == {"aging"}
+	assert len(service.ai.calls) == initial_calls
+	assert service.store.one("SELECT decision FROM messages WHERE id='aging'")["decision"] == "archive"
+	service.mailbox.metadata_fetches.clear()
+	service.now += timedelta(hours=1)
+	_, _, third = run_new(service)
+	assert third["state"] == "completed"
+	assert not service.mailbox.metadata_fetches
+
+
+def test_deadline_requeues_when_due_without_history_but_not_before(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.config.age_enabled = False
+	service.mailbox.messages = {"old": mail()}
+	_, _, _ = run_new(service)
+	due = service.now + timedelta(hours=2)
+	service.store.execute("UPDATE messages SET deadline_utc=? WHERE id='old'", (stamp(due),))
+	service.mailbox.metadata_fetches.clear()
+	service.now += timedelta(hours=1)
+	_, _, before = run_new(service)
+	assert before["state"] == "completed"
+	assert not service.mailbox.metadata_fetches
+	service.now += timedelta(hours=2)
+	_, _, after = run_new(service)
+	assert after["state"] == "completed"
+	assert set(service.mailbox.metadata_fetches) == {"old"}
+	assert len(service.ai.calls) == 1
+
+
+def test_invalidated_prediction_requeues_only_affected_local_message(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {mid: mail(mid) for mid in ("affected", "unrelated")}
+	_, _, _ = run_new(service)
+	service.store.execute("UPDATE predictions SET valid=0 WHERE message_id='affected'")
+	service.mailbox.metadata_fetches.clear()
+	service.now += timedelta(hours=1)
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert set(service.mailbox.metadata_fetches) == {"affected"}
+	assert len(service.ai.calls) == 3
+
+
+def test_rule_support_changes_do_not_requeue_or_invalidate_ai_cache(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"old": mail()}
+	service._rules = [{"id": "unrelated-rule", "enabled": True, "conditions": {"sender": "other@example.invalid"}, "action": "keep", "support": 3, "counterexamples": 0, "updated_at": "old", "revision": 1}]
+	_, _, _ = run_new(service)
+	service._rules[0].update(support=5, counterexamples=1, updated_at="new")
+	service.now += timedelta(hours=1)
+	service.mailbox.metadata_fetches.clear()
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert not service.mailbox.metadata_fetches
+	assert len(service.ai.calls) == 1
+	# Even a deliberate new full reconciliation reuses the same assessment.
+	service.store.set_checkpoint("full_reconciliation", None)
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert len(service.ai.calls) == 1
+
+
+def test_semantic_rule_change_reconsiders_local_items_without_new_ai(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"old": mail()}
+	_, _, _ = run_new(service)
+	service._rules = [{"id": "new-rule", "enabled": True, "conditions": {"sender": "records@example.invalid"}, "action": "keep", "source": "explicit", "revision": 1}]
+	service.now += timedelta(hours=1)
+	service.mailbox.metadata_fetches.clear()
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert service.mailbox.metadata_fetches == ["old"]
+	assert service.store.one("SELECT decision FROM messages WHERE id='old'")["decision"] == "keep"
+	assert len(service.ai.calls) == 1
+
+
+def test_actual_prompt_version_invalidates_cached_assessment(service, monkeypatch):
+	import gmail_clean.jobs as jobs
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"old": mail()}
+	_, _, _ = run_new(service)
+	service.now += timedelta(hours=1)
+	monkeypatch.setattr(jobs, "PROMPT_VERSION", "test-new-meaningful-prompt")
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert len(service.ai.calls) == 2
+	assert service.store.one("SELECT prompt_version FROM predictions ORDER BY created_at DESC LIMIT 1")["prompt_version"] == "test-new-meaningful-prompt"
+
+
+def test_example_statistics_reuse_assessment_but_changed_prompt_text_reassesses(service):
+	service.config.reconciliation_interval_hours = 365 * 24
+	service.mailbox.messages = {"old": mail()}
+	service.store.upsert_message(mail("reviewed", age_days=70, labels={"SENT"}))
+	service._examples = [{"id": "e1", "message_id": "reviewed", "action": "archive", "body": "Completed record", "subject": "Receipt", "weight": 1, "created_at": "old", "updated_at": "old"}]
+	_, _, first = run_new(service)
+	assert first["state"] == "completed"
+	assert len(service.ai.calls) == 1
+	service._examples[0].update(weight=3, created_at="new", updated_at="new")
+	service.store.set_checkpoint("full_reconciliation", None)
+	_, _, same_prompt = run_new(service)
+	assert same_prompt["state"] == "completed"
+	assert len(service.ai.calls) == 1
+	service._examples[0]["body"] = "Please reply"
+	service.store.set_checkpoint("full_reconciliation", None)
+	_, _, changed_prompt = run_new(service)
+	assert changed_prompt["state"] == "completed"
+	assert len(service.ai.calls) == 2

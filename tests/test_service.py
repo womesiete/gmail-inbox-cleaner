@@ -84,7 +84,9 @@ def test_worker_connections_are_fresh_and_owned_by_the_calling_thread(tmp_path):
 		def operation():
 			with service.worker() as worker:
 				assert worker.store is not main_store
-				assert worker.mailbox is not service._mailbox
+				# The demo adapter's synchronized API is shared; SQLite remains
+				# strictly worker-owned and live Gmail clients are never shared.
+				assert worker.mailbox is service._mailbox
 				worker.store.set_checkpoint("worker-ran", True)
 				return worker.account_id
 		with ThreadPoolExecutor(max_workers=1) as pool:

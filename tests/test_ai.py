@@ -1,6 +1,10 @@
 """Contract, isolation, privacy, and hostile structured-output regression tests."""
 import json
 import os
+import gc
+import threading
+import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -290,3 +294,112 @@ def test_context_dropped_for_total_budget_marks_targets_incomplete(monkeypatch):
 		monkeypatch.setattr(client, "call", lambda prompt: AIResponse(response(*(item(m.id) for m in targets))))
 		batch = client.assess(targets, [], context_messages=contexts)
 	assert all(a.missing_context and a.uncertainty == "high" for a in batch.assessments.values())
+
+
+@pytest.mark.parametrize("problem", ["truncated", "missing", "overlong", "excluded", "overflow", "budget"])
+def test_incomplete_context_affects_only_its_conversation(monkeypatch, problem):
+	from gmail_clean import ai
+	targets = [message("a", thread_id="thread-1"), message("b", thread_id="thread-2")]
+	context = message("context", thread_id="thread-1")
+	exclusions = {}
+	if problem == "truncated":
+		context.truncated = True
+	elif problem == "missing":
+		context.missing_content = True
+	elif problem == "overlong":
+		context.body = "x" * 4001
+	elif problem == "excluded":
+		context.headers = {"From": "private@example.invalid"}
+		exclusions = {"senders": ["private@example.invalid"]}
+	contexts = [context]
+	if problem == "overflow":
+		contexts = [message(f"context-{n}", thread_id="thread-1") for n in range(21)]
+	elif problem == "budget":
+		monkeypatch.setattr(ai, "MAX_PROMPT_CHARS", 8000)
+		contexts = [message(f"context-{n}", thread_id="thread-1", body="x" * 3900) for n in range(3)]
+	with AIClient("gmail_clean.demo_ai") as client:
+		monkeypatch.setattr(client, "call", lambda prompt: AIResponse(response(item("a"), item("b"))))
+		batch = client.assess(targets, [], context_messages=contexts, exclusions=exclusions)
+	assert batch.assessments["a"].missing_context
+	assert batch.assessments["a"].uncertainty == "high"
+	assert not batch.assessments["b"].missing_context
+	assert batch.assessments["b"].uncertainty == "low"
+
+
+def test_unscoped_context_incompleteness_is_conservative_for_all_targets(monkeypatch):
+	targets = [message("a", thread_id="one"), message("b", thread_id="two")]
+	context = message("context", thread_id="", truncated=True)
+	with AIClient("gmail_clean.demo_ai") as client:
+		monkeypatch.setattr(client, "call", lambda prompt: AIResponse(response(item("a"), item("b"))))
+		batch = client.assess(targets, [], context_messages=[context])
+	assert all(assessment.missing_context for assessment in batch.assessments.values())
+
+
+def test_target_without_thread_id_cannot_disclaim_incomplete_context(monkeypatch):
+	targets = [message("a", thread_id=""), message("b", thread_id="two")]
+	context = message("context", thread_id="one", truncated=True)
+	with AIClient("gmail_clean.demo_ai") as client:
+		monkeypatch.setattr(client, "call", lambda prompt: AIResponse(response(item("a"), item("b"))))
+		batch = client.assess(targets, [], context_messages=[context])
+	assert batch.assessments["a"].missing_context
+	assert not batch.assessments["b"].missing_context
+
+
+def test_domain_privacy_exclusion_includes_subdomains_but_not_suffix_lookalikes():
+	targets = [message("private", headers={"From": "person@sub.Example.org"}),
+		message("public", headers={"From": "person@notexample.org"})]
+	prompt, excluded = build_prompt(targets, [],
+		examples=[{"sender": "person@nested.example.org", "body": "PRIVATE EXAMPLE"}],
+		context_messages=[message("context", headers={"From": "person@nested.example.org"}, body="PRIVATE CONTEXT")],
+		exclusions={"domains": [" @EXAMPLE.ORG "]})
+	assert excluded == ["private"]
+	assert "PRIVATE EXAMPLE" not in prompt
+	assert "PRIVATE CONTEXT" not in prompt
+	assert "notexample.org" in prompt
+
+
+def test_unused_and_closed_clients_are_not_retained_by_exit_hooks(tmp_path):
+	path = module_file(tmp_path, "def call_api(prompt):\n\treturn prompt\n")
+	unused = AIClient(path)
+	unused_reference = weakref.ref(unused)
+	del unused
+	gc.collect()
+	assert unused_reference() is None
+	client = AIClient(path)
+	assert client.call("started").text == "started"
+	client.close()
+	closed_reference = weakref.ref(client)
+	del client
+	gc.collect()
+	assert closed_reference() is None
+
+
+@pytest.mark.parametrize("operation", ["abort", "close"])
+def test_shutdown_interrupts_a_delayed_call_without_waiting_for_serial_lock(tmp_path, operation):
+	path = module_file(tmp_path, "import time\nfrom pathlib import Path\ndef call_api(prompt):\n\tif prompt == 'ready':\n\t\treturn prompt\n\tPath(__file__).with_suffix('.started').write_text('started')\n\ttime.sleep(30)\n\treturn 'late'\n")
+	client = AIClient(path)
+	errors = []
+	def call_slow_provider():
+		try:
+			client.call("slow")
+		except AIError as error:
+			errors.append(error)
+	try:
+		assert client.call("ready").text == "ready"
+		worker = threading.Thread(target=call_slow_provider, daemon=True)
+		worker.start()
+		deadline = time.monotonic() + 10
+		while not (tmp_path / "private_test_module.started").exists() and time.monotonic() < deadline:
+			time.sleep(0.01)
+		assert (tmp_path / "private_test_module.started").exists()
+		started = time.monotonic()
+		getattr(client, operation)(grace_s=0.1)
+		assert time.monotonic() - started < 1
+		worker.join(timeout=2)
+		assert not worker.is_alive()
+		assert len(errors) == 1 and errors[0].category == "InterruptedRequest"
+		assert errors[0].request_id and "billed" in str(errors[0])
+		assert client.request_state == "abandoned"
+		assert client.worker_pid is None
+	finally:
+		client.close(grace_s=0.1)

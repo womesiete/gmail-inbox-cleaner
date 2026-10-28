@@ -381,6 +381,14 @@ def normalize_sender(value: str) -> str:
 	return parseaddr(value)[1].strip().casefold()
 
 
+def domain_matches(sender_or_domain: str, target_domain: str) -> bool:
+	"""Match a domain and its subdomains without accepting suffix lookalikes."""
+	value = str(sender_or_domain).casefold().strip()
+	domain = value.rpartition("@")[2] if "@" in value else value.lstrip("@")
+	target = str(target_domain).casefold().strip().lstrip("@")
+	return bool(domain and target and (domain == target or domain.endswith("." + target)))
+
+
 def normalize_text(value: str) -> str:
 	return " ".join(value.replace("\x00", "").split())
 
@@ -416,14 +424,13 @@ def template_key(message: Message) -> str:
 def protections(message: Message, config: Config) -> set[str]:
 	result: set[str] = set()
 	sender = message.sender
-	domain = sender.rpartition("@")[2]
 	if config.protect_starred and "STARRED" in message.labels:
 		result.add("starred")
 	if sender in {value.casefold().strip() for value in config.protected_senders}:
 		result.add(f"sender:{sender}")
 	for value in config.protected_domains:
 		protected = value.casefold().strip().lstrip("@")
-		if protected and (domain == protected or domain.endswith("." + protected)):
+		if domain_matches(sender, protected):
 			result.add(f"domain:{protected}")
 	for label_id in message.labels:
 		meaning = config.label_meanings.get(label_id, "neutral")
@@ -434,8 +441,7 @@ def protections(message: Message, config: Config) -> set[str]:
 
 def content_excluded(message: Message, config: Config) -> bool:
 	sender = message.sender
-	domain = sender.rpartition("@")[2]
-	return sender in {value.casefold().strip() for value in config.excluded_senders} or any(domain == value.casefold().strip().lstrip("@") or domain.endswith("." + value.casefold().strip().lstrip("@")) for value in config.excluded_domains if value.strip()) or bool(message.labels.intersection(config.excluded_label_ids))
+	return sender in {value.casefold().strip() for value in config.excluded_senders} or any(domain_matches(sender, value) for value in config.excluded_domains) or bool(message.labels.intersection(config.excluded_label_ids))
 
 
 def eligible(message: Message, window: Window) -> bool:
@@ -451,7 +457,7 @@ def rule_matches(rule: dict[str, Any], message: Message, assessment: Assessment 
 	for key, value in conditions.items():
 		if key == "sender" and message.sender != str(value).casefold().strip():
 			return False
-		if key == "domain" and message.sender.rpartition("@")[2] != str(value).casefold().strip().lstrip("@"):
+		if key == "domain" and not domain_matches(message.sender, value):
 			return False
 		if key == "list_id" and message.header("List-ID").strip().casefold() != str(value).strip().casefold():
 			return False

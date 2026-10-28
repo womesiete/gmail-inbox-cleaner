@@ -1,6 +1,8 @@
 import base64
 
-from gmail_clean.mime import html_to_text, parse_body, sanitize_html
+import pytest
+
+from gmail_clean.mime import decode_base64url, html_to_text, parse_body, sanitize_html
 
 
 def part(mime, value, charset="utf-8", **extra):
@@ -70,3 +72,22 @@ def test_oversized_and_unknown_charset_never_silently_become_complete():
 		lambda value: calls.append(value))
 	assert parsed.truncated and parsed.missing
 	assert calls == []
+
+
+def test_folded_standard_base64_text_and_urlsafe_alphabet_decode_identically():
+	# UTF-8 bytes for this text exercise the standard '+' alphabet as well as
+	# folded whitespace. Binary bytes below additionally exercise '/'.
+	value = "A useful receipt: \u0fff"
+	encoded = base64.b64encode(value.encode()).decode().rstrip("=")
+	folded = " \r\n\t" + " \r\n".join(encoded[i:i + 5] for i in range(0, len(encoded), 5)) + "\n"
+	parsed = parse_body({"mimeType": "text/plain", "body": {"data": folded}})
+	assert parsed.text == value and not parsed.missing
+	assert decode_base64url(" +/8=\r\n") == decode_base64url("-_8=") == b"\xfb\xff"
+
+
+@pytest.mark.parametrize("value", ["!!!", " \r\n\t", "a", "\u00a0SGVsbG8", "SGVsbG8?", "=SGVsbG8"])
+def test_base64_normalization_still_rejects_malformed_transfer_data(value):
+	with pytest.raises((ValueError, TypeError)):
+		decode_base64url(value)
+	parsed = parse_body({"mimeType": "text/plain", "body": {"data": value}})
+	assert parsed.missing and not parsed.text

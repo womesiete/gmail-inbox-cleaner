@@ -8,7 +8,7 @@ import pytest
 from gmail_clean.domain import (
 	Assessment, Config, Message, PolicyConflict, Window, content_excluded,
 	content_hash, context_hash, eligible, epoch_ms, precondition_hash,
-	protections, recommend, resolve_age_cutoff, resolve_window,
+	domain_matches, protections, recommend, resolve_age_cutoff, resolve_window, rule_matches,
 	subtract_calendar_months,
 )
 
@@ -208,3 +208,26 @@ def test_roundtrip_models_preserves_infinite_bound_and_label_identity():
 	assert Assessment.from_dict(assessment().to_dict()) == assessment()
 	assert content_excluded(item, Config(excluded_domains=["example.org"]))
 	assert eligible(item, resolve_window(cfg, ANCHOR))
+
+
+@pytest.mark.parametrize("sender,target,expected", [
+	("person@sub.Example.ORG", " @EXAMPLE.org ", True),
+	("sub.example.org", "example.org", True),
+	("person@example.org", "example.org", True),
+	("person@evil-example.org", "example.org", False),
+	("person@example.org.evil.invalid", "example.org", False),
+	("person@subexample.org", "example.org", False),
+	("", "example.org", False), ("person@example.org", " @ ", False),
+])
+def test_domain_matcher_has_one_exact_and_subdomain_meaning(sender, target, expected):
+	assert domain_matches(sender, target) is expected
+
+
+def test_domain_rules_protections_and_exclusions_share_subdomain_scope():
+	cfg = Config(protected_domains=["example.org"], excluded_domains=["example.org"])
+	rule = {"enabled": True, "conditions": {"domain": " @Example.Org "}, "action": "keep"}
+	for sender, expected in (("news@sub.example.org", True), ("news@example.org", True), ("news@evil-example.org", False)):
+		item = message(headers={"From": sender})
+		assert bool(protections(item, cfg)) is expected
+		assert content_excluded(item, cfg) is expected
+		assert rule_matches(rule, item) is expected

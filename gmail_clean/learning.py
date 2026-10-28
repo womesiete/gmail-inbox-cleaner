@@ -8,13 +8,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .domain import CATEGORIES, Message, template_key
+from .domain import CATEGORIES, Message, domain_matches, template_key
 from .storage import Store, canonical_json, utc_now
 
 _ALLOWED_ACTIONS = {"archive", "keep", "defer", "label", "label_correction", "category_correction", "mistaken_archive", "unnecessary_keep", "review"}
@@ -30,6 +31,8 @@ class Learning:
 		self.enabled = enabled
 		self._batch_depth = 0
 		self._pending_rebuild = False
+		self._pending_patterns: set[str] = set()
+		self._rebuild_all = False
 		self._pending_invalidation: set[tuple[str, str, str, str]] = set()
 
 	@contextlib.contextmanager
@@ -43,16 +46,20 @@ class Learning:
 			except BaseException:
 				if outer:
 					self._pending_rebuild = False
+					self._pending_patterns.clear()
+					self._rebuild_all = False
 					self._pending_invalidation.clear()
 				raise
 			finally:
 				self._batch_depth -= 1
 			if outer:
 				if self._pending_rebuild:
+					patterns = None if self._rebuild_all else set(self._pending_patterns)
 					self._pending_rebuild = False
-					self._rebuild_stats()
-				for related in self._pending_invalidation:
-					self._invalidate_related(*related)
+					self._pending_patterns.clear()
+					self._rebuild_all = False
+					self._rebuild_stats(patterns)
+				self._invalidate_related_batch(self._pending_invalidation)
 				self._pending_invalidation.clear()
 
 	def record(
@@ -133,7 +140,7 @@ class Learning:
 				if supersedes:
 					self.store.execute("DELETE FROM examples WHERE feedback_id=?", (supersedes,))
 				self._add_example(feedback_id, message, action, reason, category, positive_labels, event_id, now, payload)
-				self._rebuild_stats()
+				self._rebuild_stats({payload["pattern_key"]})
 				self._invalidate_related(message.sender, category, payload["list_id"], message.id)
 		return feedback_id
 
@@ -178,18 +185,19 @@ class Learning:
 			return []
 		list_id = message.header("List-ID").strip().casefold()
 		pattern = template_key(message)
-		rows = self.store.query("""SELECT * FROM examples WHERE message_id!=? AND
-			(sender=? OR pattern_key=? OR (list_id!='' AND list_id=?) OR (category!='' AND category=?))
-			ORDER BY weight DESC,created_at DESC LIMIT 300""", (message.id, message.sender, pattern, list_id, category))
+		rows = self.store.query("""SELECT e.*,m.labels_json AS current_labels_json,m.category AS current_category
+			FROM examples e LEFT JOIN messages m ON m.id=e.message_id WHERE e.message_id!=? AND
+			(e.sender=? OR e.pattern_key=? OR (e.list_id!='' AND e.list_id=?) OR (e.category!='' AND e.category=?))
+			ORDER BY e.weight DESC,e.created_at DESC LIMIT 300""", (message.id, message.sender, pattern, list_id, category))
 		candidates = []
 		for row in rows:
 			payload = json.loads(row["payload_json"])
-			current_message = self.store.one("SELECT labels_json,category FROM messages WHERE id=?", (row["message_id"],))
 			sharing_labels = set(payload.get("labels", []))
 			sharing_categories = {row["category"]}
-			if current_message:
-				sharing_labels.update(json.loads(current_message["labels_json"]))
-				sharing_categories.add(current_message["category"])
+			if row["current_labels_json"] is not None:
+				sharing_labels.update(json.loads(row["current_labels_json"]))
+			if row["current_category"] is not None:
+				sharing_categories.add(row["current_category"])
 			if sharing_categories & excluded_category_set:
 				continue
 			if _excluded(row["sender"], row["category"], sharing_labels, excluded_sender_set, excluded_domain_set, excluded_category_set, excluded_label_set):
@@ -221,35 +229,70 @@ class Learning:
 	def examples_version(self, examples: list[dict[str, Any]]) -> str:
 		return hashlib.sha256(canonical_json(examples).encode()).hexdigest()
 
-	def _rebuild_stats(self) -> None:
+	def _rebuild_stats(self, patterns: Iterable[str] | None = None) -> None:
+		"""Rebuild affected template families; explicit full reset may rebuild all.
+
+		Independent review-event IDs remain the support unit. Ordinary feedback
+		must not read/rewrite every unrelated pattern or change its timestamps.
+		"""
+		selected = set(patterns) if patterns is not None else None
 		if self._batch_depth:
 			self._pending_rebuild = True
+			if selected is None:
+				self._rebuild_all = True
+			else:
+				self._pending_patterns.update(selected)
 			return
-		self.store.execute("DELETE FROM pattern_stats")
-		rows = self.store.query("SELECT pattern_key,action,group_id FROM examples")
+		if selected is not None and not selected:
+			return
+		rows = []
+		rules = []
+		if selected is None:
+			self.store.execute("DELETE FROM pattern_stats")
+			rows = self.store.query("SELECT pattern_key,action,group_id,sender,list_id,subject,created_at,id FROM examples ORDER BY created_at DESC,id DESC")
+			rules = self.store.query("SELECT * FROM rules WHERE json_extract(payload_json,'$.pattern_key') IS NOT NULL")
+		else:
+			# Keep bulk resets within SQLite's parameter limit without N+1 queries.
+			ordered = sorted(selected)
+			for offset in range(0, len(ordered), 500):
+				chunk = ordered[offset:offset + 500]
+				marks = ",".join("?" for _ in chunk)
+				self.store.execute(f"DELETE FROM pattern_stats WHERE pattern_key IN ({marks})", chunk)
+				rows.extend(self.store.query(f"SELECT pattern_key,action,group_id,sender,list_id,subject,created_at,id FROM examples WHERE pattern_key IN ({marks}) ORDER BY created_at DESC,id DESC", chunk))
+				rules.extend(self.store.query(f"SELECT * FROM rules WHERE json_extract(payload_json,'$.pattern_key') IN ({marks})", chunk))
 		groups: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+		samples = {}
 		for row in rows:
 			action = {"mistaken_archive": "keep", "unnecessary_keep": "archive"}.get(row["action"], row["action"])
 			groups[row["pattern_key"]][action].add(row["group_id"])
+			samples.setdefault(row["pattern_key"], row)
+		statistics = {}
 		for pattern, actions in groups.items():
 			for action, events in actions.items():
 				conflicts = set().union(*(items for other, items in actions.items() if other in {"archive", "keep"} and action in {"archive", "keep"} and other != action))
 				self.store.execute("INSERT INTO pattern_stats(pattern_key,action,support,counterexamples,updated_at) VALUES(?,?,?,?,?)", (pattern, action, len(events), len(conflicts), utc_now()))
+				statistics[(pattern, action)] = {"pattern_key": pattern, "action": action, "support": len(events), "counterexamples": len(conflicts)}
 		# Suggestions are derived and removed when source evidence is forgotten.
-		for rule in self.store.query("SELECT * FROM rules WHERE source='suggested'"):
+		existing = set()
+		for rule in rules:
 			payload = json.loads(rule["payload_json"])
 			pattern = payload.get("pattern_key")
-			stats = self.store.one("SELECT * FROM pattern_stats WHERE pattern_key=? AND action=?", (pattern, rule["action"]))
-			if not stats or stats["support"] < 3:
+			key = (pattern, rule["action"])
+			if rule["source"] != "suggested":
+				existing.add(key)
+				continue
+			stats = statistics.get(key)
+			unsafe_archive = rule["action"] == "archive" and not _safe_archive_pattern(samples.get(pattern))
+			if not stats or stats["support"] < 3 or unsafe_archive:
 				self.store.execute("DELETE FROM rules WHERE id=?", (rule["id"],))
 			else:
 				self.store.execute("UPDATE rules SET support=?,counterexamples=?,updated_at=? WHERE id=?", (stats["support"], stats["counterexamples"], utc_now(), rule["id"]))
-		for stats in self.store.query("SELECT * FROM pattern_stats WHERE action IN ('archive','keep') AND support>=3"):
-			existing = self.store.one("SELECT id FROM rules WHERE json_extract(payload_json,'$.pattern_key')=? AND action=?", (stats["pattern_key"], stats["action"]))
-			if existing:
+				existing.add(key)
+		for key, stats in statistics.items():
+			if stats["action"] not in {"archive", "keep"} or stats["support"] < 3 or key in existing:
 				continue
-			sample = self.store.one("SELECT * FROM examples WHERE pattern_key=? ORDER BY created_at DESC LIMIT 1", (stats["pattern_key"],))
-			if not sample:
+			sample = samples.get(stats["pattern_key"])
+			if not sample or (stats["action"] == "archive" and not _safe_archive_pattern(sample)):
 				continue
 			conditions = {"sender": sample["sender"], "template": stats["pattern_key"]}
 			self.save_rule({"name": f"Reviewed pattern: {sample['subject'][:60]}", "conditions": conditions,
@@ -308,6 +351,8 @@ class Learning:
 				old["created_at"] if old else now, now, canonical_json(payload),
 			))
 			if invalidate:
+				if old and json.loads(old["conditions_json"]) != conditions:
+					self._invalidate_rule_matches(json.loads(old["conditions_json"]))
 				self._invalidate_rule_matches(conditions)
 		return rule_id
 
@@ -339,32 +384,31 @@ class Learning:
 		else:
 			rule = dict(rule_or_id)
 		conditions = rule.get("conditions", {})
-		clauses, params = ["in_inbox=1"], []
-		for key, value in conditions.items():
-			if key == "sender":
-				clauses.append("sender=?")
-				params.append(value.casefold())
-			elif key == "domain":
-				clauses.append("substr(sender,instr(sender,'@')+1)=?")
-				params.append(value.casefold().lstrip("@"))
-			elif key == "category":
-				clauses.append("category=?")
-				params.append(value)
-			elif key == "subject_contains":
-				clauses.append("instr(lower(subject),?)>0")
-				params.append(value.casefold())
-			elif key == "list_id":
-				clauses.append("EXISTS (SELECT 1 FROM json_each(messages.headers_json) h WHERE lower(h.key)='list-id' AND lower(trim(h.value))=?)")
-				params.append(value.casefold())
-			elif key != "template":
-				raise ValueError("Unsupported rule condition")
-		rows = self.store.query("SELECT id,internal_ms,subject,sender FROM messages WHERE " + " AND ".join(clauses) + " ORDER BY internal_ms,id", params)
+		clauses, params = _rule_sql(conditions)
+		where = "in_inbox=1 AND " + " AND ".join(clauses or ["1"])
+		sample_limit = max(0, min(limit, 100))
+		samples = []
 		if "template" in conditions:
-			rows = [row for row in rows if template_key(self.store.get_message(row["id"])) == conditions["template"]]
-		return {"count": len(rows), "sample_ids": [row["id"] for row in rows[:max(0, min(limit, 100))]],
-			"samples": rows[:max(0, min(limit, 100))],
-			"earliest_internal_ms": rows[0]["internal_ms"] if rows else None,
-			"latest_internal_ms": rows[-1]["internal_ms"] if rows else None,
+			count, earliest, latest = 0, None, None
+			# Stream metadata only; templates never require loading each cached body.
+			for raw in self.store.execute("SELECT id,internal_ms,subject,sender,headers_json FROM messages WHERE " + where + " ORDER BY internal_ms,id", params):
+				row = dict(raw)
+				if _row_template(row) != conditions["template"]:
+					continue
+				count += 1
+				earliest = row["internal_ms"] if earliest is None else earliest
+				latest = row["internal_ms"]
+				if len(samples) < sample_limit:
+					samples.append({key: row[key] for key in ("id", "internal_ms", "subject", "sender")})
+		else:
+			bounds = self.store.one("SELECT COUNT(*) n,MIN(internal_ms) earliest,MAX(internal_ms) latest FROM messages WHERE " + where, params)
+			count, earliest, latest = bounds["n"], bounds["earliest"], bounds["latest"]
+			if sample_limit:
+				samples = self.store.query("SELECT id,internal_ms,subject,sender FROM messages WHERE " + where + " ORDER BY internal_ms,id LIMIT ?", [*params, sample_limit])
+		return {"count": count, "sample_ids": [row["id"] for row in samples],
+			"samples": samples,
+			"earliest_internal_ms": earliest,
+			"latest_internal_ms": latest,
 			"support": rule.get("support", 0), "counterexamples": rule.get("counterexamples", 0),
 			"conditions": conditions, "revision": rule.get("revision", 1),
 			"scope_note": "Current local inbox matches; job eligibility and protections are checked separately"}
@@ -400,7 +444,7 @@ class Learning:
 		with self.store.transaction():
 			self.store.execute("DELETE FROM examples WHERE id=?", (example_id,))
 			self.store.execute("UPDATE feedback SET include_learning=0 WHERE id=?", (row["feedback_id"],))
-			self._rebuild_stats()
+			self._rebuild_stats({row["pattern_key"]})
 			self._invalidate_related(row["sender"], row["category"], row["list_id"], row["message_id"])
 
 	def reset(self, sender: str | None = None, category: str | None = None, pattern_key: str | None = None) -> int:
@@ -410,12 +454,12 @@ class Learning:
 				clauses.append(f"{column}=?")
 				params.append(value)
 		rows = self.store.query("SELECT * FROM examples" + (" WHERE " + " AND ".join(clauses) if clauses else ""), params)
-		with self.store.transaction():
+		with self.batch():
 			for row in rows:
 				self.store.execute("DELETE FROM examples WHERE id=?", (row["id"],))
 				self.store.execute("UPDATE feedback SET include_learning=0 WHERE id=?", (row["feedback_id"],))
 				self._invalidate_related(row["sender"], row["category"], row["list_id"], row["message_id"])
-			self._rebuild_stats()
+			self._rebuild_stats({row["pattern_key"] for row in rows} if clauses else None)
 		return len(rows)
 
 	def include_feedback(self, feedback_id: str) -> None:
@@ -434,7 +478,7 @@ class Learning:
 		with self.store.transaction():
 			self._add_example(feedback_id, message, row["action"], row["reason"], payload.get("category", ""), json.loads(row["label_ids_json"]), row["group_id"], row["created_at"], payload)
 			self.store.execute("UPDATE feedback SET include_learning=1 WHERE id=?", (feedback_id,))
-			self._rebuild_stats()
+			self._rebuild_stats({payload.get("pattern_key") or template_key(message)})
 			self._invalidate_related(message.sender, payload.get("category", ""), payload.get("list_id", ""), message.id)
 
 	def quality_metrics(self) -> dict[str, Any]:
@@ -457,41 +501,100 @@ class Learning:
 		if sender:
 			conditions.append("sender=?")
 			params.append(sender)
-		if category:
+		if category and not sender and not list_id:
 			conditions.append("category=?")
 			params.append(category)
 		if list_id:
-			conditions.append("EXISTS (SELECT 1 FROM json_each(messages.headers_json) h WHERE lower(h.key)='list-id' AND lower(trim(h.value))=?)")
-			params.append(list_id)
-		self.store.execute("UPDATE predictions SET valid=0 WHERE message_id IN (SELECT id FROM messages WHERE " + " OR ".join(conditions) + ")", params)
+			conditions.append("list_id=?")
+			params.append(list_id.strip().casefold())
+		self._invalidate_selected("SELECT id FROM messages WHERE " + " OR ".join(conditions), params, "Relevant reviewed examples changed")
+
+	def _invalidate_related_batch(self, related: Iterable[tuple[str, str, str, str]]) -> None:
+		# A bulk review of one list should not update the same list's predictions
+		# once per selected email. Union scopes, preserving every explicit ID.
+		groups: dict[str, set[str]] = {"id": set(), "sender": set(), "list_id": set(), "category": set()}
+		for sender, category, list_id, message_id in related:
+			groups["id"].add(message_id)
+			if sender:
+				groups["sender"].add(sender)
+			if list_id:
+				groups["list_id"].add(list_id.strip().casefold())
+			if category and not sender and not list_id:
+				groups["category"].add(category)
+		for column, values in groups.items():
+			ordered = sorted(values)
+			for offset in range(0, len(ordered), 500):
+				chunk = ordered[offset:offset + 500]
+				selection = "SELECT id FROM messages WHERE " + column + " IN (" + ",".join("?" for _ in chunk) + ")"
+				self._invalidate_selected(selection, chunk, "Relevant reviewed examples changed")
 
 	def _invalidate_rule_matches(self, conditions: dict[str, str]) -> None:
 		# Narrow SQL preselection avoids invalidating the entire cache after an
 		# edit to a single sender/type rule. Unknown assessments stay pending.
-		clauses, params = [], []
-		if "sender" in conditions:
-			clauses.append("sender=?")
-			params.append(conditions["sender"].casefold())
-		if "domain" in conditions:
-			clauses.append("sender LIKE ?")
-			params.append("%@" + conditions["domain"].casefold().lstrip("@"))
-		if "category" in conditions:
-			clauses.append("category=?")
-			params.append(conditions["category"])
-		if "subject_contains" in conditions:
-			clauses.append("instr(lower(subject),?)>0")
-			params.append(conditions["subject_contains"].casefold())
-		if "list_id" in conditions:
-			clauses.append("EXISTS (SELECT 1 FROM json_each(messages.headers_json) h WHERE lower(h.key)='list-id' AND lower(trim(h.value))=?)")
-			params.append(conditions["list_id"].casefold())
-		rows = self.store.query("SELECT id FROM messages" + (" WHERE " + " AND ".join(clauses) if clauses else ""), params)
-		for row in rows:
-			if "template" in conditions:
-				message = self.store.get_message(row["id"])
-				if not message or template_key(message) != conditions["template"]:
-					continue
-			self.store.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (row["id"],))
+		clauses, params = _rule_sql(conditions)
+		where = " WHERE " + " AND ".join(clauses) if clauses else ""
+		if "template" not in conditions:
+			self._invalidate_selected("SELECT id FROM messages" + where, params, "Rule semantics changed")
+			return
+		ids = []
+		for raw in self.store.execute("SELECT id,headers_json FROM messages" + where, params):
+			row = dict(raw)
+			if _row_template(row) == conditions["template"]:
+				ids.append(row["id"])
+			if len(ids) == 500:
+				self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids, "Rule semantics changed")
+				ids.clear()
+		if ids:
+			self._invalidate_selected("SELECT id FROM messages WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids, "Rule semantics changed")
+
+	def _invalidate_selected(self, selection: str, params: list[Any], reason: str) -> None:
+		self.store.execute("UPDATE predictions SET valid=0 WHERE message_id IN (" + selection + ")", params)
+		# Reviewed instructions and completed receipts survive learning/rule edits;
+		# only unexecuted automatic proposals need fresh interpretation/preflight.
+		self.store.execute("UPDATE actions SET state='stale',reason=?,updated_at=? WHERE approval='automatic' AND state IN ('queued','proposed','retry') AND message_id IN (" + selection + ")", [reason, utc_now(), *params])
 
 
 def _excluded(sender: str, category: str, labels: Iterable[str], senders: set[str], domains: set[str], categories: set[str], label_ids: set[str]) -> bool:
-	return sender.casefold() in senders or sender.rpartition("@")[2].casefold() in domains or category in categories or bool(set(labels) & label_ids)
+	return sender.casefold() in senders or any(domain_matches(sender, target) for target in domains) or category in categories or bool(set(labels) & label_ids)
+
+
+def _safe_archive_pattern(sample: dict[str, Any] | None) -> bool:
+	if not sample:
+		return False
+	if sample["list_id"].strip():
+		return True
+	cleaned = re.sub(r"^(?:(?:re|fw|fwd):\s*)+", "", sample["subject"].strip(), flags=re.IGNORECASE)
+	return sum(character.isalpha() for character in cleaned if not character.isdigit()) >= 4
+
+
+def _row_template(row: dict[str, Any]) -> str:
+	return template_key(Message(id=row["id"], thread_id="", internal_ms=row.get("internal_ms", 0), headers=json.loads(row["headers_json"] or "{}")))
+
+
+def _rule_sql(conditions: dict[str, str]) -> tuple[list[str], list[str]]:
+	"""SQL preselection shares exact/subdomain and whitespace semantics with policy."""
+	clauses, params = [], []
+	for key, value in conditions.items():
+		if key == "sender":
+			clauses.append("sender=?")
+			params.append(value.casefold().strip())
+		elif key == "domain":
+			domain = value.casefold().strip().lstrip("@")
+			if not domain:
+				clauses.append("0")
+				continue
+			escaped = domain.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+			clauses.append("(substr(sender,instr(sender,'@')+1)=? OR substr(sender,instr(sender,'@')+1) LIKE ? ESCAPE '\\')")
+			params.extend((domain, "%." + escaped))
+		elif key == "category":
+			clauses.append("category=?")
+			params.append(value)
+		elif key == "subject_contains":
+			clauses.append("instr(lower(subject),?)>0")
+			params.append(value.casefold())
+		elif key == "list_id":
+			clauses.append("list_id=?")
+			params.append(value.casefold().strip())
+		elif key != "template":
+			raise ValueError("Unsupported rule condition")
+	return clauses, params

@@ -38,6 +38,12 @@ app-data/
 demo-data/
 *-backup.sqlite*
 startup-error.txt
+demo-mailbox.json
+demo-mailbox.json.lock
+demo-mailbox.json.*.tmp
+account.json
+account.json.*.tmp
+oauth.dpapi.*.tmp
 
 # Sandboxed runtimes may place temporary pip/build/test files in the project.
 /pip-*/

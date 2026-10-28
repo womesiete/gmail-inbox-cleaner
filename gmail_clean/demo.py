@@ -7,7 +7,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import uuid
+import weakref
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Iterable
 
@@ -24,6 +29,36 @@ DEMO_LABELS = [
 	{"id": "label_action", "name": "Needs attention", "type": "user"},
 	{"id": "label_personal", "name": "Personal", "type": "user"},
 ]
+
+_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def _path_lock(path: Path | None):
+	if path is None:
+		return threading.RLock()
+	key = str(path.resolve())
+	with _LOCKS_GUARD:
+		lock = _PATH_LOCKS.get(key)
+		if lock is None:
+			lock = threading.RLock()
+			_PATH_LOCKS[key] = lock
+		return lock
+
+
+def _synchronized(method):
+	"""Keep shared main/worker adapters consistent without reparsing unchanged data."""
+	@wraps(method)
+	def call(self, *args, **kwargs):
+		with self._lock:
+			if not self._read_depth:
+				self._sync_from_disk()
+			self._read_depth += 1
+			try:
+				return method(self, *args, **kwargs)
+			finally:
+				self._read_depth -= 1
+	return call
 
 # The same sender deliberately has completed records, outstanding requests, and
 # uncertain follow-ups; a sender-only archive rule is never justified by this data.
@@ -123,44 +158,131 @@ class DemoMailbox:
 	def __init__(self, state_path: str | Path | None = None, count: int = 3000,
 			anchor: datetime | None = None) -> None:
 		self.path = Path(state_path) if state_path is not None else None
+		self._lock = _path_lock(self.path)
+		self._read_depth = 0
+		self._write_depth = 0
+		self._stat_sig: tuple[int, int] | None = None
 		self._history: list[dict] = []
 		self._history_id = 1
 		self.faults: dict[str, list[Exception]] = {}
 		self.lose_next_modify_response = False
 		self.body_reads: list[str] = []
 		self.mutations: list[tuple[list[str], list[str], list[str]]] = []
-		if self.path is not None and self.path.exists():
-			payload = json.loads(self.path.read_text(encoding="utf-8"))
-			if payload.get("account_id") != DEMO_ACCOUNT:
-				raise GmailError("account", "This is not a synthetic demo mailbox file.")
-			self.anchor = as_utc(payload["anchor"])
-			self.messages = {item["id"]: Message.from_dict(item) for item in payload["messages"]}
-			self._history = payload.get("history", [])
-			self._history_id = int(payload.get("history_id", 1))
-			self._labels = payload.get("labels", DEMO_LABELS)
-		else:
-			self.anchor = as_utc(anchor or datetime.now(UTC))
-			self.messages = {item.id: item for item in generate_messages(count, self.anchor)}
-			self._labels = [dict(item) for item in DEMO_LABELS]
-			self._save()
 		self._threads: dict[str, list[str]] = {}
+		with self._disk_write_lock():
+			if self.path is not None and self.path.exists():
+				self._load_from_disk()
+			else:
+				self.anchor = as_utc(anchor or datetime.now(UTC))
+				self.messages = {item.id: item for item in generate_messages(count, self.anchor)}
+				self._labels = [dict(item) for item in DEMO_LABELS]
+				self._rebuild_threads()
+				self._save()
+
+	def _rebuild_threads(self) -> None:
+		self._threads = {}
 		for item in self.messages.values():
 			self._threads.setdefault(item.thread_id, []).append(item.id)
+
+	def _load_from_disk(self) -> None:
+		# fstat refers to the file actually read, even if another adapter replaces
+		# the target concurrently. Its next signature check then sees that replace.
+		with self.path.open("r", encoding="utf-8") as stream:
+			payload = json.load(stream)
+			stat = os.fstat(stream.fileno())
+		if payload.get("account_id") != DEMO_ACCOUNT:
+			raise GmailError("account", "This is not a synthetic demo mailbox file.")
+		self.anchor = as_utc(payload["anchor"])
+		self.messages = {item["id"]: Message.from_dict(item) for item in payload["messages"]}
+		self._history = payload.get("history", [])
+		self._history_id = int(payload.get("history_id", 1))
+		self._labels = payload.get("labels", [dict(item) for item in DEMO_LABELS])
+		self._rebuild_threads()
+		self._stat_sig = (stat.st_mtime_ns, stat.st_size)
+
+	def _sync_from_disk(self) -> None:
+		if self.path is None:
+			return
+		try:
+			stat = self.path.stat()
+		except FileNotFoundError:
+			return
+		if (stat.st_mtime_ns, stat.st_size) != self._stat_sig:
+			# Readers use the same cross-process protocol as writers while an
+			# actual file handle is open. Windows can otherwise deny os.replace()
+			# on an open reader even though the replacement itself is atomic.
+			with self._disk_write_lock():
+				try:
+					stat = self.path.stat()
+				except FileNotFoundError:
+					return
+				if (stat.st_mtime_ns, stat.st_size) != self._stat_sig:
+					self._load_from_disk()
+
+	@contextmanager
+	def _disk_write_lock(self):
+		"""Serialize read-modify-write across adapters and operating-system processes.
+
+		The application also owns an instance lock, but direct demo adapters used
+		by tests/tools must not overwrite one another's committed synthetic edits.
+		"""
+		with self._lock:
+			if self.path is None or self._write_depth:
+				self._write_depth += 1
+				try:
+					yield
+				finally:
+					self._write_depth -= 1
+				return
+			self.path.parent.mkdir(parents=True, exist_ok=True)
+			lock_path = self.path.with_name(self.path.name + ".lock")
+			with lock_path.open("a+b") as stream:
+				if os.fstat(stream.fileno()).st_size == 0:
+					stream.write(b"\0")
+					stream.flush()
+				stream.seek(0)
+				if os.name == "nt":
+					import msvcrt
+					msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+				else:
+					import fcntl
+					fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+				self._write_depth += 1
+				try:
+					yield
+				finally:
+					self._write_depth -= 1
+					stream.seek(0)
+					if os.name == "nt":
+						msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+					else:
+						fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 	def _save(self) -> None:
 		if self.path is None:
 			return
-		self.path.parent.mkdir(parents=True, exist_ok=True)
-		payload = {"account_id": DEMO_ACCOUNT, "anchor": iso_utc(self.anchor),
-			"history_id": self._history_id, "history": self._history,
-			"labels": self._labels, "messages": [item.to_dict() for item in self.messages.values()]}
-		temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-		with temporary.open("w", encoding="utf-8") as stream:
-			json.dump(payload, stream, separators=(",", ":"), ensure_ascii=False)
-			stream.flush()
-			os.fsync(stream.fileno())
-		os.replace(temporary, self.path)
+		with self._disk_write_lock():
+			payload = {"account_id": DEMO_ACCOUNT, "anchor": iso_utc(self.anchor),
+				"history_id": self._history_id, "history": self._history,
+				"labels": self._labels, "messages": [item.to_dict() for item in self.messages.values()]}
+			temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+			try:
+				with temporary.open("x", encoding="utf-8") as stream:
+					json.dump(payload, stream, separators=(",", ":"), ensure_ascii=False)
+					stream.flush()
+					os.fsync(stream.fileno())
+				os.replace(temporary, self.path)
+				stat = self.path.stat()
+				self._stat_sig = (stat.st_mtime_ns, stat.st_size)
+			except Exception:
+				# A failed commit must not leave uncommitted in-memory edits looking
+				# current. The next public read reloads the last atomic disk version.
+				self._stat_sig = None
+				raise
+			finally:
+				temporary.unlink(missing_ok=True)
 
+	@_synchronized
 	def inject_error(self, operation: str, error: Exception) -> None:
 		self.faults.setdefault(operation, []).append(error)
 
@@ -168,19 +290,23 @@ class DemoMailbox:
 		if self.faults.get(operation):
 			raise self.faults[operation].pop(0)
 
+	@_synchronized
 	def identity(self) -> str:
 		self._fail("identity")
 		return DEMO_ACCOUNT
 
+	@_synchronized
 	def profile(self) -> dict:
 		self._fail("profile")
 		return {"emailAddress": DEMO_ACCOUNT, "historyId": str(self._history_id),
 			"messagesTotal": len(self.messages), "threadsTotal": len(self._threads)}
 
+	@_synchronized
 	def labels(self) -> list[dict]:
 		self._fail("labels")
 		return [dict(item) for item in self._labels]
 
+	@_synchronized
 	def list_messages(self, query: str, page_token: str | None = None, page_size: int = 500) -> dict:
 		self._fail("list")
 		offset = 0
@@ -209,6 +335,7 @@ class DemoMailbox:
 			result["nextPageToken"] = f"demo:{self._history_id}:{offset + size}"
 		return result
 
+	@_synchronized
 	def get_message(self, message_id: str, body: bool = False) -> Message:
 		self._fail("get")
 		if message_id not in self.messages:
@@ -222,6 +349,7 @@ class DemoMailbox:
 			item.missing_content = True
 		return item
 
+	@_synchronized
 	def get_messages(self, ids: list[str], body: bool = False) -> dict[str, Message | Exception]:
 		self._fail("get_messages")
 		result: dict[str, Message | Exception] = {}
@@ -232,10 +360,12 @@ class DemoMailbox:
 				result[message_id] = exc
 		return result
 
+	@_synchronized
 	def thread_metadata(self, thread_id: str) -> list[Message]:
 		self._fail("thread")
 		return [self.get_message(item, False) for item in self._threads.get(thread_id, []) if item in self.messages]
 
+	@_synchronized
 	def history(self, start: str, page_token: str | None = None) -> dict:
 		self._fail("history")
 		try:
@@ -254,41 +384,47 @@ class DemoMailbox:
 			result["nextPageToken"] = str(offset + 500)
 		return result
 
+	@_synchronized
 	def modify(self, ids: list[str], add: list[str], remove: list[str]) -> None:
-		self._fail("modify")
-		allowed = {item["id"] for item in self._labels if item["type"] == "user"} | {"INBOX"}
-		if not set(add).issubset(allowed) or not set(remove).issubset(allowed) or set(add) & set(remove):
-			raise GmailError("permission", "Only INBOX and existing synthetic user labels may change.")
-		if any(item not in self.messages for item in ids):
-			raise GmailError("missing", "A synthetic message no longer exists.")
-		for message_id in dict.fromkeys(ids):
-			item = self.messages[message_id]
-			added = set(add) - item.labels
-			removed = set(remove) & item.labels
-			if not added and not removed:
-				continue
-			item.labels = (item.labels | added) - removed
-			self._history_id += 1
-			event: dict = {"id": str(self._history_id)}
-			message = {"id": item.id, "threadId": item.thread_id, "labelIds": sorted(item.labels)}
-			if added:
-				event["labelsAdded"] = [{"message": message, "labelIds": sorted(added)}]
-			if removed:
-				event["labelsRemoved"] = [{"message": message, "labelIds": sorted(removed)}]
-			self._history.append(event)
-		self.mutations.append((list(ids), sorted(set(add)), sorted(set(remove))))
-		self._save()
-		if self.lose_next_modify_response:
-			self.lose_next_modify_response = False
-			raise GmailError("network", "Synthetic lost response: the mailbox may already contain the change.")
+		with self._disk_write_lock():
+			self._sync_from_disk()
+			self._fail("modify")
+			allowed = {item["id"] for item in self._labels if item["type"] == "user"} | {"INBOX"}
+			if not set(add).issubset(allowed) or not set(remove).issubset(allowed) or set(add) & set(remove):
+				raise GmailError("permission", "Only INBOX and existing synthetic user labels may change.")
+			if any(item not in self.messages for item in ids):
+				raise GmailError("missing", "A synthetic message no longer exists.")
+			for message_id in dict.fromkeys(ids):
+				item = self.messages[message_id]
+				added = set(add) - item.labels
+				removed = set(remove) & item.labels
+				if not added and not removed:
+					continue
+				item.labels = (item.labels | added) - removed
+				self._history_id += 1
+				event: dict = {"id": str(self._history_id)}
+				message = {"id": item.id, "threadId": item.thread_id, "labelIds": sorted(item.labels)}
+				if added:
+					event["labelsAdded"] = [{"message": message, "labelIds": sorted(added)}]
+				if removed:
+					event["labelsRemoved"] = [{"message": message, "labelIds": sorted(removed)}]
+				self._history.append(event)
+			self.mutations.append((list(ids), sorted(set(add)), sorted(set(remove))))
+			self._save()
+			if self.lose_next_modify_response:
+				self.lose_next_modify_response = False
+				raise GmailError("network", "Synthetic lost response: the mailbox may already contain the change.")
 
+	@_synchronized
 	def add_message(self, item: Message) -> None:
-		if item.account_id and item.account_id != DEMO_ACCOUNT:
-			raise GmailError("account", "Only synthetic messages belong in the demo.")
-		item.account_id = DEMO_ACCOUNT
-		self.messages[item.id] = item
-		self._threads.setdefault(item.thread_id, []).append(item.id)
-		self._history_id += 1
-		self._history.append({"id": str(self._history_id), "messagesAdded": [{"message": {
-			"id": item.id, "threadId": item.thread_id, "labelIds": sorted(item.labels)}}]})
-		self._save()
+		with self._disk_write_lock():
+			self._sync_from_disk()
+			if item.account_id and item.account_id != DEMO_ACCOUNT:
+				raise GmailError("account", "Only synthetic messages belong in the demo.")
+			item.account_id = DEMO_ACCOUNT
+			self.messages[item.id] = item
+			self._rebuild_threads()
+			self._history_id += 1
+			self._history.append({"id": str(self._history_id), "messagesAdded": [{"message": {
+				"id": item.id, "threadId": item.thread_id, "labelIds": sorted(item.labels)}}]})
+			self._save()

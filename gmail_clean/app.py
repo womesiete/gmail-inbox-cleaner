@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
 import sys
 import time
 from pathlib import Path
 
-from .domain import Config, content_hash
+from .domain import Config, as_utc, content_hash
 from .runtime import data_directory, utc_now
 from .service import AppService
 from .storage import Store
@@ -61,6 +62,37 @@ def benchmark(count: int, directory: Path) -> dict:
 	model.close()
 	store.close()
 	return result
+
+
+def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep=time.sleep):
+	"""Resume persisted transient retries without changing the stage-run contract.
+
+	Waits are short and interruptible. Authentication/configuration pauses and
+	failed items remain visible; only a waiting job's scheduled retries resume.
+	"""
+	summary = service.run_job(job_id, progress=progress, should_stop=should_stop)
+	while summary["state"] == "waiting":
+		current = service.store.one("SELECT state FROM jobs WHERE id=?", (job_id,))
+		if current and current["state"] != "waiting":
+			return service.jobs.summary(job_id)
+		if should_stop and should_stop():
+			signal = should_stop()
+			service.control_job(job_id, signal if signal in {"paused", "stopped"} else "paused")
+			return service.jobs.summary(job_id)
+		row = service.store.one("SELECT MIN(next_attempt_utc) AS due,COUNT(*) AS count,"
+			"SUM(next_attempt_utc IS NULL) AS immediate FROM work_items WHERE job_id=? AND state='retry'", (job_id,))
+		if not row or not row["count"]:
+			break
+		delay = 0 if row["immediate"] else (as_utc(row["due"]) - service.clock()).total_seconds() if row["due"] else None
+		if delay is None:
+			break
+		if delay > 0:
+			if progress:
+				progress(f"Waiting for scheduled retry at {row['due']}")
+			sleep(min(delay, 30))
+			continue
+		summary = service.run_job(job_id, progress=progress, should_stop=should_stop)
+	return summary
 
 
 def main(argv=None) -> int:
@@ -119,8 +151,8 @@ def main(argv=None) -> int:
 				if stage != last_report[1] or now - last_report[0] >= 0.5:
 					print(value, flush=True)
 					last_report[:] = [now, stage]
-			summary = service.run_job(job_id, progress=report)
-			if args.apply:
+			summary = run_until_settled(service, job_id, progress=report)
+			if args.apply and summary["state"] == "completed":
 				if service.config.dry_run:
 					raise ValueError("Enable live mode explicitly before applying proposals")
 				summary["execution"] = service.apply_actions(job_id=job_id)
@@ -132,7 +164,24 @@ def main(argv=None) -> int:
 		window.show()
 		code = application.exec()
 		lock.unlock()
+		if window.shutdown_incomplete and argv is None:
+			# Qt cannot safely kill a thread blocked in an external network call.
+			# A standalone application's explicit close deadline ends its process
+			# after local cleanup. WAL and pre-write attempts recover on next launch;
+			# an external Gmail/provider request may still have completed remotely.
+			service.close()
+			(directory / "shutdown-notice.log").write_text(
+				"Window close deadline reached with unfinished network work. Inspect interrupted jobs and reconcile uncertain actions on next launch. Remote requests may still finish or be billed.\n",
+				encoding="utf-8")
+			for stream in (sys.stdout, sys.stderr):
+				if stream is not None:
+					stream.flush()
+			os._exit(code)
 		return code
+	except KeyboardInterrupt:
+		if args.headless:
+			print("Interrupted; completed work and retry checkpoints are retained.", file=sys.stderr)
+		return 130
 	except Exception as exc:
 		from .runtime import safe_error
 		message = safe_error(exc)

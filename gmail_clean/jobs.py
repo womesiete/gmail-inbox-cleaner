@@ -8,7 +8,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable
 
-from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, recommend, resolve_window
+from .ai import PROMPT_VERSION
+from .domain import Assessment, Config, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
 from .runtime import digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
@@ -57,10 +58,74 @@ class JobRunner:
 		row = self.db.one("SELECT state FROM jobs WHERE id=?", (job,))
 		if row["state"] in {"paused", "stopped"}:
 			return True
-		if should_stop and should_stop():
-			self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(), job))
+		signal = should_stop() if callable(should_stop) else False
+		if signal:
+			state = signal if signal in {"paused", "stopped"} else "paused"
+			self.db.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job))
 			return True
 		return False
+
+	def rules_revision(self) -> str:
+		"""Track effective rule edits, not changing support counts or timestamps."""
+		values = [{key: rule.get(key) for key in ("id", "enabled", "conditions", "action", "label_ids", "source", "revision")} for rule in self.s.rules()]
+		return digest(sorted(values, key=encode))
+
+	def example_signature(self, examples: list[dict]) -> list[dict]:
+		"""Only selected prompt inputs affect reuse; statistics are not model inputs."""
+		keys = ("id", "message_id", "sender", "category", "action", "reason", "scope", "correction", "context_version", "version", "label_ids", "negative_label_ids", "subject")
+		result = []
+		for example in examples:
+			value = {key: example[key] for key in keys if key in example}
+			if isinstance(example.get("body"), str):
+				value["body"] = example["body"][:1600]
+			result.append(value)
+		return result
+
+	def queue_local_transitions(self, job: str, window: Window, config: Config, *, full: bool) -> None:
+		"""Revisit quiet messages only when local time or semantic inputs need it.
+
+		History records mailbox changes, not the passage of time. Keep a durable
+		last-completed anchor so a message crossing an age/defer/deadline boundary is
+		found without repeatedly fetching the entire unchanged inbox from Gmail.
+		"""
+		payload = self.payload(job)
+		policy = payload.setdefault("policy_revision", self.s.config.revision)
+		rules = payload.setdefault("rules_revision", self.rules_revision())
+		prompt = payload.setdefault("prompt_version", PROMPT_VERSION)
+		self.save_payload(job, payload)
+		force = (full or self.checkpoint("boundary_policy_revision") != policy
+			or self.checkpoint("boundary_rules_revision") != rules
+			or self.checkpoint("boundary_prompt_version") != prompt)
+		previous = self.checkpoint("boundary_anchor")
+		previous_anchor = datetime.fromisoformat(previous) if previous else None
+		effective = self.effective_config(config)
+		rows = self.db.query("""SELECT m.id,m.internal_ms,m.category,m.decision,m.defer_until_utc,m.deadline_utc,
+			EXISTS(SELECT 1 FROM predictions p WHERE p.message_id=m.id AND p.valid=1
+				AND p.content_hash=m.content_hash AND p.context_version=m.context_version
+				AND p.prompt_version=?) AS has_assessment
+			FROM messages m WHERE m.in_inbox=1 AND NOT EXISTS
+				(SELECT 1 FROM work_items w WHERE w.job_id=? AND w.message_id=m.id AND w.stage='metadata')""", (PROMPT_VERSION, job))
+		for row in rows:
+			if not window.contains(row["internal_ms"]):
+				continue
+			needs = force or not row["decision"] or row["decision"] == "pending" or not row["has_assessment"]
+			for field in ("defer_until_utc", "deadline_utc"):
+				if row[field]:
+					try:
+						due = datetime.fromisoformat(row[field].replace("Z", "+00:00"))
+						needs = needs or (due <= window.anchor_utc and (previous_anchor is None or previous_anchor < due))
+					except (TypeError, ValueError):
+						# Malformed state must be reconsidered, never silently retained.
+						needs = True
+			if row["decision"] == "review" and not needs:
+				try:
+					cutoff = resolve_age_cutoff(effective, window.anchor_utc, row["category"])
+					old_cutoff = resolve_age_cutoff(effective, previous_anchor, row["category"]) if previous_anchor else None
+					needs = cutoff is not None and row["internal_ms"] < epoch_ms(cutoff) and (old_cutoff is None or row["internal_ms"] >= epoch_ms(old_cutoff))
+				except (TypeError, ValueError):
+					needs = True
+			if needs:
+				self.queue(job, row["id"])
 
 	def effective_config(self, frozen: Config) -> Config:
 		"""Recompute current policy without broadening an older job's protections.
@@ -125,8 +190,13 @@ class JobRunner:
 			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
 			self.set_checkpoint("boundary_latest", window.to_dict()["latest_exclusive"])
 			self.set_checkpoint("boundary_window", {"earliest_date": config.earliest_date, "latest_mode": config.latest_mode, "latest_days": config.latest_days, "latest_date": config.latest_date, "timezone": config.timezone})
+			completed_inputs = self.payload(job)
+			self.set_checkpoint("boundary_anchor", stamp(window.anchor_utc))
+			self.set_checkpoint("boundary_policy_revision", completed_inputs.get("policy_revision", config.revision))
+			self.set_checkpoint("boundary_rules_revision", completed_inputs.get("rules_revision", self.rules_revision()))
+			self.set_checkpoint("boundary_prompt_version", completed_inputs.get("prompt_version", PROMPT_VERSION))
 			if self.s.config.auto_execute and not self.s.config.dry_run:
-				self.s.apply_actions(job_id=job)
+				self.s.apply_actions(job_id=job, should_stop=should_stop)
 		except Exception as exc:
 			self.s.error("job", exc, job_id=job)
 			self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(), job))
@@ -212,10 +282,10 @@ class JobRunner:
 				raise
 			# Do not advance the expired checkpoint. Next run must fully reconcile.
 			self.set_checkpoint("full_reconciliation", None)
-		# Time transitions cannot be inferred from history alone. Include local eligible
-		# inbox candidates on every cycle; valid assessments are reused without AI.
-		for item in self.db.query("SELECT id FROM messages WHERE in_inbox=1"):
-			self.queue(job, item["id"])
+		# Quiet time-driven transitions still need work, but an unchanged decided
+		# inbox does not need a complete Gmail metadata refresh on every cycle.
+		self.queue_local_transitions(job, window, config, full=bool(payload.get("full")))
+		payload = self.payload(job)
 		if payload.get("full"):
 			# Detect locally cached items that disappeared from the inbox listing too.
 			self.set_checkpoint("full_reconciliation", stamp(window.anchor_utc))
@@ -361,6 +431,7 @@ class JobRunner:
 					results = self.s.mailbox.get_messages(ids, body=stage == "body")
 				except Exception as exc:
 					results = {mid: exc for mid in ids}
+				threads = {}
 				for row in rows:
 					mid = row["message_id"]
 					result = results.get(mid, ValueError("Missing retrieval result"))
@@ -368,7 +439,7 @@ class JobRunner:
 						if isinstance(result, Exception):
 							raise result
 						if stage == "metadata":
-							self.metadata(job, result, window, effective)
+							self.metadata(job, result, window, effective, threads=threads)
 						else:
 							# Eligibility is established before this retrieval was queued.
 							if self.s.eligible(result, window):
@@ -390,7 +461,7 @@ class JobRunner:
 				counts = self.summary(job)
 				progress(f"{stage.title()}: {counts['completed']:,} stages completed; {counts['failed']:,} errors")
 
-	def metadata(self, job: str, message, window: Window, config: Config) -> None:
+	def metadata(self, job: str, message, window: Window, config: Config, *, threads=None) -> None:
 		old = self.db.get_message(message.id)
 		if not self.s.eligible(message, window):
 			# Out-of-window bodies are never fetched or sent to AI.
@@ -398,7 +469,10 @@ class JobRunner:
 			self.db.upsert_message(message)
 			self.db.execute("UPDATE messages SET decision='skip' WHERE id=?", (message.id,))
 			return
-		members = self.s.mailbox.thread_metadata(message.thread_id)
+		threads = {} if threads is None else threads
+		if message.thread_id not in threads:
+			threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+		members = threads[message.thread_id]
 		message.context_version = context_hash(members, config.sent_context_enabled)
 		if old and old.internal_ms == message.internal_ms and old.headers == message.headers:
 			message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
@@ -505,7 +579,8 @@ class JobRunner:
 			examples = self.examples(message, config, window)
 			route = self.route_category(message, config)
 			model = config.optional_model_routes.get(route, config.ai_model)
-			version = digest({"module": config.ai_module, "model": model, "examples": examples, "rules": self.s.rules(), "prompt": "1.0", "sent_context_enabled": config.sent_context_enabled, "archived_context_enabled": config.archived_context_enabled})
+			example_inputs = self.example_signature(examples)
+			version = digest({"module": config.ai_module, "model": model, "examples": example_inputs, "prompt": PROMPT_VERSION, "sent_context_enabled": config.sent_context_enabled, "archived_context_enabled": config.archived_context_enabled})
 			cached = self.db.one("SELECT assessment_json FROM predictions WHERE message_id=? AND content_hash=? AND context_version=? AND model_version=? AND valid=1 ORDER BY created_at DESC LIMIT 1", (message.id, message.content_hash, message.context_version, version))
 			if cached:
 				assessment = Assessment.from_dict(json.loads(cached["assessment_json"]))
@@ -515,7 +590,7 @@ class JobRunner:
 			else:
 				# Batching unrelated example selections would make an assessment
 				# depend on examples absent from its cache key. Group like selections.
-				pending[(route, digest(examples))].append((row, message, examples, version))
+				pending[(route, digest(example_inputs))].append((row, message, examples, version))
 		if not pending:
 			return
 		exclusions = {"senders": config.excluded_senders, "domains": config.excluded_domains, "label_ids": config.excluded_label_ids, "categories": config.excluded_categories}
@@ -535,7 +610,7 @@ class JobRunner:
 						self.fail(job, row, raise_for, config)
 						continue
 					decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-					telemetry = {**batch.telemetry, "example_version": digest(examples), "route_category": route}
+					telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
 					self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
 					self.done(job, message.id, "classification")
 			except Exception as exc:
@@ -549,7 +624,7 @@ class JobRunner:
 			else:
 				self.db.execute("UPDATE messages SET decision=? WHERE id=?", (action, message.id))
 			if assessment:
-				insert(self.db, "predictions", {"id": identifier(), "message_id": message.id, "job_id": job, "content_hash": message.content_hash, "context_version": message.context_version, "policy_version": self.s.config.revision, "model_version": version, "prompt_version": "1.0", "example_version": (telemetry or {}).get("example_version", ""), "assessment_json": encode(assessment.to_dict()), "decision": action, "reason": reason, "valid": 1, "created_at": stamp(), "payload_json": encode(telemetry or {})})
+				insert(self.db, "predictions", {"id": identifier(), "message_id": message.id, "job_id": job, "content_hash": message.content_hash, "context_version": message.context_version, "policy_version": self.s.config.revision, "model_version": version, "prompt_version": PROMPT_VERSION, "example_version": (telemetry or {}).get("example_version", ""), "assessment_json": encode(assessment.to_dict()), "decision": action, "reason": reason, "valid": 1, "created_at": stamp(), "payload_json": encode(telemetry or {})})
 			self.db.execute("UPDATE actions SET state='stale',reason='Superseded recommendation' WHERE message_id=? AND state IN ('queued','proposed') AND approval='automatic'", (message.id,))
 			if action == "archive":
 				labels = list(label_ids) if label_ids is not None else assessment.suggested_label_ids if assessment and self.s.config.auto_label else []

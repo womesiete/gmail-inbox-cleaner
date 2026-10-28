@@ -67,7 +67,12 @@ class ParsedBody:
 
 
 def decode_base64url(data: str) -> bytes:
-	return base64.b64decode(data + "=" * (-len(data) % 4), altchars=b"-_", validate=True)
+	# MIME transfer data can contain folded ASCII whitespace or use the standard
+	# alphabet. Normalize those representations, but still reject arbitrary junk.
+	cleaned = data.translate(str.maketrans("", "", " \t\r\n\f\v")).replace("+", "-").replace("/", "_")
+	if (data and not cleaned) or len(cleaned) % 4 == 1:
+		raise ValueError("Invalid base64url data")
+	return base64.b64decode(cleaned + "=" * (-len(cleaned) % 4), altchars=b"-_", validate=True)
 
 
 def _headers(part: dict) -> dict[str, str]:

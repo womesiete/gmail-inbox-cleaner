@@ -1,0 +1,28 @@
+# Reliability and performance follow-up
+
+This change follows the supplied issue list and implementation plan. The table maps every reported item to its implementation and regression coverage.
+
+| Issue | Resolution | Regression coverage |
+| --- | --- | --- |
+| 1. Stranded waiting jobs | Desktop timers resume due retries when idle; headless execution waits in interruptible slices and resumes the same frozen job. The stage runner's waiting/return contract remains intact. | `test_gui.py`, `test_lifecycle.py`, `test_jobs.py` |
+| 2. Unbounded undo pagination | A 100-page limit and repeated-token detection turn incomplete ownership evidence into a conflict. | `test_actions.py` |
+| 3. Batch-wide incomplete context | Target/context thread IDs and dropped-context metadata restrict uncertainty to affected conversations; unscoped context remains conservative. | `test_ai.py` |
+| 4. Slow close and uninterruptible commands | Cooperative stop checks cover review, replan, execution, undo, and downloads. Closing aborts isolated AI; the three-second window deadline avoids unsafe Qt termination. Standalone process recovery is documented in architecture. | `test_gui.py`, `test_actions.py`, `test_lifecycle.py` |
+| 5. GUI SQLite write contention | Active jobs receive pause/stop signals; the owning worker writes the state. Idle control writes remain local. Database close avoids an unnecessary writer lock when the connection owns no lease. | `test_gui.py`, `test_jobs.py`, `test_storage.py` |
+| 6. Retained AI clients/cold starts | Exit hooks exist only for started children and are unregistered on termination/close. The application reuses serialized isolated clients across tasks while reopening worker-owned SQLite connections. | `test_ai.py`, `test_lifecycle.py` |
+| 7. Demo divergence and temporary-file collisions | Synchronized demo reads detect changed file signatures; mutations use process/file locks and atomic writes. The desktop shares the synchronized demo adapter. Tokens and account identity use unique, fsynced temporaries with cleanup. | `test_gmail.py`, `test_service.py`, `test_lifecycle.py` |
+| 8. Fragile MIME decoding | ASCII whitespace and standard Base64 alphabet are normalized before padding/strict decoding; malformed data still produces missing-content review. | `test_mime.py` |
+| 9. Sequential action reads | Batched metadata prefetch/readback, phase-local thread reuse, and bounded identity checks reduce round trips while preserving fresh preflight. | `test_actions.py`, `test_security.py` |
+| 10. Moving receipt endpoints | One post-write history checkpoint is shared across each execution chunk; intervening label edits remain visible to ownership checks. | `test_actions.py`, `test_security.py` |
+| 11. Full inbox work on every cycle | Incremental local discovery revisits due age/defer/deadline transitions and changed semantic inputs; unchanged valid items avoid metadata retrieval. Metadata batches share thread lookups. Periodic full reconciliation remains. | `test_jobs.py`, `test_acceptance.py` |
+| 12. Unstable prediction keys | Cache identity uses actual `PROMPT_VERSION` and selected prompt inputs, excluding rule statistics/timestamps. Prompt changes and changed example text invalidate reuse. | `test_jobs.py`, `test_ai.py` |
+| 13. Broad invalidation/N+1 learning reads | Indexed normalized List-ID lookup, narrow feedback scopes, joined examples, metadata-only streamed template checks, and affected-pattern rebuilds replace broad scans and per-row body loads. | `test_learning.py`, `test_storage.py` |
+| 14. Interactive work queued behind jobs | Rule previews and selected-text retrieval use a separate thread pool. Both pools obey shutdown and retain worker-owned resources until safe cleanup. | `test_gui.py` |
+| 15. Weak inferred archive patterns | Archive suggestions need a List-ID or at least four alphabetic subject characters after prefix/number normalization. Blank/numeric-only subjects do not create inferred archive rules. | `test_learning.py` |
+| 16. Inconsistent domains | A shared suffix-aware matcher and equivalent SQL match exact domains/subdomains while rejecting lookalikes; applied to rules, protections, privacy, and learning. | `test_domain.py`, `test_learning.py`, `test_ai.py` |
+| 17. Bleach/duplicate HTML parsing | Bleach is removed. Optional formatted previews use one BeautifulSoup allowlist pass; plain-text preview remains the default and resource loading stays blocked. | `test_gui.py`, `test_mime.py` |
+| 18. Packaging/data paths/source completeness | Requests is explicit; PyInstaller collects Gmail discovery data; platform data paths respect XDG/macOS/Windows. All required service, storage, and SQL-model modules were already complete and remain included in built distributions. | `test_runtime.py`, package build/inspection, existing service/storage/GUI suites |
+
+The 1,000-action request-count regression uses messages in one conversation and an injectable transport: 21 bulk metadata facade calls, 11 thread reads, 32 profile/identity calls, ten history interval reads, and no individual message reads. Distinct conversations still require their own context checks. Multipart request parts continue to consume Gmail quota; these figures are not production latency measurements.
+
+Date windows, protections, explicit message-ID scope, uncertain-write reconciliation, and ownership-aware undo remain enforced. Stage-boundary metadata checks are retained because a paused job can encounter new inbox, label, or conversation state. Performance improvements do not make Gmail reads/writes atomic.

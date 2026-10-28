@@ -46,6 +46,7 @@ The application runs when you launch it; it does not install a background servic
 - [Architecture, persistence, recovery, and security](docs/architecture.md)
 - [Acceptance coverage and validation commands](docs/acceptance.md)
 - [Recorded test and scale-check results](docs/validation.md)
+- [Reliability and performance fixes: all 18 reported issues](docs/reliability-fixes.md)
 - [Original implementation requirements](docs/implementation-plan.txt)
 
 ## Development checks

@@ -9,6 +9,7 @@ import ctypes
 import hashlib
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -83,13 +84,16 @@ class TokenStore:
 		except Exception:
 			# There is deliberately no unencrypted-file fallback.
 			protected = self._dpapi(value.encode(), encrypt=True)
-			temporary = self.path.with_suffix(".tmp")
-			with temporary.open("wb") as stream:
-				stream.write(protected)
-				stream.flush()
-				os.fsync(stream.fileno())
-			os.chmod(temporary, 0o600)
-			os.replace(temporary, self.path)
+			temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+			try:
+				with temporary.open("xb") as stream:
+					stream.write(protected)
+					stream.flush()
+					os.fsync(stream.fileno())
+				os.chmod(temporary, 0o600)
+				os.replace(temporary, self.path)
+			finally:
+				temporary.unlink(missing_ok=True)
 
 	def load(self) -> dict | None:
 		if self.path.exists():

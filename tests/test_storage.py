@@ -223,3 +223,52 @@ def test_current_process_lease_probe_is_non_destructive():
 		capture_output=True, text=True, timeout=30, check=False)
 	assert result.returncode == 0, result.stderr
 	assert result.stdout.strip() == "owner-is-alive"
+
+
+def test_list_id_upgrade_backfills_mixed_case_headers_and_remains_indexed(tmp_path):
+	from gmail_clean.storage import _MIGRATIONS
+	path = tmp_path / "version-three.sqlite3"
+	conn = sqlite3.connect(path)
+	for migration in _MIGRATIONS[:3]:
+		conn.executescript(migration)
+	conn.execute("INSERT INTO messages(id,headers_json) VALUES('old','{\"lIsT-iD\":\"  Weekly.Example.INVALID  \"}')")
+	conn.execute("PRAGMA user_version=3")
+	conn.commit()
+	conn.close()
+	with Store(path, "me@example.invalid") as store:
+		assert store.one("SELECT list_id FROM messages WHERE id='old'")["list_id"] == "weekly.example.invalid"
+		plan = store.query("EXPLAIN QUERY PLAN SELECT id FROM messages WHERE list_id=?", ("weekly.example.invalid",))
+		assert any("idx_messages_list_id" in row["detail"] for row in plan)
+		store.execute("UPDATE messages SET headers_json='{}' WHERE id='old'")
+		assert store.one("SELECT list_id FROM messages WHERE id='old'")["list_id"] == ""
+		store.upsert_message(replace(message("new"), headers={"From": "news@example.invalid", "LIST-ID": "  Digest.Example  "}))
+		assert store.one("SELECT list_id FROM messages WHERE id='new'")["list_id"] == "digest.example"
+		assert store.one("PRAGMA integrity_check")["integrity_check"] == "ok"
+
+
+def test_closing_nonowner_store_does_not_wait_for_another_writer(tmp_path):
+	import time
+	path = tmp_path / "busy.sqlite3"
+	reader = Store(path, "me@example.invalid")
+	ready, finish = threading.Event(), threading.Event()
+	errors = []
+	def writer():
+		try:
+			with Store(path, "me@example.invalid") as store:
+				with store.transaction():
+					store.execute("INSERT INTO jobs(id) VALUES('held')")
+					ready.set()
+					finish.wait(10)
+		except BaseException as exc:
+			errors.append(exc)
+	worker = threading.Thread(target=writer)
+	worker.start()
+	try:
+		assert ready.wait(5)
+		start = time.monotonic()
+		reader.close()
+		assert time.monotonic() - start < 1
+	finally:
+		finish.set()
+		worker.join(5)
+	assert not errors

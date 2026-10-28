@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class AccountMismatchError(RuntimeError):
@@ -181,6 +181,29 @@ _MIGRATIONS = [
 	CREATE INDEX idx_rules_enabled ON rules(enabled,source);
 	CREATE INDEX idx_errors_queue ON errors(state,stage,next_attempt_utc);
 	""",
+	"""
+	ALTER TABLE messages ADD COLUMN list_id TEXT NOT NULL DEFAULT '';
+	UPDATE messages SET list_id=COALESCE((SELECT lower(trim(CAST(h.value AS TEXT)))
+		FROM json_each(messages.headers_json) h WHERE lower(h.key)='list-id' LIMIT 1),'');
+	CREATE TRIGGER messages_list_id_insert AFTER INSERT ON messages
+	WHEN NEW.list_id != COALESCE((SELECT lower(trim(CAST(h.value AS TEXT)))
+		FROM json_each(NEW.headers_json) h WHERE lower(h.key)='list-id' LIMIT 1),'')
+	BEGIN
+		UPDATE messages SET list_id=COALESCE((SELECT lower(trim(CAST(h.value AS TEXT)))
+			FROM json_each(NEW.headers_json) h WHERE lower(h.key)='list-id' LIMIT 1),'') WHERE id=NEW.id;
+	END;
+	CREATE TRIGGER messages_list_id_update AFTER UPDATE OF headers_json ON messages
+	WHEN NEW.list_id != COALESCE((SELECT lower(trim(CAST(h.value AS TEXT)))
+		FROM json_each(NEW.headers_json) h WHERE lower(h.key)='list-id' LIMIT 1),'')
+	BEGIN
+		UPDATE messages SET list_id=COALESCE((SELECT lower(trim(CAST(h.value AS TEXT)))
+			FROM json_each(NEW.headers_json) h WHERE lower(h.key)='list-id' LIMIT 1),'') WHERE id=NEW.id;
+	END;
+	CREATE INDEX idx_messages_list_id ON messages(list_id,id);
+	CREATE INDEX idx_examples_list_id ON examples(list_id,created_at);
+	CREATE INDEX idx_examples_category ON examples(category,created_at);
+	CREATE INDEX idx_rules_pattern_action ON rules(json_extract(payload_json,'$.pattern_key'),action);
+	""",
 ]
 
 _ACCOUNT_TABLES = (
@@ -234,9 +257,16 @@ class Store:
 			if version > SCHEMA_VERSION:
 				raise RuntimeError("Database schema is newer than this application; use a matching version")
 			for number in range(version, SCHEMA_VERSION):
-				for statement in _MIGRATIONS[number].split(";"):
-					if statement.strip():
+				# complete_statement keeps trigger bodies and quoted semicolons
+				# intact while retaining the migration's enclosing transaction.
+				statement = ""
+				for line in _MIGRATIONS[number].splitlines(keepends=True):
+					statement += line
+					if sqlite3.complete_statement(statement):
 						self.conn.execute(statement)
+						statement = ""
+				if statement.strip():
+					self.conn.execute(statement)
 				self.conn.execute(f"PRAGMA user_version={number + 1}")
 			self.conn.commit()
 		except Exception:
@@ -317,16 +347,16 @@ class Store:
 		body = data.get("body") or ""
 		now = utc_now()
 		self.execute("""INSERT INTO messages
-			(id,account_id,thread_id,internal_ms,labels_json,headers_json,sender,subject,snippet,body,
+			(id,account_id,thread_id,internal_ms,labels_json,headers_json,list_id,sender,subject,snippet,body,
 			truncated,missing_content,content_hash,context_version,in_inbox,updated_at,payload_json)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
 			thread_id=excluded.thread_id,internal_ms=excluded.internal_ms,labels_json=excluded.labels_json,
-			headers_json=excluded.headers_json,sender=excluded.sender,subject=excluded.subject,snippet=excluded.snippet,
+			headers_json=excluded.headers_json,list_id=excluded.list_id,sender=excluded.sender,subject=excluded.subject,snippet=excluded.snippet,
 			body=excluded.body,truncated=excluded.truncated,missing_content=excluded.missing_content,
 			content_hash=excluded.content_hash,context_version=excluded.context_version,in_inbox=excluded.in_inbox,
 			updated_at=excluded.updated_at,payload_json=excluded.payload_json""", (
 			data["id"], self.account_id, data.get("thread_id", ""), data.get("internal_ms", 0),
-			canonical_json(labels), canonical_json(headers), parseaddr(str(lower.get("from", "")))[1].casefold(),
+			canonical_json(labels), canonical_json(headers), str(lower.get("list-id", "")).strip().casefold(), parseaddr(str(lower.get("from", "")))[1].casefold(),
 			str(lower.get("subject", "")), data.get("snippet", ""), body, int(bool(data.get("truncated", False))),
 			int(bool(data.get("missing_content", not body))), data.get("content_hash", ""),
 			data.get("context_version", ""), int("INBOX" in labels), now, canonical_json(data),
@@ -431,7 +461,10 @@ class Store:
 	def close(self) -> None:
 		self._check_thread()
 		try:
-			self.execute("DELETE FROM job_leases WHERE owner_token=?", (self._owner_token,))
+			# A read-only/main-thread service usually owns no leases. Avoid taking
+			# SQLite's writer lock merely to delete zero rows during window close.
+			if self.one("SELECT 1 FROM job_leases WHERE owner_token=? LIMIT 1", (self._owner_token,)):
+				self.execute("DELETE FROM job_leases WHERE owner_token=?", (self._owner_token,))
 		finally:
 			self.conn.close()
 

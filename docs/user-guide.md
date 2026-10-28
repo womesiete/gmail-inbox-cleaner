@@ -112,7 +112,7 @@ Undo uses the original explicit IDs and inverse app-owned deltas. It can restore
 | OAuth test access denied | Confirm External audience, add the exact Gmail address as a test user, select Desktop app credentials, enable Gmail API. |
 | Authorization expired / 401 | Reconnect. External Testing consent normally expires after seven days for this scope. |
 | 403 | Inspect the classified error: missing permission or account policy is different from a quota/rate reason. Repeated retries cannot fix consent or policy. |
-| 429 / transient 5xx / offline | Leave the checkpointed work pending; bounded backoff permits retry. Inspect exhausted failures in Errors. |
+| 429 / transient 5xx / offline | Transient items retain a scheduled retry. The desktop resumes due waiting jobs when idle; headless runs wait and resume automatically. Explicit pauses/stops stay paused/stopped. Inspect exhausted failures in Errors. |
 | Expired Gmail history | Run/resume reconciliation. Local audit and learning data are retained. |
 | Invalid pagination token | Safe re-enumeration deduplicates IDs; do not clear the database to repair it. |
 | Missing AI key / unsupported model | Configure the external module or exact model identifier; resume after correcting configuration. |

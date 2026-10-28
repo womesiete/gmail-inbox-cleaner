@@ -1,0 +1,83 @@
+### Stability & Reliability Issues
+
+1. **Jobs with transient retry items become permanently stranded in the `'waiting'` state (`gmail_clean/jobs.py`, `gmail_clean/gui.py`)**: When all remaining items in a stage hit a transient error (such as a network blip or rate limit) and transition to `state='retry'` with a future `next_attempt_utc`, `JobRunner.process_stage()` sets the job state to `'waiting'` and returns `False`, terminating `run_job()`. Neither the headless CLI (`gmail_clean/app.py`) nor `MainWindow` (`gmail_clean/gui.py`) schedules a timer or sleeps until `next_attempt_utc` to resume the job. Worse, `MainWindow._maintenance_tick()` queries `WHERE state IN ('pending','running','paused','waiting','retry')` and refuses to start new maintenance runs while a `'waiting'` job exists, leaving the pipeline stuck indefinitely until manual user intervention.
+
+
+2. **Unbounded pagination loop in `ActionExecutor.preflight_undo` (`gmail_clean/actions.py`)**: While `_history_interval()` caps pagination at 100 pages (`for _ in range(100):`) and tracks visited `nextPageToken` values in a `set` to detect cycles, `preflight_undo()` uses an unbounded `while True:` loop with no page limit or repeated-token guard. Undoing an older action on an active mailbox with thousands of subsequent history events can stall the worker thread or loop infinitely if a transport repeats a page token.
+
+
+3. **Batch-level `context_incomplete` contaminates unrelated messages in the same AI prompt (`gmail_clean/ai.py`, `gmail_clean/jobs.py`)**: When `ai_batch_size > 1`, `JobRunner.classify()` collects `context_messages` across all target messages in the batch and passes them as a single flat list to `AIClient.assess()`. In `AIClient.assess()`, `context_incomplete` is computed globally across the batch (triggering if total context messages exceed 20, or if any single context message is truncated, missing content, over 4,000 characters, or excluded by privacy settings). When `context_incomplete` is true, `assess()` overwrites `missing_context = True` and `uncertainty = "high"` on **every** target message in the batch, forcing unrelated single-message emails (such as simple newsletters) into manual review.
+
+
+4. **Window close hang and uninterruptible worker operations in `MainWindow.closeEvent` (`gmail_clean/gui.py`)**: When the user closes the window while `self.tasks` is non-empty, `closeEvent()` sets `self.stop_event.set()` and calls `event.ignore()`, waiting for `_on_finished()` to close the window. However, `self.stop_event` is only passed to `run_job()` and is never checked by `replan()`, `apply_actions()`, `undo()`, `manual()`, or an in-flight `AIClient.call()` (which blocks for up to `ai_timeout_seconds = 120.0`). Clicking close during any of those operations leaves the window unresponsive to close events until the worker finishes or times out.
+
+
+5. **Main-thread SQLite write contention in `MainWindow._control` (`gmail_clean/gui.py`)**: `MainWindow._control()` calls `self.service.control_job(job_id, state)`, which executes an `UPDATE jobs` statement directly on the GUI thread's SQLite connection while the background worker thread is actively writing to the database. If the worker thread is inside a multi-statement transaction, the main Qt thread can freeze for up to `busy_timeout` (5,000 ms) or raise an uncaught `sqlite3.OperationalError: database is locked`.
+
+
+6. **`AIClient` memory leak via `atexit.register` and repeated subprocess cold-starts (`gmail_clean/ai.py`, `gmail_clean/service.py`)**: `AIClient.__init__()` registers `atexit.register(self.close)` on every instantiation, and `close()` never calls `atexit.unregister(self.close)`. Because `AppService.worker()` creates a new `AppService` clone—and therefore new `AIClient` instances—for each background task and closes them when the task exits, every `AIClient` instance created during the session remains strongly referenced by Python's `atexit` registry and is never garbage-collected, while the spawned AI worker process must be torn down and cold-started across tasks.
+
+
+7. **`DemoMailbox` state divergence, redundant disk loads, and `.tmp` file race conditions (`gmail_clean/demo.py`, `gmail_clean/service.py`, `gmail_clean/auth.py`)**: In `AppService.worker()`, `self._mailbox` is only passed to the worker clone when `not self.demo`, causing every background worker task in demo mode to re-read and parse the entire `demo-mailbox.json` file from disk into a separate `DemoMailbox` object. Meanwhile, the main thread's `self.service._mailbox` retains its initial in-memory dictionary and never reloads changes written by workers. Additionally, `DemoMailbox._save()`, `TokenStore.save()`, and `AppService._write_identity()` write to static temporary filenames (`demo-mailbox.json.tmp`, `oauth.tmp`, `account.tmp`), which can collide and raise `PermissionError` during `os.replace()` on Windows if accessed concurrently.
+
+
+8. **Strict `decode_base64url` fails on whitespace or non-URL-safe MIME characters (`gmail_clean/mime.py`)**: `decode_base64url()` calculates `=` padding from `len(data)` without stripping whitespace first and passes `validate=True` to `base64.b64decode(data + "=" * (-len(data) % 4), altchars=b"-_", validate=True)`. Any MIME part body containing embedded `\r\n` line breaks, spaces, or standard base64 characters (`+` or `/`) will raise `binascii.Error` (`ValueError`), causing `parse_body()` to discard the text and mark `result.missing = True`.
+
+
+
+---
+
+### Performance & API Quota Problems
+
+9. **$6N$ sequential HTTP requests during `ActionExecutor.apply` (`gmail_clean/actions.py`)**: To apply $N$ queued actions, `apply()` runs `self.preflight(action)` during initial grouping and runs `self.preflight(action)` a second time inside the batch chunk loop. Each `preflight()` call invokes `live_state()`, which makes two sequential synchronous network calls (`mailbox.get_message()` and `mailbox.thread_metadata()`). After `mailbox.modify()` executes the batch, `apply()` loops over each item again to call `mailbox.get_message()` and `self.receipt()`, which calls `mailbox.profile()` and `_history_interval()` per item. Applying 1,000 actions thus performs roughly 6,000+ sequential HTTP calls, creating a severe bottleneck and risking Gmail API rate limits (`403 userRateLimitExceeded`).
+
+
+10. **Per-message `receipt()` checkpointing widens the conflict window across batches (`gmail_clean/actions.py`)**: In `ActionExecutor.apply()`, `before_write_history_id` is recorded once before `mailbox.modify()` modifies up to `execution_batch_size` (100) messages. However, `receipt()` fetches `end = str(self.s.mailbox.profile()["historyId"])` inside the per-message readback loop. As readbacks proceed sequentially over the network, the advancing `end` checkpoint widens the `[start, end]` interval for later messages in the chunk, increasing the likelihood that unrelated mailbox activity during readback causes `_history_interval()` to downgrade ownership to `ambiguous_history` and block future undo.
+
+
+11. **Every incremental maintenance job re-queues the entire local inbox and repeats network fetches across stages (`gmail_clean/jobs.py`)**: At the end of `JobRunner.discover()`, `for item in self.db.query("SELECT id FROM messages WHERE in_inbox=1"): self.queue(job, item["id"])` queues every locally cached inbox message into the `metadata` stage on every run, even when no Gmail history events occurred. Furthermore, as a message moves through `metadata` -> `body` -> `classification` within a single job, its metadata is fetched up to four times (`get_messages`) and its thread is fetched up to three times via unbatched `thread_metadata()` calls.
+
+
+12. **AI prediction cache thrashing and dead `PROMPT_VERSION` invalidation (`gmail_clean/jobs.py`, `gmail_clean/ai.py`)**: `JobRunner.classify()` ignores `ai.cache_key()` and instead computes `version = digest({"module": config.ai_module, "model": model, "examples": examples, "rules": self.s.rules(), "prompt": "1.0", ...})`. Because `self.s.rules()` returns full rule rows—including `support`, `counterexamples`, and `updated_at` timestamps updated by `Learning._rebuild_stats()`—recording manual feedback on a single message changes `self.s.rules()` and invalidates the `model_version` cache key for **every** message in the mailbox, even though rules are not part of the AI prompt. Conversely, hardcoding `"prompt": "1.0"` in `jobs.py` means updating `PROMPT_VERSION` (`"gmail-clean-assessment-v1.0.1"`) in `gmail_clean/ai.py` never invalidates cached predictions.
+
+
+13. **Category-wide prediction invalidation, full-table rebuilds, and N+1 queries in `Learning` (`gmail_clean/learning.py`)**:
+* `Learning._invalidate_related()` executes `UPDATE predictions SET valid=0 WHERE message_id IN (SELECT id FROM messages WHERE id=? OR sender=? OR category=? OR ...)`. Joining `category=?` with `OR` means reviewing a single `"newsletter"` or `"receipt"` invalidates cached AI predictions for every message in that category across the entire database, while the `json_each(messages.headers_json)` check triggers a full-table scan whenever `list_id` is non-empty.
+
+
+* `Learning.examples_for()` fetches up to 300 candidate rows from `examples` and then executes an individual `SELECT labels_json,category FROM messages WHERE id=?` query inside a Python loop for each candidate instead of using a SQL `LEFT JOIN`.
+
+
+* `Learning.rule_preview()` and `_invalidate_rule_matches()` call `self.store.get_message(row["id"])` in a loop whenever `"template" in conditions`, loading and JSON-parsing full message rows (including `body`) one by one.
+
+
+
+
+14. **Single-thread `QThreadPool` blocks interactive UI actions behind long jobs (`gmail_clean/gui.py`)**: `MainWindow` sets `self.pool.setMaxThreadCount(1)` and submits all work—long cleanup jobs, rule match previews (`_preview_rule`), body downloads (`_fetch_selected_text`), and settings saves (`_save_settings`)—to that single thread pool. Any interactive UI operation triggered while a cleanup job is running sits queued behind the entire job.
+
+
+
+---
+
+### Potential Improvements & Code Hygiene
+
+15. **Tighten `template_key` generation to prevent overly broad suggested archive rules (`gmail_clean/domain.py`, `gmail_clean/learning.py`)**: `template_key()` replaces all standalone numbers with `#` and hashes `[message.sender, list_id, subject]`. If a user manually archives three messages from the same sender that have blank subjects (`""`) or subjects differing only by numbers, `Learning._rebuild_stats()` automatically creates a `suggested` archive rule keyed only on `{"sender": ..., "template": ...}`. Require a minimum normalized subject length or non-empty `list_id` before inferring template-based archive rules.
+
+
+16. **Unify domain-matching semantics across rules, protections, and exclusions (`gmail_clean/domain.py`, `gmail_clean/learning.py`)**: `protections()` and `content_excluded()` match both the exact domain and subdomains (`domain == protected or domain.endswith("." + protected)`). However, `rule_matches()` and `Learning.rule_preview()` only match exact domain equality, whereas `Learning._invalidate_rule_matches()` uses `sender LIKE '%@' + domain`. Standardize subdomain matching across all four functions.
+
+
+17. **Remove deprecated `bleach` dependency and dead HTML sanitization plumbing (`pyproject.toml`, `gmail_clean/gui.py`, `gmail_clean/mime.py`)**: `pyproject.toml` depends on `bleach`, which is deprecated and archived upstream, and `sanitize_preview_html()` parses HTML twice (`BeautifulSoup` followed by `bleach.clean()`). Furthermore, `MainWindow._show_preview()` always calls `self.preview.set_message(prefix + text)` with `html=False`, so neither `sanitize_preview_html()` in `gui.py` nor `sanitize_html()` in `mime.py` is ever invoked outside of tests.
+
+
+18. **Fix packaging, dependency declarations, and incomplete source files (`pyproject.toml`, `gmail_clean/auth.py`, `gmail_clean/runtime.py`, `scripts/package_windows.ps1`, `gmail_clean/service.py`)**:
+* Declare `requests` explicitly in `pyproject.toml` dependencies rather than relying on transitive installation for `import requests` in `AuthManager.disconnect()`.
+
+
+* Add `--collect-data googleapiclient` in `scripts/package_windows.ps1` so PyInstaller bundles the Gmail v1 discovery JSON document required by `build("gmail", "v1", ..., cache_discovery=False)`.
+
+
+* Update `data_directory()` in `gmail_clean/runtime.py` to respect `XDG_DATA_HOME` on Linux and `~/Library/Application Support` on macOS.
+
+
+* Restore the truncated tail of `gmail_clean/service.py` (which cuts off mid-line at `def eligible(self, message, window): if message.acco...`) and include the missing `gmail_clean/storage.py` and `gmail_clean/table_model.py` modules in the repository archive.

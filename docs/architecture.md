@@ -14,13 +14,13 @@ flowchart TD
 
 `domain.py` contains configuration, messages, assessments, frozen windows, canonical hashes, calendar arithmetic, and deterministic recommendations. `gmail.py`, `auth.py`, and `mime.py` implement real Gmail integration and body parsing. `demo.py` supplies a synthetic mailbox; `demo_ai.py` implements the exact external-module surface without network calls. `ai.py` owns prompts, strict response validation, module isolation, and structured error transport. `storage.py` owns schema migrations and thread-affine SQLite access; `learning.py` manages feedback, examples, and rules. `jobs.py` coordinates durable discovery/retrieval/classification. Application/action services compose those parts; the GUI and CLI call the same core behavior.
 
-Gmail clients and database connections belong to their worker. GUI signals carry results back to the main Qt thread. The AI child process has no SQLite connection: it loads one module, processes serializable requests sequentially, and returns text/metadata or a typed error record over IPC. Local termination is recorded as interrupted work, not proof that a remote provider canceled billing.
+Live Gmail clients and database connections belong to their worker. GUI signals carry results back to the main Qt thread. The application reuses isolated AI clients between tasks; calls remain serialized, and a worker closes only its own SQLite connection. The AI child process has no SQLite connection: it loads one module, processes serializable requests sequentially, and returns text/metadata or a typed error record over IPC. Local termination is recorded as interrupted work, not proof that a remote provider canceled billing. The offline DemoMailbox has a synchronized API and can be shared across tasks without repeatedly parsing its state file.
 
 Large tables use SQL filtering/sorting and bounded LRU page caches. They do not create widgets for every record or sort 50,000 cached bodies through an in-memory proxy. Message previews block external resource loading and active content. An explicit click is required to open a link.
 
 ## Runtime locations and account isolation
 
-Default Windows base: `%LOCALAPPDATA%\GmailInboxCleaner\`. Linux development fallback: `~/.local/share/GmailInboxCleaner/`. **`demo`** and **`live`** subdirectories are always separate; a custom `--data-dir` base also receives the appropriate mode subdirectory.
+Default Windows base: `%LOCALAPPDATA%\GmailInboxCleaner\`. Linux uses `$XDG_DATA_HOME/GmailInboxCleaner/`, falling back to `~/.local/share/GmailInboxCleaner/`; macOS uses `~/Library/Application Support/GmailInboxCleaner/`. **`demo`** and **`live`** subdirectories are always separate; a custom `--data-dir` base also receives the appropriate mode subdirectory.
 
 - `mailbox-<account SHA-256 prefix>.sqlite`: account-bound operational database, with SQLite WAL/SHM sidecars while open.
 - `unconnected.sqlite`: disconnected UI state before selecting an account.
@@ -35,7 +35,7 @@ A database binds to one authenticated account. Operational tables retain the acc
 
 ## Schema
 
-Schema migrations use `PRAGMA user_version`; the initial delivered schema is version 3. Migrations run transactionally, and newer unsupported schema versions are rejected. JSON payload columns retain structured/versioned details alongside indexed fields used by queues and UI.
+Schema migrations use `PRAGMA user_version`; the current schema is version 4. The version-4 migration backfills and indexes normalized `messages.list_id`, keeps it synchronized with header updates, and adds learning lookup indexes. Migrations run transactionally, and newer unsupported schema versions are rejected. JSON payload columns retain structured/versioned details alongside indexed fields used by queues and UI.
 
 | Table | Purpose / indexed relationships |
 | --- | --- |
@@ -107,11 +107,17 @@ stateDiagram-v2
 
 Discovery, metadata/body retrieval, classification, review/plan, execution, and undo retain stage-specific records. In-flight work is recovered from durable state after a crash. Pausing or stopping retains checkpoints; it does not roll back completed network work. Authentication and configuration failures pause affected work; known rate/transient conditions use bounded jittered backoff; permanent/unknown failures remain inspectable.
 
+The stage runner still returns a durable `waiting` state when retry items are not due. The desktop refresh timer resumes due waiting jobs when idle; the headless runner waits in interruptible slices of at most 30 seconds and resumes them. Explicitly paused/stopped jobs do not auto-resume. The GUI sends pause/stop signals to the owning worker instead of contending for SQLite writes on the GUI thread. Rule previews and selected-text downloads use a separate pool from long cleanup jobs.
+
+Closing stops new work, requests cooperative cancellation, and aborts isolated AI processes promptly. After a three-second window-close deadline, pools still blocked in external network calls are detached without terminating Qt threads or closing their worker-owned stores from another thread. A standalone launcher then ends its own process after local cleanup and writes `shutdown-notice.log`; WAL transactions and pre-write action attempts support recovery at the next launch. A remote request may still complete or be billed. An embedded `MainWindow` closes its window while the host retains responsibility for remaining workers.
+
 ## Action ledger and undo
 
 An action exists before any network write. It records job/account, explicit target ID, preconditions/context, minimal add/remove label IDs, evidence, policy/model versions, and approval source. Execution re-fetches relevant live state and current label catalog, checks both frozen and current restrictions, and verifies manual decision/protection bypass applicability. A newer reply never expands the approved target list.
 
 Attempts are committed before sending. A lost response or process crash can mean Gmail wrote successfully; the resulting uncertain state is reconciled before replay. Idempotent label effects and durable deduplication reduce duplicate effects without claiming exactly-once execution or atomic compare-and-modify. Another client can change Gmail between preflight and write.
+
+Preflight and readback use metadata batches and phase-local thread caches. Each execution chunk captures one post-write history endpoint, shared by all its receipts. Undo history inspection is limited to 100 pages and rejects repeated page tokens; insufficient evidence becomes a visible conflict. Multipart batching reduces HTTP round trips while retaining per-message requests and quota accounting.
 
 Undo cancels queued actions or reverses applicable original deltas. It preserves unrelated state rather than replacing a whole historical label snapshot. Only changes attributable to the app can be reversed. Later intervening edits, unavailable/deleted labels, protected/manual meanings, missing items, or ambiguous ownership become visible conflicts. Explicit undo may use original IDs outside the current cleanup window; it does not classify those bodies or include new replies.
 

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
-from .domain import Window, context_hash, precondition_hash, protections
+from .domain import Message, Window, context_hash, precondition_hash, protections
 from .runtime import encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
@@ -22,6 +22,36 @@ class ActionExecutor:
 		self.s = service
 		self.db = service.store
 		self._history_evidence_cache = {}
+		self._prefetched_messages: dict[str, Message] = {}
+		self._prefetched_threads: dict[str, list[Message]] = {}
+		self._batch_identity_cache = False
+		self._identity_verified = False
+		self._should_stop: Callable[[], bool] | None = None
+
+	def _stop_requested(self) -> bool:
+		return bool(self._should_stop and self._should_stop())
+
+	def _prefetch(self, message_ids: list[str]) -> None:
+		"""Replace short-lived live-state caches at each safety/readback boundary.
+
+		The Gmail adapter splits HTTP multipart retrieval into its configured
+		batches. Transports lacking that optional bulk method retain the ordinary
+		per-message path; an individual failed bulk part is also retried there.
+		"""
+		self._prefetched_messages.clear()
+		self._prefetched_threads.clear()
+		self._identity_verified = False
+		if self._stop_requested():
+			return
+		if len(message_ids) > 1 and callable(getattr(self.s.mailbox, "get_messages", None)):
+			try:
+				results = self.s.mailbox.get_messages(message_ids, body=False)
+			except Exception:
+				# A failed multipart transport does not establish any item's state.
+				# Individual preflight reads isolate and report affected failures.
+				return
+			self._prefetched_messages.update({mid: value for mid, value in results.items()
+				if mid in message_ids and isinstance(value, Message) and value.id == mid})
 
 	def plan(self, job_id, message, action, label_ids, reason, approval, window: Window, bypass=()) -> str:
 		if action not in {"archive", "label"}:
@@ -53,17 +83,39 @@ class ActionExecutor:
 			self.db.execute("UPDATE actions SET state=?,reason=?,updated_at=? WHERE id=?", (state, reason, stamp(), aid))
 
 	def verify_identity(self) -> None:
+		if self._batch_identity_cache and self._identity_verified:
+			return
 		if self.s.mailbox.identity().casefold() != self.s.account_id.casefold():
 			raise ValueError("Authenticated Gmail account does not match this action ledger")
+		if self._batch_identity_cache:
+			self._identity_verified = True
+
+	def _checkpoint(self) -> str:
+		profile = self.s.mailbox.profile()
+		identity = profile.get("emailAddress")
+		if identity is not None and str(identity).casefold() != self.s.account_id.casefold():
+			raise ValueError("Authenticated Gmail account does not match this action ledger")
+		return str(profile["historyId"])
 
 	def live_state(self, action):
-		message = self.s.mailbox.get_message(action["message_id"], body=False)
-		members = self.s.mailbox.thread_metadata(message.thread_id)
+		message = self._prefetched_messages.pop(action["message_id"], None)
+		if message is None:
+			message = self.s.mailbox.get_message(action["message_id"], body=False)
+		if self._batch_identity_cache:
+			if message.thread_id not in self._prefetched_threads:
+				self._prefetched_threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+			members = self._prefetched_threads[message.thread_id]
+		else:
+			members = self.s.mailbox.thread_metadata(message.thread_id)
 		message.context_version = context_hash(members, self.s.config.sent_context_enabled)
 		return message
 
 	def preflight(self, action: dict):
 		self.s.reload_config()
+		# Rule/example edits and explicit review can invalidate the durable action
+		# without changing Config.revision. Never trust the earlier queue snapshot.
+		if not self._pending(action):
+			return None
 		if self.s.config.dry_run:
 			self.mark(action["id"], "proposed", "Simulation enabled before execution; no mailbox write")
 			return None
@@ -110,10 +162,31 @@ class ActionExecutor:
 			return None
 		return message
 
-	def apply(self, action_ids=None, job_id=None) -> dict:
+	def _pending(self, action: dict) -> bool:
+		current = self.db.one("SELECT state FROM actions WHERE id=?", (action["id"],))
+		return bool(current and current["state"] in {"queued", "proposed", "retry"})
+
+	def apply(self, action_ids=None, job_id=None, should_stop: Callable[[], bool] | None = None) -> dict:
+		self._batch_identity_cache = True
+		self._identity_verified = False
+		self._should_stop = should_stop
+		try:
+			return self._apply(action_ids, job_id)
+		finally:
+			# Neither another command nor a canceled/failed request may reuse stale
+			# live state, identity evidence, or a prior command's stop callback.
+			self._prefetched_messages.clear()
+			self._prefetched_threads.clear()
+			self._batch_identity_cache = False
+			self._identity_verified = False
+			self._should_stop = None
+
+	def _apply(self, action_ids=None, job_id=None) -> dict:
 		self.s.reload_config()
 		if self.s.config.dry_run:
 			return {"applied": 0, "dry_run": True, "message": "Simulation: no mailbox changes"}
+		if self._stop_requested():
+			return {"applied": 0, "dry_run": False, "stopped": True}
 		self.verify_identity()
 		self.s.refresh_labels()
 		where = "state IN ('queued','proposed','uncertain','executing','retry')"
@@ -129,7 +202,10 @@ class ActionExecutor:
 		actions = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY created_at,id", params)
 		groups = defaultdict(list)
 		applied = 0
+		self._prefetch([action["message_id"] for action in actions if action["state"] not in {"uncertain", "executing"}])
 		for action in actions:
+			if self._stop_requested():
+				break
 			try:
 				if action["state"] in {"uncertain", "executing"}:
 					self.recover(action)
@@ -148,12 +224,17 @@ class ActionExecutor:
 				self.mark(action["id"], "conflict", safe_error(exc))
 		for (add, remove), group in groups.items():
 			for offset in range(0, len(group), self.s.config.execution_batch_size):
+				if self._stop_requested():
+					return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 				chunk = group[offset:offset + self.s.config.execution_batch_size]
+				self._prefetch([action["message_id"] for action, _ in chunk])
 				self.s.refresh_labels()
 				ready = []
 				# Recheck immediately before the request, rather than relying on a long
 				# preflight for the first item of a 50,000-item execution queue.
 				for action, _ in chunk:
+					if self._stop_requested():
+						break
 					try:
 						message = self.preflight(action)
 						if message is not None:
@@ -171,6 +252,8 @@ class ActionExecutor:
 					continue
 				unchanged = []
 				for action, message in ready:
+					if not self._pending(action):
+						continue
 					if action["policy_version"] != self.s.config.revision:
 						self.mark(action["id"], "conflict" if action["undo_of"] else "stale", "Settings changed during final preflight; replan")
 					else:
@@ -178,15 +261,29 @@ class ActionExecutor:
 				ready = unchanged
 				if not ready:
 					continue
+				if self._stop_requested():
+					return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 				# Persist the start of the write interval. A receipt checkpoint taken
 				# only after readback could skip a concurrent user edit before undo.
-				before_write_history_id = str(self.s.mailbox.profile()["historyId"])
+				before_write_history_id = self._checkpoint()
 				with self.db.transaction():
+					# Check again after the network checkpoint, under the transaction
+					# that claims these intents. Another local worker may have edited
+					# a matching rule while the profile request was in flight.
+					ready = [(action, message) for action, message in ready if self._pending(action)]
 					for action, message in ready:
 						attempt = identifier()
 						insert(self.db, "attempts", {"id": attempt, "action_id": action["id"], "state": "sending", "before_json": encode(sorted(message.labels)), "started_at": stamp(), "payload_json": encode({"add": add, "remove": remove, "before_write_history_id": before_write_history_id})})
 						self.db.execute("UPDATE actions SET state='executing',attempt_id=?,before_json=?,updated_at=? WHERE id=?", (attempt, encode(sorted(message.labels)), stamp(), action["id"]))
+				if not ready:
+					continue
 				try:
+					if self._stop_requested():
+						with self.db.transaction():
+							for action, _ in ready:
+								self.db.execute("UPDATE attempts SET state='cancelled_before_send',finished_at=? WHERE action_id=? AND state='sending'", (stamp(), action["id"]))
+								self.mark(action["id"], "queued", "Stopped before the network write")
+						return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 					self.s.mailbox.modify([action["message_id"] for action, _ in ready], list(add), list(remove))
 				except Exception as exc:
 					# Even a lost response can follow a successful Gmail commit.
@@ -194,17 +291,34 @@ class ActionExecutor:
 						self.mark(action["id"], "uncertain", "Write outcome unknown; reconcile before retry")
 						self.s.error("execution", exc, job_id=action["job_id"], message_id=action["message_id"])
 					continue
-				for action, before in ready:
+				if self._stop_requested():
+					for action, _ in ready:
+						self.mark(action["id"], "uncertain", "Stopped after write; reconcile before retry")
+					return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
+				try:
+					after_write_history_id = self._checkpoint()
+				except Exception as exc:
+					for action, _ in ready:
+						self.mark(action["id"], "uncertain", safe_error(exc))
+					continue
+				self._prefetch([action["message_id"] for action, _ in ready])
+				for index, (action, before) in enumerate(ready):
+					if self._stop_requested():
+						for pending, _ in ready[index:]:
+							self.mark(pending["id"], "uncertain", "Stopped after write; reconcile before retry")
+						return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 					try:
-						after = self.s.mailbox.get_message(action["message_id"], body=False)
+						after = self._prefetched_messages.pop(action["message_id"], None)
+						if after is None:
+							after = self.s.mailbox.get_message(action["message_id"], body=False)
 						if set(add) <= after.labels and not (set(remove) & after.labels):
-							self.receipt(action, before, after, "applied", ownership="confirmed_response")
+							self.receipt(action, before, after, "applied", ownership="confirmed_response", end_history_id=after_write_history_id)
 							applied += 1
 						else:
 							self.mark(action["id"], "conflict", "Readback did not confirm all requested effects")
 					except Exception as exc:
 						self.mark(action["id"], "uncertain", safe_error(exc))
-		return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run}
+		return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": self._stop_requested()}
 
 	def _history_interval(self, start, end):
 		"""Read exact specific transitions through a captured checkpoint, with replay deduplication."""
@@ -220,6 +334,8 @@ class ActionExecutor:
 			events = []
 			seen = set()
 			for _ in range(100):
+				if self._stop_requested():
+					raise ValueError("Receipt inspection interrupted")
 				page = self.s.mailbox.history(str(start), token)
 				if int(page.get("historyId", "0")) < end_number:
 					raise ValueError("History did not cover the receipt checkpoint")
@@ -251,9 +367,9 @@ class ActionExecutor:
 		self._history_evidence_cache[key] = result
 		return result
 
-	def receipt(self, action, before, after, state, ownership):
+	def receipt(self, action, before, after, state, ownership, *, end_history_id: str | None = None):
 		payload = json.loads(action["payload_json"])
-		end = str(self.s.mailbox.profile()["historyId"])
+		end = str(end_history_id) if end_history_id is not None else self._checkpoint()
 		payload["receipt_history_id"] = end
 		attempt = self.db.one("SELECT t.payload_json FROM attempts t JOIN actions a ON a.attempt_id=t.id WHERE a.id=?", (action["id"],))
 		attempt_payload = json.loads(attempt["payload_json"]) if attempt else {}
@@ -300,9 +416,11 @@ class ActionExecutor:
 		else:
 			self.mark(action["id"], "conflict", "Partial/ambiguous effects after uncertain attempt")
 
-	def undo(self, action_ids) -> dict:
+	def undo(self, action_ids, should_stop: Callable[[], bool] | None = None) -> dict:
 		queued = []
 		for aid in action_ids:
+			if should_stop and should_stop():
+				break
 			action = self.db.one("SELECT * FROM actions WHERE id=?", (aid,))
 			if not action:
 				continue
@@ -328,8 +446,8 @@ class ActionExecutor:
 			insert(self.db, "actions", {"id": uid, "job_id": action["job_id"], "message_id": action["message_id"], "state": "proposed" if self.s.config.dry_run else "queued", "action": "undo", "add_json": action["remove_json"], "remove_json": action["add_json"], "before_json": action["after_json"], "context_version": action["context_version"], "policy_version": self.s.config.revision, "approval": "manual", "reason": "Explicit undo of recorded app-owned changes", "undo_of": aid, "created_at": stamp(), "updated_at": stamp(), "payload_json": encode(payload)})
 			queued.append(uid)
 		if queued and not self.s.config.dry_run:
-			return self.apply(queued)
-		return {"queued": len(queued), "dry_run": self.s.config.dry_run}
+			return self.apply(queued, should_stop=should_stop)
+		return {"queued": len(queued), "dry_run": self.s.config.dry_run, "stopped": bool(should_stop and should_stop())}
 
 	def preflight_undo(self, action, message, payload, add, remove):
 		original = self.db.one("SELECT * FROM actions WHERE id=?", (action["undo_of"],))
@@ -350,7 +468,11 @@ class ActionExecutor:
 			return None
 		try:
 			token = None
-			while True:
+			tokens = set()
+			for _ in range(100):
+				if self._stop_requested():
+					self.mark(action["id"], "queued", "Undo paused before history inspection finished")
+					return None
 				page = self.s.mailbox.history(str(checkpoint), token)
 				for event in page.get("history", []):
 					for kind in ("labelsAdded", "labelsRemoved", "messagesDeleted"):
@@ -361,6 +483,11 @@ class ActionExecutor:
 				token = page.get("nextPageToken")
 				if not token:
 					break
+				if token in tokens:
+					raise ValueError("Repeated Gmail history page token")
+				tokens.add(token)
+			else:
+				raise ValueError("History interval exceeds bounded undo inspection")
 		except Exception:
 			self.mark(action["id"], "conflict", "Gmail history cannot establish safe undo ownership")
 			return None

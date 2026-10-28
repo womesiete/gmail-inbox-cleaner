@@ -1,6 +1,13 @@
 from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 import json
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
 
 import pytest
 
@@ -215,3 +222,174 @@ def test_real_adapter_respects_configured_body_character_limit_above_default():
 	box = GmailMailbox(service, body_limit=70_000)
 	message = box.get_message("large", body=True)
 	assert len(message.body) == 70_000 and message.truncated
+
+
+def test_demo_instances_observe_commits_without_reparsing_unchanged_state(tmp_path, monkeypatch):
+	path = tmp_path / "demo.json"
+	parent = DemoMailbox(path, count=40)
+	worker = DemoMailbox(path)
+	mid = next(message.id for message in parent.messages.values() if "INBOX" in message.labels)
+	loads = []
+	original_load = parent._load_from_disk
+	def tracked_load():
+		loads.append(True)
+		return original_load()
+	monkeypatch.setattr(parent, "_load_from_disk", tracked_load)
+	start = parent.profile()["historyId"]
+	for _ in range(3):
+		parent.get_message(mid)
+		parent.get_messages([mid])
+		parent.labels()
+		parent.thread_metadata(parent.messages[mid].thread_id)
+		parent.history(start)
+	assert not loads
+	worker.modify([mid], ["label_records"], ["INBOX"])
+	assert parent.profile()["historyId"] != start
+	assert "label_records" in parent.get_messages([mid])[mid].labels
+	assert "INBOX" not in parent.get_message(mid).labels
+	assert mid not in {item["id"] for item in parent.list_messages("label:INBOX")["messages"]}
+	assert parent.history(start)["history"]
+	new = Message("added", "new-thread", epoch_ms(datetime.now(UTC)), {"INBOX"}, body="synthetic", account_id=DEMO_ACCOUNT)
+	worker.add_message(new)
+	assert [message.id for message in parent.thread_metadata("new-thread")] == ["added"]
+	worker._labels[0]["name"] = "Renamed synthetic label"
+	worker._save()
+	assert parent.labels()[0]["name"] == "Renamed synthetic label"
+	assert len(loads) == 3  # One reload per committed disk generation, never per read.
+
+
+def test_concurrent_demo_adapters_preserve_both_label_changes_and_unique_history(tmp_path):
+	path = tmp_path / "demo.json"
+	first = DemoMailbox(path, count=40)
+	second = DemoMailbox(path)
+	mid = next(iter(first.messages))
+	barrier = threading.Barrier(2)
+	def write(item):
+		box, label = item
+		barrier.wait(timeout=10)
+		box.modify([mid], [label], [])
+	with ThreadPoolExecutor(max_workers=2) as pool:
+		list(pool.map(write, [(first, "label_records"), (second, "label_personal")]))
+	assert {"label_records", "label_personal"} <= first.get_message(mid).labels
+	assert first.get_message(mid).labels == second.get_message(mid).labels
+	assert len({event["id"] for event in first.history("1")["history"]}) == 2
+	assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_changed_demo_read_holds_the_cross_process_replace_lock(tmp_path, monkeypatch):
+	path = tmp_path / "demo.json"
+	reader = DemoMailbox(path, count=40)
+	writer = DemoMailbox(path)
+	mid = next(iter(reader.messages))
+	writer.modify([mid], ["label_personal"], [])
+	inside = []
+	original_lock = reader._disk_write_lock
+	original_load = reader._load_from_disk
+	@contextmanager
+	def tracked_lock():
+		with original_lock():
+			inside.append(True)
+			try:
+				yield
+			finally:
+				inside.pop()
+	def guarded_load():
+		# A reader's open file handle must participate in the same OS lock used
+		# by replacement writers; this catches the Windows share-delete race
+		# deterministically rather than relying on a narrow scheduling window.
+		assert inside
+		return original_load()
+	monkeypatch.setattr(reader, "_disk_write_lock", tracked_lock)
+	monkeypatch.setattr(reader, "_load_from_disk", guarded_load)
+	assert "label_personal" in reader.get_message(mid).labels
+	assert not inside
+
+
+def test_demo_processes_serialize_read_modify_write(tmp_path):
+	path = tmp_path / "demo.json"
+	box = DemoMailbox(path, count=40)
+	mid = next(iter(box.messages))
+	go = tmp_path / "go"
+	code = """import sys,time
+from pathlib import Path
+from gmail_clean.demo import DemoMailbox
+box=DemoMailbox(sys.argv[1])
+original=box._save
+def slow_save():
+\ttime.sleep(0.1)
+\toriginal()
+box._save=slow_save
+Path(sys.argv[4]).write_text('ready')
+deadline=time.monotonic()+30
+while not Path(sys.argv[5]).exists():
+\tif time.monotonic()>deadline: raise RuntimeError('parent did not release barrier')
+\ttime.sleep(0.01)
+box.modify([sys.argv[2]],[sys.argv[3]],[])
+"""
+	processes = []
+	try:
+		for index, label in enumerate(("label_records", "label_personal")):
+			processes.append(subprocess.Popen([sys.executable, "-c", code, str(path), mid, label, str(tmp_path / f"ready-{index}"), str(go)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+		deadline = time.monotonic() + 30
+		while not all((tmp_path / f"ready-{index}").exists() for index in range(2)):
+			assert time.monotonic() < deadline, "Demo processes did not reach the shared write barrier"
+			time.sleep(0.01)
+		go.write_text("go")
+		for process in processes:
+			stdout, stderr = process.communicate(timeout=30)
+			assert process.returncode == 0, stdout + stderr
+	finally:
+		for process in processes:
+			if process.poll() is None:
+				process.terminate()
+				process.wait(timeout=10)
+	assert {"label_records", "label_personal"} <= box.get_message(mid).labels
+	assert len(box.history("1")["history"]) == 2
+	assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_failed_demo_atomic_replace_keeps_previous_state_and_cleans_unique_temporary(tmp_path, monkeypatch):
+	from gmail_clean import demo
+	path = tmp_path / "demo.json"
+	box = DemoMailbox(path, count=40)
+	mid = next(iter(box.messages))
+	before = path.read_bytes()
+	seen = []
+	def failed_replace(source, target):
+		seen.append(Path(source).name)
+		raise PermissionError("synthetic atomic replace failure")
+	monkeypatch.setattr(demo.os, "replace", failed_replace)
+	with pytest.raises(PermissionError):
+		box.modify([mid], ["label_personal"], [])
+	assert path.read_bytes() == before
+	assert "label_personal" not in box.get_message(mid).labels
+	assert seen[0].startswith("demo.json.") and seen[0].endswith(".tmp")
+	assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_protected_token_saves_use_distinct_temporary_files_and_cleanup_on_failure(tmp_path, monkeypatch):
+	from gmail_clean import auth
+	store = TokenStore(tmp_path)
+	monkeypatch.setattr(TokenStore, "_keyring", staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("unavailable"))))
+	monkeypatch.setattr(TokenStore, "_dpapi", staticmethod(lambda data, encrypt: b"encrypted:" + data if encrypt else data.removeprefix(b"encrypted:")))
+	original_replace = auth.os.replace
+	barrier = threading.Barrier(2)
+	paths = []
+	def concurrent_replace(source, target):
+		paths.append(Path(source))
+		barrier.wait(timeout=10)
+		original_replace(source, target)
+	monkeypatch.setattr(auth.os, "replace", concurrent_replace)
+	def save_token(token):
+		store.save(SimpleNamespace(refresh_token=token, token_uri="uri", client_id="id", client_secret="secret", scopes=["modify"]))
+	with ThreadPoolExecutor(max_workers=2) as pool:
+		list(pool.map(save_token, ["synthetic-first", "synthetic-second"]))
+	assert len(set(paths)) == 2
+	assert store.load()["refresh_token"] in {"synthetic-first", "synthetic-second"}
+	assert not list(tmp_path.glob("*.tmp"))
+	def failed_replace(source, target):
+		raise PermissionError("synthetic replace failure")
+	monkeypatch.setattr(auth.os, "replace", failed_replace)
+	with pytest.raises(PermissionError):
+		save_token("synthetic-third")
+	assert not list(tmp_path.glob("*.tmp"))

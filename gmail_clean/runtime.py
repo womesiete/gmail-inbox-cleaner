@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,12 @@ def identifier() -> str:
 
 
 def data_directory(demo: bool = False) -> Path:
-	base = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local" / "share"))
+	if os.environ.get("LOCALAPPDATA"):
+		base = Path(os.environ["LOCALAPPDATA"])
+	elif sys.platform == "darwin":
+		base = Path.home() / "Library" / "Application Support"
+	else:
+		base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 	return base / "GmailInboxCleaner" / ("demo" if demo else "live")
 
 

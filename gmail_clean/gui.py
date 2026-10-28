@@ -7,11 +7,10 @@ from pathlib import Path
 import sqlite3
 import threading
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-import bleach
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 from PyQt6.QtCore import (QByteArray, QLockFile, QObject, QRunnable, QSettings,
 	Qt, QThreadPool, QTimer, QUrl, QItemSelectionModel, pyqtSignal, pyqtSlot)
 from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
@@ -28,6 +27,48 @@ from .table_model import Column, SqlTableModel
 
 
 UTC = timezone.utc
+_DRAINING_WORK = []
+
+
+class _DrainingWork(QObject):
+	"""Keep detached pools alive until their own workers release resources.
+
+	A pool's destructor waits for running QRunnables. Closing a window must not
+	delete that pool or a worker-owned SQLite connection from the GUI thread.
+	This owner drains independently after the UI has stopped accepting results.
+	"""
+	def __init__(self, pools, tasks):
+		super().__init__()
+		self.pools, self.tasks = list(pools), dict(tasks)
+		self._drained = False
+		for pool in self.pools:
+			pool.setParent(None)
+		self.timer = QTimer(self)
+		self.timer.setInterval(100)
+		self.timer.timeout.connect(self._check)
+		for task in self.tasks.values():
+			task.signals.finished.connect(self._finished, Qt.ConnectionType.QueuedConnection)
+		_DRAINING_WORK.append(self)
+		self.timer.start()
+
+	@pyqtSlot(str)
+	def _finished(self, task_id):
+		self.tasks.pop(task_id, None)
+		self._check()
+
+	def _check(self):
+		if self._drained:
+			return
+		if any(pool.activeThreadCount() for pool in self.pools):
+			return
+		self._drained = True
+		self.timer.stop()
+		self.tasks.clear()
+		for pool in self.pools:
+			pool.deleteLater()
+		self.pools.clear()
+		_DRAINING_WORK.remove(self)
+		self.deleteLater()
 
 
 def preferences(demo: bool = False) -> QSettings:
@@ -72,13 +113,28 @@ def acquire_instance_lock(data_dir: str | Path) -> QLockFile:
 def sanitize_preview_html(value: str) -> str:
 	"""Strip active content before Qt sees it; resources are independently blocked."""
 	soup = BeautifulSoup(value, "html.parser")
-	for tag in soup(["script", "style", "iframe", "object", "embed", "form", "input", "img", "svg", "math", "link", "meta"]):
+	for tag in soup(["script", "style", "iframe", "object", "embed", "form", "input", "img", "svg", "math", "link", "meta", "head", "noscript"]):
 		tag.decompose()
-	return bleach.clean(str(soup), tags={"p", "br", "b", "i", "strong", "em",
+	for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+		comment.extract()
+	allowed_tags = {"p", "br", "b", "i", "strong", "em",
 		"ul", "ol", "li", "blockquote", "pre", "code", "table", "thead", "tbody",
-		"tr", "td", "th", "a", "hr", "h1", "h2", "h3"},
-		attributes={"a": ["href", "title"]}, protocols={"https", "http", "mailto"},
-		strip=True, strip_comments=True)
+		"tr", "td", "th", "a", "hr", "h1", "h2", "h3"}
+	for tag in list(soup.find_all(True)):
+		if tag.name not in allowed_tags:
+			tag.unwrap()
+		elif tag.name == "a":
+			tag.attrs = {key: value for key, value in tag.attrs.items() if key in {"href", "title"}}
+			if "href" in tag.attrs:
+				try:
+					allowed = urlsplit(str(tag["href"]).strip()).scheme.casefold() in {"http", "https", "mailto"}
+				except ValueError:
+					allowed = False
+				if not allowed:
+					del tag["href"]
+		else:
+			tag.attrs = {}
+	return str(soup)
 
 
 class SafePreview(QTextBrowser):
@@ -117,9 +173,14 @@ class ServiceTask(QRunnable):
 		super().__init__()
 		self.task_id, self.service, self.operation = task_id, service, operation
 		self.signals = TaskSignals()
+		self.started = threading.Event()
+		self.cancelled = threading.Event()
 
 	def run(self):
+		self.started.set()
 		try:
+			if self.cancelled.is_set():
+				return
 			with self.service.worker() as worker:
 				try:
 					result = self.operation(worker, lambda text: self.signals.progress.emit(self.task_id, str(text)))
@@ -417,13 +478,21 @@ class MainWindow(QMainWindow):
 		self.settings = settings or preferences(bool(service.demo))
 		self.pool = QThreadPool(self)
 		self.pool.setMaxThreadCount(1)
+		self.preview_pool = QThreadPool(self)
+		self.preview_pool.setMaxThreadCount(1)
 		self.tasks, self.callbacks = {}, {}
 		self.models, self.views, self.model_specs = {}, {}, {}
 		self.stop_event = threading.Event()
+		self._requested_control_state = None
+		self._job_task_id = None
 		self.current_job_id = None
 		self._running_job = False
 		self._closing = False
 		self._resources_closed = False
+		self.shutdown_incomplete = False
+		self._close_deadline = QTimer(self)
+		self._close_deadline.setSingleShot(True)
+		self._close_deadline.timeout.connect(self._force_close)
 		self._last_action_ids = []
 		self._reader = None
 		self.setWindowTitle("Gmail Inbox Cleaner" + (" · Offline demo" if service.demo else ""))
@@ -641,7 +710,7 @@ class MainWindow(QMainWindow):
 		groups.setMaximumHeight(200)
 		layout.addWidget(groups)
 		bar = QHBoxLayout()
-		bar.addWidget(self._button("Recompute recommendations", lambda: self._submit("Replan", lambda svc, p: svc.replan())))
+		bar.addWidget(self._button("Recompute recommendations", lambda: self._submit("Replan", lambda svc, p: svc.replan(should_stop=self.stop_event.is_set))))
 		bar.addWidget(self._button("Apply selected approved", lambda: self.apply_plan(False)))
 		bar.addWidget(self._button("Apply all approved", lambda: self.apply_plan(True)))
 		bar.addWidget(self._button("Cancel selected / undo queued", lambda: self.undo_selected("plan")))
@@ -867,10 +936,29 @@ class MainWindow(QMainWindow):
 		metrics = self._query("SELECT action,COUNT(DISTINCT CASE WHEN group_id='' THEN id ELSE group_id END) n FROM feedback WHERE source='manual' GROUP BY action")
 		self.learning_summary.setText("Reviewed independent events · " + " · ".join(f"{r['action']}: {r['n']}" for r in metrics) +
 			". These counts measure explicit feedback; automatic decisions are not accuracy successes. Inferred archive rules require enablement.")
+		self._resume_due_retry()
 
-	def _submit(self, title, operation, callback=None):
+	def _resume_due_retry(self):
+		"""Resume durable retry work when its deadline arrives, never paused jobs."""
+		if self.tasks or self._running_job or self._closing:
+			return False
+		due = self._query("SELECT j.id FROM jobs j WHERE j.state IN ('waiting','retry') AND EXISTS "
+			"(SELECT 1 FROM work_items w WHERE w.job_id=j.id AND w.state='retry' "
+			"AND (w.next_attempt_utc IS NULL OR julianday(w.next_attempt_utc)<=julianday(?))) "
+			"ORDER BY CASE WHEN j.id=? THEN 0 ELSE 1 END,j.created_at LIMIT 1",
+			(datetime.now(UTC).isoformat(), self.current_job_id))
+		if not due:
+			return False
+		self.current_job_id = due[0]["id"]
+		self.resume_job(self.current_job_id)
+		return True
+
+	def _submit(self, title, operation, callback=None, *, pool=None):
 		if self._closing:
 			return
+		if not self.tasks and not self._running_job:
+			self.stop_event.clear()
+			self._requested_control_state = None
 		task_id = uuid.uuid4().hex
 		task = ServiceTask(task_id, self.service, operation)
 		task.signals.progress.connect(self._on_progress, Qt.ConnectionType.QueuedConnection)
@@ -880,11 +968,13 @@ class MainWindow(QMainWindow):
 		self.tasks[task_id] = task
 		self.callbacks[task_id] = callback
 		self.statusBar().showMessage(title)
-		self.pool.start(task)
+		(self.pool if pool is None else pool).start(task)
 		return task_id
 
 	@pyqtSlot(str, str)
 	def _on_progress(self, task_id, text):
+		if self._closing:
+			return
 		self.statusBar().showMessage(text)
 		self.job_status.setText(text)
 		if text.startswith("Started job "):
@@ -895,6 +985,8 @@ class MainWindow(QMainWindow):
 	@pyqtSlot(str, object)
 	def _on_result(self, task_id, result):
 		callback = self.callbacks.pop(task_id, None)
+		if self._closing:
+			return
 		if hasattr(self.service, "refresh_connection") and self.service.refresh_connection():
 			self._connect_reader()
 			old_editor = self.settings_editor
@@ -912,15 +1004,31 @@ class MainWindow(QMainWindow):
 	@pyqtSlot(str, str)
 	def _on_error(self, task_id, summary):
 		self.callbacks.pop(task_id, None)
+		if self._closing:
+			return
 		self.statusBar().showMessage(summary)
 		self.job_status.setText(summary)
 		self.refresh(force=True)
 
 	@pyqtSlot(str)
 	def _on_finished(self, task_id):
+		finished_job = task_id == self._job_task_id
 		self.tasks.pop(task_id, None)
+		self.callbacks.pop(task_id, None)
+		if finished_job or self._job_task_id not in self.tasks:
+			self._job_task_id = None
+		self._running_job = self._job_task_id is not None
+		if finished_job and not self._closing and self._requested_control_state and self.current_job_id:
+			# A click can arrive after JobRunner's final stop check but before its
+			# finished signal. Persist that last control request asynchronously too.
+			job_id, state = self.current_job_id, self._requested_control_state
+			self._submit("Saving requested job control", lambda svc, p: svc.control_job(job_id, state))
 		if not self.tasks:
-			self._running_job = False
+			if not self._closing:
+				# Pause/stop is durable in the job row. Its in-memory cancellation
+				# token must not cancel later independent review or preview actions.
+				self.stop_event.clear()
+				self._requested_control_state = None
 			self.refresh(force=True)
 		if self._closing and not self.tasks:
 			self.close()
@@ -930,14 +1038,15 @@ class MainWindow(QMainWindow):
 			self.statusBar().showMessage("A job is already running. Pause or stop it before starting another.")
 			return
 		self.stop_event.clear()
+		self._requested_control_state = None
 		self._running_job = True
 		self.progress.setRange(0, 0)
 		def operation(svc, progress):
 			job_id = svc.new_job()
 			progress(f"Started job {job_id}")
-			svc.run_job(job_id, progress=progress, should_stop=self.stop_event.is_set)
+			svc.run_job(job_id, progress=progress, should_stop=lambda: self._requested_control_state or self.stop_event.is_set())
 			return job_id
-		self._submit("Discovering eligible inbox messages", operation, self._job_complete)
+		self._job_task_id = self._submit("Discovering eligible inbox messages", operation, self._job_complete)
 
 	def _job_complete(self, job_id):
 		self.current_job_id = job_id
@@ -951,30 +1060,35 @@ class MainWindow(QMainWindow):
 		self._refresh_plan_groups()
 		self.refresh()
 
-	def resume_job(self):
+	def resume_job(self, job_id=None):
 		if self._running_job:
 			return
 		ids = self._selected_ids("jobs")
-		job_id = ids[0] if ids else self.current_job_id
+		job_id = job_id or (ids[0] if ids else self.current_job_id)
 		if not job_id:
 			self.statusBar().showMessage("Select a saved job to resume.")
 			return
 		self.current_job_id = job_id
 		self.stop_event.clear()
+		self._requested_control_state = None
 		self._running_job = True
 		self.progress.setRange(0, 0)
 		def operation(svc, progress):
 			svc.control_job(job_id, "pending")
-			svc.run_job(job_id, progress=progress, should_stop=self.stop_event.is_set)
+			svc.run_job(job_id, progress=progress, should_stop=lambda: self._requested_control_state or self.stop_event.is_set())
 			return job_id
-		self._submit("Resuming frozen job", operation, self._job_complete)
+		self._job_task_id = self._submit("Resuming frozen job", operation, self._job_complete)
 
 	def _control(self, state):
+		self._requested_control_state = state
 		self.stop_event.set()
 		ids = self._selected_ids("jobs")
 		job_id = self.current_job_id or (ids[0] if ids else None)
-		if job_id:
-			self.service.control_job(job_id, state)
+		if job_id and self._job_task_id not in self.tasks:
+			# This is still asynchronous: an external connection may hold a write
+			# transaction, and a preview/label worker cannot consume JobRunner's
+			# cooperative stop signal for a waiting or already-finished job.
+			self._submit("Saving requested job control", lambda svc, p: svc.control_job(job_id, state))
 		self.job_status.setText(f"{state.capitalize()} requested. Current AI/provider call may finish; remote cancellation is not guaranteed.")
 
 	def _configure_maintenance(self, checked=None):
@@ -987,7 +1101,9 @@ class MainWindow(QMainWindow):
 			self.maintenance_timer.start(max(1, self.service.config.maintenance_interval_minutes) * 60_000)
 
 	def _maintenance_tick(self):
-		if self.tasks or (not self.service.demo and self.service.account_id in {"", "unconnected", None}):
+		if self._closing or self.tasks or (not self.service.demo and self.service.account_id in {"", "unconnected", None}):
+			return
+		if self._resume_due_retry():
 			return
 		active = self._query("SELECT COUNT(*) n FROM jobs WHERE state IN ('pending','running','paused','waiting','retry')")
 		if not active or not active[0]["n"]:
@@ -1153,15 +1269,15 @@ class MainWindow(QMainWindow):
 		def operation(svc, progress):
 			return svc.manual(ids, action, label_ids=label_ids, reason=reason, scope=scope, defer_until=defer_until,
 				displayed_revision=displayed_revision, displayed_protections=displayed_protections,
-				displayed_context_versions=displayed_context_versions)
+				displayed_context_versions=displayed_context_versions, should_stop=self.stop_event.is_set)
 		self._submit(f"Reviewing {len(ids)} explicit message IDs", operation,
 			lambda result: setattr(self, "_last_action_ids", result or []))
 
 	def _fetch_selected_text(self):
 		ids = self._selected_ids("review")
 		if ids:
-			self._submit("Fetching eligible text without marking read", lambda svc, p: svc.download_bodies(ids),
-				lambda result: self._show_preview(self.views["review"].currentIndex()))
+			self._submit("Fetching eligible text without marking read", lambda svc, p: svc.download_bodies(ids, should_stop=self.stop_event.is_set),
+				lambda result: self._show_preview(self.views["review"].currentIndex()), pool=self.preview_pool)
 
 	def open_gmail(self):
 		rows = self._selected("review")
@@ -1192,7 +1308,7 @@ class MainWindow(QMainWindow):
 		if not all_approved and not ids:
 			return
 		self._submit("Applying approved plans" if not self.service.config.dry_run else "Simulating approved plans",
-			lambda svc, p: svc.apply_actions(action_ids=ids))
+			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set))
 
 	def _undo_scope_changed(self, *args):
 		self._describe_undo_scope(self._selected("history"))
@@ -1212,7 +1328,7 @@ class MainWindow(QMainWindow):
 		if not ids:
 			return
 		self._describe_undo_scope(rows)
-		self._submit(f"Undoing {len(ids)} recorded actions", lambda svc, p: svc.undo(ids))
+		self._submit(f"Undoing {len(ids)} recorded actions", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
 
 	def _undo_job(self):
 		rows = self._selected("history")
@@ -1223,7 +1339,7 @@ class MainWindow(QMainWindow):
 		actions = self._query(f"SELECT a.id,a.message_id,m.internal_ms FROM actions a LEFT JOIN messages m ON m.id=a.message_id WHERE a.job_id IN ({placeholders}) AND a.undo_of IS NULL", tuple(job_ids))
 		ids = [row["id"] for row in actions]
 		self._describe_undo_scope(actions)
-		self._submit(f"Undoing {len(ids)} original actions from {len(job_ids)} cleanup jobs", lambda svc, p: svc.undo(ids))
+		self._submit(f"Undoing {len(ids)} original actions from {len(job_ids)} cleanup jobs", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
 
 	def _filter_history(self, text):
 		if "history" in self.models:
@@ -1267,6 +1383,8 @@ class MainWindow(QMainWindow):
 			cursor = svc.store.conn.execute("SELECT id,thread_id,internal_ms,labels_json,headers_json,category,decision FROM messages WHERE in_inbox=1 AND internal_ms < ?", (window.latest_ms,))
 			count, protected, exceptions, samples = 0, 0, 0, []
 			while True:
+				if self.stop_event.is_set():
+					return "Rule preview stopped."
 				batch = cursor.fetchmany(128)
 				if not batch:
 					break
@@ -1288,7 +1406,7 @@ class MainWindow(QMainWindow):
 				dialog.summary.setText(result)
 			except RuntimeError:
 				pass  # Dialog may have closed while its preview was queued.
-		self._submit("Previewing rule matches without loading message bodies", operation, done)
+		self._submit("Previewing rule matches without loading message bodies", operation, done, pool=self.preview_pool)
 
 	def _toggle_rules(self, enabled):
 		ids = self._selected_ids("rules")
@@ -1297,7 +1415,7 @@ class MainWindow(QMainWindow):
 		def operation(svc, progress):
 			for rule_id in ids:
 				svc.learning.set_rule_enabled(rule_id, enabled)
-			svc.replan()
+			svc.replan(should_stop=self.stop_event.is_set)
 		self._submit("Changing selected rule activation", operation)
 
 	def _export_rules(self):
@@ -1317,7 +1435,7 @@ class MainWindow(QMainWindow):
 		def operation(svc, progress):
 			for example_id in ids:
 				svc.learning.forget(example_id)
-			svc.replan()
+			svc.replan(should_stop=self.stop_event.is_set)
 		self._submit("Forgetting examples and rebuilding derived learning", operation)
 
 	def _reset_learning(self):
@@ -1325,13 +1443,13 @@ class MainWindow(QMainWindow):
 		if ok:
 			def operation(svc, progress):
 				svc.learning.reset(sender=text.strip() or None)
-				svc.replan()
+				svc.replan(should_stop=self.stop_event.is_set)
 			self._submit("Resetting learning", operation)
 
 	def _save_settings(self, config):
 		def operation(svc, progress):
 			svc.update_config(config)
-			svc.replan()
+			svc.replan(should_stop=self.stop_event.is_set)
 			return config
 		def done(result):
 			self.service.config = result
@@ -1391,7 +1509,7 @@ class MainWindow(QMainWindow):
 		if action == "undo":
 			if self._last_action_ids:
 				ids = list(self._last_action_ids)
-				self._submit("Undoing last review action", lambda svc, p: svc.undo(ids))
+				self._submit("Undoing last review action", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
 			return
 		if self.tabs.currentIndex() != 1:
 			return
@@ -1405,15 +1523,23 @@ class MainWindow(QMainWindow):
 			event.accept()
 			return
 		if self.tasks:
-			self._closing = True
-			self.stop_event.set()
-			self.refresh_timer.stop()
-			self.maintenance_timer.stop()
-			self.statusBar().showMessage("Finishing current worker work before closing. A remote AI request may still complete or be billed.")
+			if not self._closing:
+				self._closing = True
+				self._requested_control_state = "stopped"
+				self.stop_event.set()
+				self.refresh_timer.stop()
+				self.maintenance_timer.stop()
+				if hasattr(self.service, "abort_workers"):
+					self.service.abort_workers()
+				self.pool.clear()
+				self.preview_pool.clear()
+				self._close_deadline.start(3000)
+				self.statusBar().showMessage("Stopping local workers and closing. An interrupted remote request may still complete or be billed.")
 			event.ignore()
 			return
 		self._closing = True
 		self._resources_closed = True
+		self._close_deadline.stop()
 		self.refresh_timer.stop()
 		self.maintenance_timer.stop()
 		self.settings.setValue("window/geometry", self.saveGeometry())
@@ -1427,3 +1553,26 @@ class MainWindow(QMainWindow):
 			self._reader.close()
 		self.service.close()
 		event.accept()
+
+	def _force_close(self):
+		"""Bound the UI close without deleting a pool or Store owned by a worker.
+
+		The process launcher can detect ``shutdown_incomplete`` and record an
+		abrupt local shutdown. Gmail effects remain uncertain until reconciliation;
+		no Qt worker thread is forcibly terminated or claimed to cancel a request.
+		"""
+		if self._resources_closed:
+			return
+		self.shutdown_incomplete = bool(self.tasks)
+		if self.tasks:
+			for task in self.tasks.values():
+				for signal in (task.signals.progress, task.signals.result, task.signals.error, task.signals.finished):
+					try:
+						signal.disconnect()
+					except TypeError:
+						pass  # A task can finish before all UI receivers are detached.
+			_DrainingWork((self.pool, self.preview_pool), self.tasks)
+			self.tasks = {}
+			self.callbacks.clear()
+			self._running_job = False
+		self.close()
