@@ -31,6 +31,8 @@ def parser():
 	result.add_argument("--max-actions", type=int, help="Maximum mailbox actions authorized for this invocation")
 	result.add_argument("--yes", action="store_true", help="Confirm live execution, including a plan above the configured write cap")
 	result.add_argument("--apply", action="store_true", help="Apply current approved proposals (requires live mode)")
+	result.add_argument("--undo", nargs="+", metavar="ACTION_ID", help="Undo only the specified recorded action IDs")
+	result.add_argument("--undo-unverified", action="store_true", help="Undo without ownership history; requires --undo and --yes, with exact after-state")
 	result.add_argument("--backup", type=Path, help="Save a consistent SQLite backup after the run")
 	return result
 
@@ -103,6 +105,8 @@ def main(argv=None) -> int:
 		parser().error("Counts must be positive")
 	if args.headless and args.live and args.max_actions is None and not args.yes:
 		parser().error("Headless --live requires --max-actions N or --yes")
+	if args.undo_unverified and not (args.undo and args.yes):
+		parser().error("--undo-unverified requires --undo ACTION_ID and --yes")
 	directory = args.data_dir / ("demo" if args.demo else "live") if args.data_dir else data_directory(args.demo)
 	directory.mkdir(parents=True, exist_ok=True)
 	if args.benchmark:
@@ -145,6 +149,9 @@ def main(argv=None) -> int:
 		if args.credentials:
 			service.connect(args.credentials)
 		if args.headless:
+			if args.undo:
+				print(json.dumps(service.undo(args.undo, allow_unverified=args.undo_unverified, confirmed=args.yes), indent=2))
+				return 0
 			job_id = args.resume or service.new_job()
 			last_report = [0.0, ""]
 			def report(value):

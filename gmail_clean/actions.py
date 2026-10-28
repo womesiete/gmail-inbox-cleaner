@@ -52,6 +52,7 @@ class ActionExecutor:
 		self._prefetched_messages.clear()
 		self._prefetched_threads.clear()
 		self._identity_verified = False
+		self._undo_history_evidence = None
 		if self._stop_requested():
 			return
 		if len(message_ids) > 1 and callable(getattr(self.s.mailbox, "get_messages", None)):
@@ -199,7 +200,7 @@ class ActionExecutor:
 		for action, _ in ready:
 			current = self.db.one("SELECT * FROM actions WHERE id=?", (action["id"],))
 			if current is None or self._intent_hash(current) != self._intent_hash(action):
-				raise ValueError("The reviewed plan changed during preflight; review its count and hash again")
+				raise PlanConfirmationError("The reviewed plan changed during preflight; review its count and hash again")
 
 	def plan_snapshot(self, action_ids=None, job_id=None) -> dict:
 		"""Hash the exact reviewed target IDs and write intents, independent of simulation."""
@@ -227,7 +228,7 @@ class ActionExecutor:
 			action_ids = list(action_ids) if action_ids is not None else None
 			snapshot = self.plan_snapshot(action_ids, job_id)
 			if expected_plan_hash is not None and snapshot["hash"] != expected_plan_hash:
-				raise ValueError("The reviewed plan changed; inspect the count and hash again before execution")
+				raise PlanConfirmationError("The reviewed plan changed; inspect the count and hash again before execution")
 			if not self.s.config.dry_run and snapshot["count"] > self.s.config.max_actions_per_run and not allow_over_limit:
 				raise PlanConfirmationError(f"Plan of {snapshot['count']} actions exceeds the write cap of {self.s.config.max_actions_per_run}; explicit confirmation is required")
 			self._reviewed_scope = (action_ids, job_id, set(snapshot["action_ids"])) if expected_plan_hash is not None else None
@@ -266,6 +267,13 @@ class ActionExecutor:
 			where += " AND job_id=?"
 			params.append(job_id)
 		actions = self.db.query("SELECT * FROM actions WHERE " + where + " ORDER BY created_at,id", params)
+		starts = []
+		for action in actions:
+			if action["undo_of"]:
+				checkpoint = json.loads(action["payload_json"]).get("receipt_history_id")
+				if str(checkpoint).isdigit():
+					starts.append(int(checkpoint))
+		self._undo_history_start = min(starts) if starts else None
 		groups = defaultdict(list)
 		applied = 0
 		self._prefetch([action["message_id"] for action in actions])
@@ -476,6 +484,8 @@ class ActionExecutor:
 				raise ValueError("History interval exceeds the bounded receipt inspection")
 		except Exception:
 			result = (False, [])
+		if self._stop_requested():
+			return result
 		if len(self._history_evidence_cache) >= 8:
 			self._history_evidence_cache.pop(next(iter(self._history_evidence_cache)))
 		self._history_evidence_cache[key] = result
@@ -533,6 +543,8 @@ class ActionExecutor:
 			self.mark(action["id"], "conflict", "Partial/ambiguous effects after uncertain attempt")
 
 	def undo(self, action_ids, should_stop: Callable[[], bool] | None = None, *, allow_unverified=False, confirmed=False, allow_over_limit=False) -> dict:
+		if allow_unverified and not confirmed:
+			raise PlanConfirmationError("Ownership-unverified undo requires explicit confirmation")
 		queued = []
 		for aid in action_ids:
 			if should_stop and should_stop():
@@ -545,7 +557,9 @@ class ActionExecutor:
 			if action["state"] in {"queued", "proposed", "retry", "stale"}:
 				self.mark(aid, "cancelled", "Proposal cancelled by explicit undo")
 				continue
-			if action["state"] not in {"applied", "reconciled"}:
+			payload = json.loads(action["payload_json"])
+			unverified_receipt = allow_unverified and action["state"] == "conflict" and payload.get("receipt_history_id") is not None
+			if action["state"] not in {"applied", "reconciled"} and not unverified_receipt:
 				continue
 			# A settings change can stale an unexecuted undo preview. Cancel that
 			# preview so a new explicit undo may use current restrictions.
@@ -564,11 +578,12 @@ class ActionExecutor:
 				else:
 					continue
 			payload = json.loads(action["payload_json"])
-			if payload.get("ownership") != "confirmed_response":
+			if payload.get("ownership") != "confirmed_response" and not allow_unverified:
 				self.mark(aid, "conflict", "Lost response leaves app ownership ambiguous; inspect Gmail before undo")
 				continue
 			uid = identifier()
 			payload["original_action"] = aid
+			payload["ownership_unverified_confirmation"] = bool(allow_unverified and confirmed)
 			# Undo can restore only the recorded IDs/deltas, regardless of today's scope.
 			insert(self.db, "actions", {"id": uid, "job_id": action["job_id"], "message_id": action["message_id"], "state": "proposed" if self.s.config.dry_run else "queued", "action": "undo", "add_json": action["remove_json"], "remove_json": action["add_json"], "before_json": action["after_json"], "context_version": action["context_version"], "policy_version": self.s.config.revision, "approval": "manual", "reason": "Explicit undo of recorded app-owned changes", "undo_of": aid, "created_at": stamp(), "updated_at": stamp(), "payload_json": encode(payload)})
 			queued.append(uid)
@@ -578,7 +593,7 @@ class ActionExecutor:
 
 	def preflight_undo(self, action, message, payload, add, remove):
 		original = self.db.one("SELECT * FROM actions WHERE id=?", (action["undo_of"],))
-		if not original or original["state"] not in {"applied", "reconciled"}:
+		if not original or (original["state"] not in {"applied", "reconciled"} and not (original["state"] == "conflict" and payload.get("ownership_unverified_confirmation"))):
 			self.mark(action["id"], "conflict", "Original change no longer owns an applicable undo")
 			return None
 		if remove & set(self.s.config.protected_label_ids):
@@ -587,37 +602,35 @@ class ActionExecutor:
 		if any(str(self.s.config.label_meanings.get(label, "")).strip().casefold() in {"protected", "requires_attention", "requires attention", "attention", "action"} for label in remove):
 			self.mark(action["id"], "conflict", "Label now has an attention/protective meaning")
 			return None
+		if payload.get("ownership_unverified_confirmation"):
+			if message.labels != set(json.loads(original["after_json"])):
+				self.mark(action["id"], "conflict", "Ownership-unverified undo requires the exact recorded after-state")
+				return None
+			return message
 		# Ownership of a delta can be lost by an intervening edit even if the label
 		# currently has the same value. History has no actor identity: ambiguity wins.
 		checkpoint = payload.get("receipt_history_id")
-		if not checkpoint:
+		if not checkpoint or not str(checkpoint).isdigit():
 			self.mark(action["id"], "conflict", "No history checkpoint is available to establish undo ownership")
 			return None
-		try:
-			token = None
-			tokens = set()
-			for _ in range(100):
-				if self._stop_requested():
-					self.mark(action["id"], "queued", "Undo paused before history inspection finished")
-					return None
-				page = self.s.mailbox.history(str(checkpoint), token)
-				for event in page.get("history", []):
-					for kind in ("labelsAdded", "labelsRemoved", "messagesDeleted"):
-						for change in event.get(kind, []):
-							if change.get("message", {}).get("id") == message.id and ((set(change.get("labelIds", [])) & (add | remove)) or kind == "messagesDeleted"):
-								self.mark(action["id"], "conflict", "Intervening relevant Gmail edits make undo ownership ambiguous")
-								return None
-				token = page.get("nextPageToken")
-				if not token:
-					break
-				if token in tokens:
-					raise ValueError("Repeated Gmail history page token")
-				tokens.add(token)
-			else:
-				raise ValueError("History interval exceeds bounded undo inspection")
-		except Exception:
-			self.mark(action["id"], "conflict", "Gmail history cannot establish safe undo ownership")
+		if self._undo_history_evidence is None:
+			start = self._undo_history_start if self._undo_history_start is not None else int(checkpoint)
+			reliable, events = self._history_interval(start, self._checkpoint())
+			index = defaultdict(list)
+			for number, kind, mid, label in events:
+				index[mid].append((number, kind, label))
+			self._undo_history_evidence = (reliable, index)
+		reliable, index = self._undo_history_evidence
+		if self._stop_requested():
+			self.mark(action["id"], "queued", "Undo paused before history inspection finished")
 			return None
+		if not reliable:
+			self.mark(action["id"], "conflict", "Gmail history cannot establish safe undo ownership; finite retention may require explicitly confirmed ownership-unverified undo")
+			return None
+		for number, kind, label in index.get(message.id, []):
+			if number > int(checkpoint) and (label in add | remove or kind.startswith("messages")):
+				self.mark(action["id"], "conflict", "Intervening relevant Gmail edits make undo ownership ambiguous")
+				return None
 		expected = set(json.loads(original["after_json"]))
 		if any((label in message.labels) != (label in expected) for label in add | remove):
 			self.mark(action["id"], "conflict", "Recorded effects changed; inverse delta is unsafe")

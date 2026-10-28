@@ -857,3 +857,50 @@ def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_m
 		assert state(app, aid)["state"] == "proposed"
 	assert not app.mailbox.calls
 	assert not app.store.one("SELECT id FROM attempts")
+
+
+def test_undo_history_scan_shared_by_batch(app):
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(10)]
+	assert app.actions.apply(ids)["applied"] == 10
+	reads = []
+	original = app.mailbox.history
+	def history(start, page_token=None):
+		reads.append((start, page_token))
+		return original(start, page_token)
+	app.mailbox.history = history
+	assert app.actions.undo(ids)["applied"] == 10
+	# One shared indexed scan establishes intervening history; one other scan
+	# proves the inverse receipt interval. Rechecks reuse the same evidence.
+	assert len(reads) <= 2
+
+
+def test_unverified_undo_requires_confirmation_and_exact_recorded_after_state(app):
+	aid = plan(app, seed(app))
+	assert app.actions.apply([aid])["applied"] == 1
+	app.mailbox.expired_history = True
+	with pytest.raises(ValueError, match="explicit confirmation"):
+		app.actions.undo([aid], allow_unverified=True)
+	assert "INBOX" not in app.mailbox.messages["old"].labels
+	assert app.actions.undo([aid], allow_unverified=True, confirmed=True)["applied"] == 1
+	assert "INBOX" in app.mailbox.messages["old"].labels
+
+
+def test_unverified_undo_refuses_even_unrelated_label_changes(app):
+	aid = plan(app, seed(app))
+	app.actions.apply([aid])
+	app.mailbox.expired_history = True
+	app.mailbox.edit("old", add=["Label_other"])
+	app.actions.undo([aid], allow_unverified=True, confirmed=True)
+	assert "INBOX" not in app.mailbox.messages["old"].labels
+	inverse = app.store.one("SELECT * FROM actions WHERE undo_of=?", (aid,))
+	assert inverse["state"] == "conflict"
+	assert "exact recorded after-state" in inverse["reason"]
+
+
+def test_confirmation_error_keeps_content_free_ui_explanation(app):
+	from gmail_clean.runtime import safe_error
+	app.config.max_actions_per_run = 0
+	plan(app, seed(app))
+	with pytest.raises(ValueError) as caught:
+		app.actions.apply()
+	assert "exceeds the write cap" in safe_error(caught.value)

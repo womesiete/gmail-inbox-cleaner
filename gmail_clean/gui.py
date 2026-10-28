@@ -783,9 +783,10 @@ class MainWindow(QMainWindow):
 
 	def _build_history(self):
 		layout = self._tab("History / Undo")
-		layout.addWidget(QLabel("Undo reverses recorded application-owned deltas on the original message IDs. Later manual changes and deleted labels may require conflict review. Out-of-current-window undo targets remain explicit.", wordWrap=True))
+		layout.addWidget(QLabel("Undo reverses recorded application-owned deltas on the original message IDs. Gmail history has finite retention; older receipts may no longer prove ownership. Later manual changes and deleted labels may require conflict review. Out-of-current-window undo targets remain explicit.", wordWrap=True))
 		bar = QHBoxLayout()
 		bar.addWidget(self._button("Undo selected actions", lambda: self.undo_selected("history")))
+		bar.addWidget(self._button("Undo anyway · ownership unverified", lambda: self.undo_selected("history", allow_unverified=True)))
 		bar.addWidget(self._button("Undo selected cleanup job", self._undo_job))
 		bar.addStretch()
 		self.history_search = QLineEdit(placeholderText="Filter history by message ID, job ID, or reason…")
