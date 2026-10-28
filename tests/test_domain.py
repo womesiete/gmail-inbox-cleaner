@@ -16,6 +16,11 @@ from gmail_clean.domain import (
 ANCHOR = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
 
 
+def test_default_timezone_uses_system_zone(monkeypatch):
+	monkeypatch.setenv("TZ", "Asia/Tokyo")
+	assert Config().timezone == "Asia/Tokyo"
+
+
 def message(days=90, **changes):
 	values = {"id": "m1", "thread_id": "t1", "internal_ms": epoch_ms(ANCHOR - timedelta(days=days)), "labels": {"INBOX", "UNREAD"}, "headers": {"From": "Records <records@example.org>", "Subject": "Completed account record"}, "body": "This is complete; no further action is needed.", "context_version": "ctx-1"}
 	values.update(changes)
@@ -49,7 +54,7 @@ def test_millisecond_cutoff_is_not_rounded_outward():
 
 
 def test_fixed_calendar_dates_include_entire_dst_transition_day():
-	cfg = Config(earliest_date="2026-03-08", latest_mode="fixed", latest_date="2026-03-08")
+	cfg = Config(timezone="America/New_York", earliest_date="2026-03-08", latest_mode="fixed", latest_date="2026-03-08")
 	window = resolve_window(cfg, ANCHOR)
 	assert window.earliest_inclusive == datetime(2026, 3, 8, 5, tzinfo=UTC)
 	assert window.latest_exclusive == datetime(2026, 3, 9, 4, tzinfo=UTC)
@@ -61,7 +66,7 @@ def test_fixed_calendar_dates_include_entire_dst_transition_day():
 
 
 def test_fall_calendar_day_is_twenty_five_hours():
-	window = resolve_window(Config(earliest_date="2026-11-01", latest_mode="fixed", latest_date="2026-11-01"), ANCHOR)
+	window = resolve_window(Config(timezone="America/New_York", earliest_date="2026-11-01", latest_mode="fixed", latest_date="2026-11-01"), ANCHOR)
 	assert window.latest_exclusive - window.earliest_inclusive == timedelta(hours=25)
 
 

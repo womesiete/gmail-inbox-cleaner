@@ -10,6 +10,7 @@ import calendar
 import hashlib
 import json
 import math
+import os
 import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
@@ -54,6 +55,18 @@ def canonical_hash(value: Any) -> str:
 	return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
+def system_timezone() -> str:
+	"""Resolve the host's IANA zone, including Windows registry zone mappings."""
+	try:
+		from tzlocal import get_localzone_name
+		name = os.environ.get("TZ", "").removeprefix(":") or get_localzone_name()
+		ZoneInfo(name)
+		return name
+	except (ImportError, ValueError, OSError, ZoneInfoNotFoundError):
+		# UTC is explicit and stable if the OS timezone is not configured.
+		return "UTC"
+
+
 @dataclass
 class Config:
 	"""Serializable preferences. Secrets and operational state are never settings.
@@ -63,7 +76,7 @@ class Config:
 	configuration conflict rather than arbitrarily selecting one.
 	"""
 
-	timezone: str = "America/New_York"
+	timezone: str = field(default_factory=system_timezone)
 	earliest_date: str | None = None
 	latest_mode: str = "rolling"
 	latest_days: int = 14

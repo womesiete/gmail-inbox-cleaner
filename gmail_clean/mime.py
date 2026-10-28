@@ -38,6 +38,8 @@ class _TextParser(HTMLParser):
 
 def normalize_text(value: str) -> str:
 	value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+	value = value.translate(str.maketrans("", "", "\u200b\u200c\u200d\ufeff\u2060\u00ad"))
+	value = value.replace("\u00a0", " ").replace("\u2007", " ").replace("\u202f", " ")
 	value = re.sub(r"[ \t\f\v]+", " ", value)
 	return re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", value).strip()
 
@@ -149,9 +151,21 @@ def parse_body(payload: dict, fetch_text_attachment: Callable[[str], dict] | Non
 		try:
 			text = raw.decode(charset, errors="strict")
 		except (LookupError, UnicodeDecodeError):
-			text = raw.decode("utf-8", errors="replace")
-			result.missing = True
-		return html_to_text(text) if mime == "text/html" else normalize_text(text)
+			# A wrong/missing declaration does not imply missing bytes. Keep the
+			# complete decoded text, preferring UTF-8 and common legacy mail encodings.
+			for fallback in ("utf-8", "cp1252", "latin-1"):
+				try:
+					text = raw.decode(fallback, errors="strict")
+					break
+				except UnicodeDecodeError:
+					continue
+		if mime == "text/html":
+			parser = _TextParser()
+			parser.feed(text)
+			parser.close()
+			result.truncated = result.truncated or bool(parser.blocked)
+			return normalize_text("".join(parser.output))
+		return normalize_text(text)
 
 	result.text = normalize_text(walk(payload))
 	if len(result.text) > max_chars:

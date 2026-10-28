@@ -63,15 +63,35 @@ def test_attached_text_is_not_analyzed_and_empty_plain_falls_back_to_html():
 	assert "confidential" not in parsed.text
 
 
-def test_oversized_and_unknown_charset_never_silently_become_complete():
+def test_oversized_content_is_incomplete_and_unknown_charset_uses_lossless_fallback():
 	parsed = parse_body({"mimeType": "text/plain", "headers": [{"name": "Content-Type", "value": "text/plain; charset=unknown-wrong"}],
 		"body": {"data": "SGVsbG8"}})
-	assert parsed.text == "Hello" and parsed.missing
+	assert parsed.text == "Hello" and not parsed.missing
 	calls = []
 	parsed = parse_body({"mimeType": "text/plain", "body": {"attachmentId": "large", "size": 2_000_000}},
 		lambda value: calls.append(value))
 	assert parsed.truncated and parsed.missing
 	assert calls == []
+
+
+def test_bad_charset_uses_cp1252_then_latin1_without_claiming_missing_text():
+	for raw, expected in [(b"Total \x80 12", "Total € 12"), (b"data \x81 bytes", "data \x81 bytes")]:
+		parsed = parse_body({"mimeType": "text/plain", "body": {"data": base64.urlsafe_b64encode(raw).decode()}})
+		assert parsed.text == expected
+		assert not parsed.missing
+
+
+@pytest.mark.parametrize("tag", ["script", "style", "head"])
+def test_unclosed_hidden_html_is_reported_truncated(tag):
+	parsed = parse_body(part("text/html", f"<p>Visible</p><{tag}>invisible remainder"))
+	assert parsed.text == "Visible"
+	assert parsed.truncated
+
+
+def test_zero_width_preheader_padding_is_removed_from_plain_and_html():
+	value = "Useful\u200b\u200c\u200d\ufeff\u2060\u00ad" + "\u00a0" * 150 + " message"
+	assert parse_body(part("text/plain", value)).text == "Useful message"
+	assert parse_body(part("text/html", f"<p>{value}</p>")).text == "Useful message"
 
 
 def test_folded_standard_base64_text_and_urlsafe_alphabet_decode_identically():
