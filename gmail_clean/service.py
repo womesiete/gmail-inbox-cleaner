@@ -87,6 +87,8 @@ class AppService:
 			self.config.ai_module = "gmail_clean.demo_ai"
 		self._validate_demo_ai(self.config)
 		self.config.validate()
+		from .diagnostics import configure
+		self.logger = configure(self.data_dir, self.config.log_level)
 		if config is not None or saved is None:
 			self.store.set_checkpoint("effective_preferences", self.config.to_dict())
 		# Worker/account initialization persists only base preferences. Invocation
@@ -287,6 +289,8 @@ class AppService:
 		previous = Config.from_dict(self.store.checkpoint("effective_preferences", self.config.to_dict()))
 		self._approve_ai_source(config, previous, approve_ai_module)
 		self.config = config
+		from .diagnostics import configure
+		self.logger = configure(self.data_dir, config.log_level)
 		with self.store.transaction():
 			self.store.set_checkpoint("effective_preferences", config.to_dict())
 			if previous.revision != config.revision:
@@ -387,6 +391,8 @@ class AppService:
 		with self.execution_lease():
 			self.reload_config()
 			self.current_job_id = job_id
+			from .diagnostics import event
+			event(self.logger, "job_started", job_id=job_id, stage="discovery")
 			try:
 				self.refresh_labels()
 			except Exception as exc:
@@ -396,6 +402,7 @@ class AppService:
 			result = self.jobs.run(job_id, progress, should_stop)
 			if result["state"] == "completed":
 				self.store.checkpoint_wal(truncate=True)
+			event(self.logger, "job_returned", job_id=job_id, stage=result.get("stage", ""), kind=result.get("state", ""))
 			return result
 
 	def control_job(self, job_id, state):
@@ -746,7 +753,15 @@ class AppService:
 		return {"message": "Disconnected and Google consent revoked; local data and undo history retained" if revoke else "Disconnected; local data and undo history retained"}
 
 	def error(self, stage, exc, job_id="", message_id=""):
+		import logging
+		from .diagnostics import event
+		event(self.logger, "operation_failed", job_id=job_id, stage=stage, kind=getattr(exc, "kind", type(exc).__name__), exception=type(exc).__name__, level=logging.ERROR)
 		insert(self.store, "errors", {"id": identifier(), "job_id": job_id, "message_id": message_id, "stage": stage, "kind": getattr(exc, "category", getattr(exc, "kind", type(exc).__name__)), "class_name": getattr(exc, "exception_class", type(exc).__name__), "summary": safe_error(exc), "created_at": stamp(), "payload_json": encode({"exception_module": getattr(exc, "exception_module", type(exc).__module__)})})
+
+	def export_diagnostics(self, path):
+		from .diagnostics import export
+		from .storage import SCHEMA_VERSION
+		return export(self.data_dir, Path(path), schema_version=SCHEMA_VERSION)
 
 	def retry_errors(self, *, job_id=None, work_item_ids=None):
 		"""Reset explicitly scoped work without reviving a user-paused job."""
@@ -810,3 +825,6 @@ class AppService:
 				self._close_ai(grace_s=0.1)
 		finally:
 			self.store.close()
+			if self._resource_owner is self:
+				from .diagnostics import close
+				close(self.logger)

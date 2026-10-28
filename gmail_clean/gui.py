@@ -828,6 +828,8 @@ class MainWindow(QMainWindow):
 		self.error_search.textChanged.connect(self._filter_errors)
 		bar.addWidget(self.error_search, 1)
 		bar.addWidget(self._button("Retry selected job errors", self._retry_job_errors))
+		bar.addWidget(self._button("Open logs", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.service.data_dir / "logs")))))
+		bar.addWidget(self._button("Export diagnostics…", self._export_diagnostics))
 		layout.addLayout(bar)
 		layout.addWidget(self._table("errors", "SELECT id,job_id,message_id,stage,kind,class_name,summary,attempts,next_attempt_utc,state,created_at FROM errors",
 			[Column("created_at", "Observed (UTC)", 205), Column("stage", "Stage", 100), Column("kind", "Kind", 130),
@@ -1575,6 +1577,11 @@ class MainWindow(QMainWindow):
 		path, _ = QFileDialog.getSaveFileName(self, "Consistent database backup", "gmail-clean-backup.sqlite", "SQLite (*.sqlite)")
 		if path:
 			self._submit("Backing up local state", lambda svc, p: svc.backup(path))
+
+	def _export_diagnostics(self):
+		path, _ = QFileDialog.getSaveFileName(self, "Export content-free diagnostics", "gmail-clean-diagnostics.zip", "ZIP (*.zip)")
+		if path:
+			self._submit("Exporting operational diagnostics", lambda svc, p: svc.export_diagnostics(path))
 
 	def _setup_shortcuts(self):
 		for shortcut in getattr(self, "_shortcuts", []):
