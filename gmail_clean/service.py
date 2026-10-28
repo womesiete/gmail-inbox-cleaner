@@ -326,7 +326,8 @@ class AppService:
 			raise LeaseBusyError("Another worker is using this mailbox; pause it before executing")
 		self._lease_depth += 1
 		try:
-			yield
+			with self.store.lease_heartbeat("mailbox_execution"):
+				yield
 		finally:
 			self._lease_depth -= 1
 			if self._lease_depth == 0:

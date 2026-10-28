@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from .domain import content_hash
-from .runtime import data_directory, utc_now
+from .runtime import data_directory, digest, utc_now
 from .service import AppService
 from .storage import Store
 
@@ -34,6 +34,9 @@ def parser():
 	result.add_argument("--apply", action="store_true", help="Apply current approved proposals (requires live mode)")
 	result.add_argument("--undo", nargs="+", metavar="ACTION_ID", help="Undo only the specified recorded action IDs")
 	result.add_argument("--undo-unverified", action="store_true", help="Undo without ownership history; requires --undo and --yes, with exact after-state")
+
+	result.add_argument("--break-lease", action="store_true", help="Break a stuck execution lease and exit")
+	result.add_argument("--confirm-break-lease", action="store_true", help="Confirm an in-flight request may still complete")
 	result.add_argument("--backup", type=Path, help="Save a consistent SQLite backup after the run")
 	return result
 
@@ -99,6 +102,29 @@ def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep
 	return summary
 
 
+def break_lease_metadata(directory: Path, *, demo: bool, confirmed: bool) -> dict:
+	"""Fence only the observed lease, without mailbox clients or the app lock.
+
+		This explicit repair exception does not authorize execution. The existing
+		instance lock continues to guard every normal GUI/headless operation.
+	"""
+	if not confirmed:
+		raise ValueError("--break-lease requires --confirm-break-lease; an in-flight request may still complete")
+	account = "demo@example.invalid" if demo else "unconnected"
+	identity = directory / "account.json"
+	if not demo and identity.exists():
+		account = str(json.loads(identity.read_text(encoding="utf-8"))["account_id"]).strip().casefold()
+	if not account:
+		raise ValueError("A current account identity is required to break its lease")
+	path = directory / ("unconnected.sqlite" if account == "unconnected" else "mailbox-" + digest(account)[:12] + ".sqlite")
+	if not path.is_file():
+		return {"broken": False, "message": "No existing account database or execution lease"}
+	with Store(path, account) as store:
+		row = store.one("SELECT owner_token FROM job_leases WHERE name='mailbox_execution'")
+		broken = bool(row) and store.break_lease("mailbox_execution", confirmed=True, owner_token=row["owner_token"])
+	return {"broken": broken, "message": "Observed execution lease fenced; an in-flight request may still complete. Normal execution still requires the instance lock." if broken else "No matching lease was broken; the owner may have changed."}
+
+
 def main(argv=None) -> int:
 	multiprocessing.freeze_support()
 	args = parser().parse_args(argv)
@@ -110,6 +136,16 @@ def main(argv=None) -> int:
 		parser().error("--undo-unverified requires --undo ACTION_ID and --yes")
 	directory = args.data_dir / ("demo" if args.demo else "live") if args.data_dir else data_directory(args.demo)
 	directory.mkdir(parents=True, exist_ok=True)
+	if args.break_lease:
+		try:
+			if args.live or args.apply or args.resume or args.credentials or getattr(args, "restore_backup", None) or args.benchmark or getattr(args, "job_benchmark", None) or args.ai_module is not None or args.model is not None:
+				raise ValueError("Lease repair is a standalone metadata operation; omit execution, connection and restore options")
+			print(json.dumps(break_lease_metadata(directory, demo=args.demo, confirmed=args.confirm_break_lease), indent=2))
+			return 0
+		except Exception as exc:
+			from .runtime import safe_error
+			print(str(exc) if isinstance(exc, ValueError) else safe_error(exc), file=sys.stderr)
+			return 1
 	if args.benchmark:
 		if not args.demo:
 			parser().error("--benchmark requires --demo")

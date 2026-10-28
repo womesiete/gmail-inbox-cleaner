@@ -9,13 +9,15 @@ import contextlib
 import json
 import os
 import sqlite3
+import subprocess
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+_PROCESS_FALLBACK = uuid.uuid4().hex
 
 
 class AccountMismatchError(RuntimeError):
@@ -204,6 +206,7 @@ _MIGRATIONS = [
 	CREATE INDEX idx_examples_category ON examples(category,created_at);
 	CREATE INDEX idx_rules_pattern_action ON rules(json_extract(payload_json,'$.pattern_key'),action);
 	""",
+	"""ALTER TABLE job_leases ADD COLUMN process_start TEXT NOT NULL DEFAULT '';""",
 ]
 
 _ACCOUNT_TABLES = (
@@ -251,6 +254,9 @@ class Store:
 	def _migrate(self) -> None:
 		# Read the version only after the write lock is held. Two starting workers
 		# must not both decide to apply the same migration from a stale version.
+		version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+		if 0 < version < SCHEMA_VERSION and self.path != ":memory:":
+			self.backup(Path(str(self.path) + f".pre-migration-v{version}-{uuid.uuid4().hex}.sqlite3"))
 		self.conn.execute("BEGIN IMMEDIATE")
 		try:
 			version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
@@ -405,17 +411,20 @@ class Store:
 		with self.transaction():
 			row = self.one("SELECT * FROM job_leases WHERE name=?", (name,))
 			if row and row["owner_token"] != self._owner_token:
-				# A living process keeps ownership even if a long network call delays its
-				# heartbeat. A dead process is safe to recover immediately.
-				if _pid_alive(int(row["pid"])):
+				# A dedicated heartbeat survives slow network calls. Expired owners
+				# are fenced by owner_token; PID start identity rejects PID reuse.
+				alive = _pid_alive(int(row["pid"]))
+				start = _process_start(int(row["pid"])) if alive else None
+				same_process = not start or not row["process_start"] or start == row["process_start"]
+				if alive and same_process and datetime.fromisoformat(row["expires_at"]) > now:
 					return False
 			stamp = now.astimezone(timezone.utc).isoformat()
 			expires = (now + timedelta(seconds=ttl_seconds)).astimezone(timezone.utc).isoformat()
 			generation = (int(row["generation"]) + 1) if row and row["owner_token"] != self._owner_token else (int(row["generation"]) if row else 1)
-			self.execute("""INSERT INTO job_leases(name,owner_token,pid,acquired_at,heartbeat_at,expires_at,generation)
-				VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,pid=excluded.pid,
-				acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at,generation=excluded.generation""", (
-				name, self._owner_token, os.getpid(), stamp, stamp, expires, generation,
+			self.execute("""INSERT INTO job_leases(name,owner_token,pid,acquired_at,heartbeat_at,expires_at,generation,process_start)
+				VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,pid=excluded.pid,
+				acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,expires_at=excluded.expires_at,generation=excluded.generation,process_start=excluded.process_start""", (
+				name, self._owner_token, os.getpid(), stamp, stamp, expires, generation, _process_start(os.getpid()) or "",
 			))
 		return True
 
@@ -433,6 +442,45 @@ class Store:
 	def release_lease(self, name: str) -> None:
 		self.execute("DELETE FROM job_leases WHERE name=? AND owner_token=?", (name, self._owner_token))
 
+	@contextlib.contextmanager
+	def lease_heartbeat(self, name: str, ttl_seconds: int = 90, interval_seconds: float = 20):
+		"""Renew on a thread-owned connection while the owner is blocked in I/O."""
+		stop = threading.Event()
+		error = []
+		def renew():
+			try:
+				with contextlib.closing(sqlite3.connect(str(self.path), timeout=5)) as connection:
+					while not stop.wait(interval_seconds):
+						now = datetime.now(timezone.utc)
+						cursor = connection.execute("UPDATE job_leases SET heartbeat_at=?,expires_at=? WHERE name=? AND owner_token=?", (now.isoformat(), (now + timedelta(seconds=ttl_seconds)).isoformat(), name, self._owner_token))
+						connection.commit()
+						if cursor.rowcount != 1:
+							raise LeaseBusyError("Execution lease was lost")
+			except Exception as exc:
+				error.append(exc)
+		thread = None
+		if self.path != ":memory:":
+			thread = threading.Thread(target=renew, name="lease-heartbeat", daemon=True)
+			thread.start()
+		try:
+			yield
+			if error:
+				raise LeaseBusyError("Lease heartbeat failed; execution must stop") from error[0]
+		finally:
+			stop.set()
+			if thread:
+				thread.join(timeout=6)
+
+	def break_lease(self, name: str, *, confirmed: bool = False, owner_token: str | None = None) -> bool:
+		"""Fence a stuck owner after explicit confirmation; do not break its successor."""
+		if not confirmed:
+			raise ValueError("Please confirm breaking the lease; an in-flight request may still finish")
+		with self.transaction():
+			row = self.one("SELECT owner_token FROM job_leases WHERE name=?", (name,))
+			if not row or (owner_token is not None and row["owner_token"] != owner_token):
+				return False
+			return bool(self.execute("DELETE FROM job_leases WHERE name=? AND owner_token=?", (name, row["owner_token"])).rowcount)
+
 	def backup(self, destination: str | Path) -> Path:
 		self._check_thread()
 		if self.conn.in_transaction:
@@ -441,7 +489,7 @@ class Store:
 		if self.path != ":memory:" and target.resolve() == Path(self.path).resolve():
 			raise ValueError("Backup must use a different file")
 		target.parent.mkdir(parents=True, exist_ok=True)
-		with sqlite3.connect(str(target)) as other:
+		with contextlib.closing(sqlite3.connect(str(target))) as other:
 			self.conn.backup(other)
 		if os.name != "nt":
 			os.chmod(target, 0o600)
@@ -531,3 +579,35 @@ def _windows_pid_alive(pid: int) -> bool:
 		return exit_code.value == 259  # STILL_ACTIVE
 	finally:
 		close_handle(handle)
+
+
+def _process_start(pid: int) -> str | None:
+	"""Return OS process creation identity, or None when it cannot be queried."""
+	try:
+		if os.name == "nt":
+			import ctypes
+			from ctypes import wintypes
+			kernel32, _ = _windows_process_api()
+			kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+			kernel32.OpenProcess.restype = wintypes.HANDLE
+			kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+			kernel32.GetProcessTimes.restype = wintypes.BOOL
+			kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+			handle = kernel32.OpenProcess(0x1000, False, pid)
+			if not handle:
+				return None
+			try:
+				times = [wintypes.FILETIME() for _ in range(4)]
+				if kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)):
+					return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+			finally:
+				kernel32.CloseHandle(handle)
+		else:
+			path = Path(f"/proc/{pid}/stat")
+			if path.exists():
+				# The command name may itself contain spaces and parentheses.
+				return path.read_text().rsplit(")", 1)[1].split()[19]
+			return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], text=True, stderr=subprocess.DEVNULL, timeout=2).strip() or None
+	except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+		return _PROCESS_FALLBACK if pid == os.getpid() else None
+	return _PROCESS_FALLBACK if pid == os.getpid() else None

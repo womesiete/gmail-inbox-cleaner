@@ -628,6 +628,7 @@ class MainWindow(QMainWindow):
 		layout.addWidget(self.maintenance_label)
 		data_bar = QHBoxLayout()
 		data_bar.addWidget(self._button("Backup database…", self._backup))
+		data_bar.addWidget(self._button("Break stuck lease…", self._break_lease))
 		data_bar.addWidget(self._button("Apply cache retention", lambda: self._submit("Apply retention", lambda svc, p: svc.retention())))
 		data_bar.addStretch()
 		self.in_app_maintenance = QCheckBox("Run maintenance while this window is open")
@@ -1544,6 +1545,14 @@ class MainWindow(QMainWindow):
 			QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
 			QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
 			self._submit("Revoking Google consent and removing protected local tokens", lambda svc, p: svc.disconnect(revoke=True))
+
+	def _break_lease(self):
+		row = self.service.store.one("SELECT owner_token FROM job_leases WHERE name='mailbox_execution'")
+		if not row:
+			self.statusBar().showMessage("No execution lease is held")
+			return
+		if QMessageBox.warning(self, "Break execution lease?", "The old worker will be fenced. An in-flight Gmail request may still finish. Stop the old process before continuing. Break this lease?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+			self._submit("Breaking stuck execution lease", lambda svc, p: svc.store.break_lease("mailbox_execution", confirmed=True, owner_token=row["owner_token"]), pool=self.preview_pool)
 
 	def _backup(self):
 		path, _ = QFileDialog.getSaveFileName(self, "Consistent database backup", "gmail-clean-backup.sqlite", "SQLite (*.sqlite)")

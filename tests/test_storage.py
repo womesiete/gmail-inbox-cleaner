@@ -99,8 +99,8 @@ def test_leases_prevent_duplicate_execution_and_recover_dead_pid(tmp_path, monke
 	first.heartbeat("execute")
 	with pytest.raises(LeaseBusyError):
 		second.require_lease("execute")
-	# Even a late heartbeat from a living process must not cause two writers.
-	assert not second.acquire_lease("execute", now=datetime.now(timezone.utc) + timedelta(days=2))
+	# An expired owner is fenced even when its PID still exists.
+	assert second.acquire_lease("execute", now=datetime.now(timezone.utc) + timedelta(days=2))
 	monkeypatch.setattr("gmail_clean.storage._pid_alive", lambda pid: False)
 	assert second.acquire_lease("execute")
 	second.require_lease("execute")
@@ -272,3 +272,42 @@ def test_closing_nonowner_store_does_not_wait_for_another_writer(tmp_path):
 		finish.set()
 		worker.join(5)
 	assert not errors
+
+
+def test_expired_lease_is_fenced_and_break_requires_confirmation(tmp_path):
+	path = tmp_path / 'leases.sqlite'
+	with Store(path, 'me@example.invalid') as first, Store(path, 'me@example.invalid') as second:
+		assert first.acquire_lease('execute', ttl_seconds=1)
+		assert first.one('SELECT process_start FROM job_leases')['process_start']
+		assert second.acquire_lease('execute', now=datetime.now(timezone.utc) + timedelta(seconds=2))
+		with pytest.raises(LeaseBusyError):
+			first.require_lease('execute')
+		with pytest.raises(ValueError, match='confirm'):
+			second.break_lease('execute')
+		assert second.break_lease('execute', confirmed=True)
+
+
+def test_background_heartbeat_renews_lease_without_owner_connection(tmp_path):
+	import time
+	path = tmp_path / 'heartbeat.sqlite'
+	with Store(path, 'me@example.invalid') as store:
+		assert store.acquire_lease('execute')
+		before = store.one('SELECT heartbeat_at FROM job_leases')['heartbeat_at']
+		with store.lease_heartbeat('execute', interval_seconds=0.02):
+			time.sleep(0.08)
+		assert store.one('SELECT heartbeat_at FROM job_leases')['heartbeat_at'] > before
+
+
+
+def test_numbered_migration_has_a_pre_migration_backup(tmp_path):
+	from gmail_clean.storage import _MIGRATIONS
+	path = tmp_path / 'old.sqlite'
+	with sqlite3.connect(path) as connection:
+		for script in _MIGRATIONS[:4]:
+			connection.executescript(script)
+		connection.execute('PRAGMA user_version=4')
+	with Store(path, 'me@example.invalid'):
+		backups = list(tmp_path.glob('old.sqlite.pre-migration-v4-*.sqlite3'))
+		assert len(backups) == 1
+		with sqlite3.connect(backups[0]) as backup:
+			assert backup.execute('PRAGMA user_version').fetchone()[0] == 4

@@ -623,3 +623,16 @@ def test_saving_external_ai_code_requires_hash_confirmation(qtbot, tmp_path, mon
 	assert len(saved) == 1
 	assert len(saved[0].ai_module_sha256) == 64
 	assert "ai_module_sha256" not in editor.controls
+
+
+def test_break_lease_uses_independent_preview_pool(qtbot, service, tmp_path, monkeypatch):
+	from gmail_clean import gui
+	window = MainWindow(service, settings=QSettings(str(tmp_path / 'lease-prefs.ini'), QSettings.Format.IniFormat))
+	qtbot.addWidget(window)
+	assert service.store.acquire_lease('mailbox_execution')
+	monkeypatch.setattr(gui.QMessageBox, 'warning', lambda *args, **kwargs: gui.QMessageBox.StandardButton.Yes)
+	submissions = []
+	monkeypatch.setattr(window, '_submit', lambda *args, **kwargs: submissions.append((args, kwargs)))
+	window._break_lease()
+	assert submissions[0][1]['pool'] is window.preview_pool
+	window.close()

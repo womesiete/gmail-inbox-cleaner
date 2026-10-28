@@ -105,3 +105,34 @@ def test_cli_can_replace_a_missing_saved_ai_module(tmp_path, monkeypatch):
 	replacement.write_text("def call_api(prompt):\n\treturn 'reviewed replacement'\n", encoding="utf-8")
 	monkeypatch.setattr(AppService, "run_job", lambda self, job_id, **kwargs: {"state": "completed", "failed": 0})
 	assert main(["--headless", "--ai-module", str(replacement), "--data-dir", str(root)]) == 0
+
+
+def test_confirmed_break_lease_is_metadata_only_and_bypasses_busy_instance(tmp_path, monkeypatch, capsys):
+	from gmail_clean import app, gui
+	from gmail_clean.runtime import digest
+	from gmail_clean.storage import Store
+	root = tmp_path / 'break-data'
+	directory = root / 'demo'
+	account = 'demo@example.invalid'
+	path = directory / ('mailbox-' + digest(account)[:12] + '.sqlite')
+	with Store(path, account) as owner:
+		assert owner.acquire_lease('mailbox_execution')
+		def forbidden(*args, **kwargs):
+			raise AssertionError('Lease repair must not open an app service or take the busy instance lock')
+		monkeypatch.setattr(gui, 'acquire_instance_lock', forbidden)
+		monkeypatch.setattr(app, 'AppService', forbidden)
+		assert main(['--demo', '--headless', '--break-lease', '--confirm-break-lease', '--data-dir', str(root)]) == 0
+		assert not owner.one("SELECT 1 FROM job_leases WHERE name='mailbox_execution'")
+		assert 'broken' in capsys.readouterr().out
+
+
+def test_unconfirmed_break_lease_does_not_open_state_or_service(tmp_path, monkeypatch):
+	from gmail_clean import app
+	calls = []
+	def forbidden(*args, **kwargs):
+		calls.append(True)
+		raise AssertionError('Unconfirmed repair must not open local state')
+	monkeypatch.setattr(app, 'Store', forbidden)
+	monkeypatch.setattr(app, 'AppService', forbidden)
+	assert main(['--headless', '--break-lease', '--data-dir', str(tmp_path)]) == 1
+	assert not calls
