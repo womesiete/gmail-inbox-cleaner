@@ -172,6 +172,7 @@ class ServiceTask(QRunnable):
 	def __init__(self, task_id, service, operation):
 		super().__init__()
 		self.task_id, self.service, self.operation = task_id, service, operation
+		self.simulation_requested = bool(service.config.dry_run)
 		self.signals = TaskSignals()
 		self.started = threading.Event()
 		self.cancelled = threading.Event()
@@ -183,6 +184,10 @@ class ServiceTask(QRunnable):
 				return
 			with self.service.worker() as worker:
 				try:
+					# A task submitted from simulation can never inherit a newer live
+					# preference. This overlay stays in this worker and never forces live.
+					if self.simulation_requested and callable(getattr(worker, "force_session_simulation", None)):
+						worker.force_session_simulation()
 					result = self.operation(worker, lambda text: self.signals.progress.emit(self.task_id, str(text)))
 				except Exception as exc:
 					if hasattr(worker, "error"):
@@ -1332,12 +1337,13 @@ class MainWindow(QMainWindow):
 		if not all_approved and not ids:
 			return
 		snapshot = self.service.plan_snapshot(action_ids=ids)
-		if not self.service.config.dry_run:
-			answer = QMessageBox.question(self, "Execute this plan", f"Execute this plan of {snapshot['count']} actions?\nPlan SHA-256: {snapshot['hash']}\nOnly these reviewed message IDs and label deltas are approved.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+		expected_dry_run = self.service.config.dry_run
+		if not expected_dry_run:
+			answer = QMessageBox.question(self, "Execute this plan", f"Execute this plan of {snapshot['count']} actions? Write cap: {self.service.config.max_actions_per_run}. Confirming authorizes this exact count.\nPlan SHA-256: {snapshot['hash']}\nOnly these reviewed message IDs and label deltas are approved.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
 			if answer != QMessageBox.StandardButton.Yes:
 				return
-		self._submit("Executing reviewed plan" if not self.service.config.dry_run else "Simulating approved plans",
-			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set, expected_plan_hash=snapshot["hash"]))
+		self._submit("Executing reviewed plan" if not expected_dry_run else "Simulating approved plans",
+			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set, expected_plan_hash=snapshot["hash"], allow_over_limit=snapshot["count"] > self.service.config.max_actions_per_run, expected_dry_run=expected_dry_run))
 
 	def _undo_scope_changed(self, *args):
 		self._describe_undo_scope(self._selected("history"))
@@ -1351,13 +1357,26 @@ class MainWindow(QMainWindow):
 			(f"Out-of-window IDs: {identifiers}" + ("…" if len(outside) > 10 else "") + ". " if outside else "") +
 			"Undo is a narrow exception for recorded deltas; newer replies are never included.")
 
-	def undo_selected(self, table="history"):
+	def undo_selected(self, table="history", *, allow_unverified=False):
 		rows = self._selected(table)
 		ids = [row["id"] for row in rows]
 		if not ids:
 			return
 		self._describe_undo_scope(rows)
-		self._submit(f"Undoing {len(ids)} recorded actions", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
+		self._submit_undo(ids, f"Undoing {len(ids)} recorded actions", allow_unverified=allow_unverified)
+
+	def _submit_undo(self, ids, title, *, allow_unverified=False):
+		count = len(ids)
+		cap = self.service.config.max_actions_per_run
+		over_limit = count > cap
+		if allow_unverified or over_limit:
+			details = f"Undo up to {count} explicit recorded actions? Write cap: {cap}. Confirming authorizes this exact selection."
+			if allow_unverified:
+				details += "\nGmail history has finite retention, so ownership is unverified. Every current label must exactly match its recorded after-state. This may reverse an effect also desired by another Gmail client."
+			answer = QMessageBox.warning(self, "Confirm recorded undo", details, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+			if answer != QMessageBox.StandardButton.Yes:
+				return
+		self._submit(title, lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set, allow_unverified=allow_unverified, confirmed=allow_unverified, allow_over_limit=over_limit))
 
 	def _undo_job(self):
 		rows = self._selected("history")
@@ -1368,7 +1387,7 @@ class MainWindow(QMainWindow):
 		actions = self._query(f"SELECT a.id,a.message_id,m.internal_ms FROM actions a LEFT JOIN messages m ON m.id=a.message_id WHERE a.job_id IN ({placeholders}) AND a.undo_of IS NULL", tuple(job_ids))
 		ids = [row["id"] for row in actions]
 		self._describe_undo_scope(actions)
-		self._submit(f"Undoing {len(ids)} original actions from {len(job_ids)} cleanup jobs", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
+		self._submit_undo(ids, f"Undoing {len(ids)} original actions from {len(job_ids)} cleanup jobs")
 
 	def _filter_history(self, text):
 		if "history" in self.models:
@@ -1540,7 +1559,7 @@ class MainWindow(QMainWindow):
 		if action == "undo":
 			if self._last_action_ids:
 				ids = list(self._last_action_ids)
-				self._submit("Undoing last review action", lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set))
+				self._submit_undo(ids, "Undoing last review action")
 			return
 		if self.tabs.currentIndex() != 1:
 			return

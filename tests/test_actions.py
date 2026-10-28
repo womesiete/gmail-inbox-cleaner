@@ -749,3 +749,111 @@ def test_explicit_http_rejection_records_not_applied_instead_of_uncertain(app, s
 	app.actions.apply([aid])
 	assert state(app, aid)["state"] == ("conflict" if status_code in {400, 404, 422} else "retry")
 	assert app.store.one("SELECT state FROM attempts WHERE action_id=?", (aid,))["state"] == "not_applied"
+
+
+def test_write_cap_requires_explicit_confirmation(app):
+	app.config.max_actions_per_run = 1
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(2)]
+	with pytest.raises(ValueError, match="exceeds the write cap"):
+		app.actions.apply(ids)
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")
+	assert app.actions.apply(ids, allow_over_limit=True)["applied"] == 2
+
+
+def test_reviewed_delta_changed_during_preflight_refuses_the_batch(app):
+	aid = plan(app, seed(app))
+	snapshot = app.actions.plan_snapshot([aid])
+	original = app.actions.preflight
+	changed = False
+	def preflight(action):
+		nonlocal changed
+		message = original(action)
+		if not changed:
+			app.store.execute("UPDATE actions SET add_json=? WHERE id=?", ('["Label_added"]', aid))
+			changed = True
+		return message
+	app.actions.preflight = preflight
+	with pytest.raises(ValueError, match="reviewed plan changed"):
+		app.actions.apply([aid], expected_plan_hash=snapshot["hash"])
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+def test_identity_callback_cannot_expand_confirmed_scope_or_write_cap(app, reviewed):
+	app.config.max_actions_per_run = 1
+	plan(app, seed(app, "reviewed"))
+	snapshot = app.actions.plan_snapshot()
+	original = app.mailbox.identity
+	inserted = False
+	def identity():
+		nonlocal inserted
+		if not inserted:
+			inserted = True
+			plan(app, seed(app, "unreviewed"))
+		return original()
+	app.mailbox.identity = identity
+	if reviewed:
+		with pytest.raises(ValueError, match="reviewed plan changed"):
+			app.actions.apply(expected_plan_hash=snapshot["hash"])
+		assert not app.mailbox.calls
+	else:
+		assert app.actions.apply()["applied"] == 1
+		assert app.mailbox.calls[0][0] == ["reviewed"]
+	assert "INBOX" in app.mailbox.messages["unreviewed"].labels
+
+
+def test_added_target_during_reviewed_preflight_refuses_before_first_write(app):
+	plan(app, seed(app, "reviewed"))
+	snapshot = app.actions.plan_snapshot()
+	original = app.actions.preflight
+	inserted = False
+	def preflight(action):
+		nonlocal inserted
+		message = original(action)
+		if not inserted:
+			inserted = True
+			plan(app, seed(app, "unreviewed"))
+		return message
+	app.actions.preflight = preflight
+	with pytest.raises(ValueError, match="reviewed plan changed"):
+		app.actions.apply(expected_plan_hash=snapshot["hash"])
+	assert not app.mailbox.calls
+
+
+def test_confirmed_undo_can_resume_previews_left_by_a_write_cap_refusal(app):
+	app.config.max_actions_per_run = 1
+	ids = [plan(app, seed(app, f"m{i}")) for i in range(2)]
+	assert app.actions.apply(ids, allow_over_limit=True)["applied"] == 2
+	with pytest.raises(ValueError, match="exceeds the write cap"):
+		app.actions.undo(ids)
+	assert app.actions.undo(ids, allow_over_limit=True)["applied"] == 2
+
+
+def test_submitted_simulation_can_never_be_promoted_to_live(app):
+	app.config.dry_run = True
+	aid = plan(app, seed(app))
+	app.reload_config = lambda: setattr(app.config, "dry_run", False)
+	with pytest.raises(ValueError, match="Execution mode changed"):
+		app.actions.apply([aid], expected_dry_run=True)
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")
+
+
+@pytest.mark.parametrize("expected_mode", [None, False])
+def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_mode):
+	aid = plan(app, seed(app))
+	original = app.mailbox.profile
+	def profile():
+		app.config.dry_run = True
+		return original()
+	app.mailbox.profile = profile
+	if expected_mode is False:
+		with pytest.raises(ValueError, match="Execution mode changed"):
+			app.actions.apply([aid], expected_dry_run=False)
+	else:
+		assert app.actions.apply([aid])["applied"] == 0
+		assert state(app, aid)["state"] == "proposed"
+	assert not app.mailbox.calls
+	assert not app.store.one("SELECT id FROM attempts")

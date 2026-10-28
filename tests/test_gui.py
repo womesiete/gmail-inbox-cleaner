@@ -466,3 +466,116 @@ def test_retry_refresh_resumes_due_system_pause_and_surfaces_block_reason(qapp, 
 	assert resumed == ["system"]
 	assert "Network recovery pending" in window.job_status.text()
 	window.close()
+
+
+def test_gui_undo_above_cap_requires_and_passes_explicit_confirmation(qtbot, service, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox
+	service.config.max_actions_per_run = 1
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	monkeypatch.setattr(window, "_selected", lambda table: [{"id": "a"}, {"id": "b"}])
+	prompts = []
+	def confirm(parent, title, text, *args):
+		prompts.append(text)
+		return QMessageBox.StandardButton.Yes
+	monkeypatch.setattr(QMessageBox, "question", confirm)
+	monkeypatch.setattr(QMessageBox, "warning", confirm)
+	calls = []
+	monkeypatch.setattr(service, "undo", lambda ids, **kwargs: calls.append((ids, kwargs)), raising=False)
+	monkeypatch.setattr(window, "_submit", lambda title, operation, done=None, **kwargs: operation(service, lambda value: None))
+	window.undo_selected("history")
+	assert len(prompts) == 1 and "2" in prompts[0] and "1" in prompts[0]
+	assert calls[0][1]["allow_over_limit"] is True
+
+
+def test_gui_undo_above_cap_decline_makes_no_worker_request(qtbot, service, monkeypatch):
+	from PyQt6.QtWidgets import QMessageBox
+	service.config.max_actions_per_run = 1
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	monkeypatch.setattr(QMessageBox, "warning", lambda *args: QMessageBox.StandardButton.No)
+	monkeypatch.setattr(window, "_submit", lambda *args, **kwargs: pytest.fail("Declined undo must not start a worker"))
+	window._submit_undo(["a", "b"], "Synthetic undo")
+
+
+def test_gui_simulation_mode_is_bound_to_the_submitted_operation(qtbot, service, monkeypatch):
+	window = MainWindow(service)
+	qtbot.addWidget(window)
+	monkeypatch.setattr(service, "plan_snapshot", lambda **kwargs: {"count": 1, "hash": "a" * 64}, raising=False)
+	operations = []
+	monkeypatch.setattr(window, "_submit", lambda title, operation, **kwargs: operations.append(operation))
+	window.apply_plan(True)
+	assert len(operations) == 1
+	service.config.dry_run = False
+	calls = []
+	monkeypatch.setattr(service, "apply_actions", lambda **kwargs: calls.append(kwargs), raising=False)
+	operations[0](service, lambda value: None)
+	assert calls[0]["expected_dry_run"] is True
+
+
+def test_every_gui_simulation_task_stays_readonly_with_newer_live_preferences(qapp, tmp_path):
+	from gmail_clean.gui import ServiceTask
+	from gmail_clean.service import AppService
+	service = AppService(data_dir=tmp_path, demo=True, count=2)
+	observed = []
+	def operation(worker, progress):
+		worker.reload_config()
+		observed.append((worker.config.dry_run, worker.store.checkpoint("effective_preferences")["dry_run"]))
+	try:
+		task = ServiceTask("mode-regression", service, operation)
+		preferences = service.store.checkpoint("effective_preferences")
+		preferences["dry_run"] = False
+		service.store.set_checkpoint("effective_preferences", preferences)
+		task.run()
+		assert observed == [(True, False)]
+	finally:
+		service.close()
+
+
+def test_settings_task_can_save_live_preference_while_current_task_stays_readonly(qapp, tmp_path):
+	from gmail_clean.gui import ServiceTask
+	from gmail_clean.service import AppService
+	service = AppService(data_dir=tmp_path, demo=True, count=2)
+	observed = []
+	def operation(worker, progress):
+		config = Config.from_dict({**worker.config.to_dict(), "dry_run": False})
+		worker.update_config(config)
+		worker.reload_config()
+		observed.append((worker.config.dry_run, worker.store.checkpoint("effective_preferences")["dry_run"]))
+	try:
+		ServiceTask("settings-mode-regression", service, operation).run()
+		assert observed == [(True, False)]
+		assert service.config.dry_run is True  # The UI changes only after its result callback.
+	finally:
+		service.close()
+
+
+@pytest.mark.parametrize("provider_problem", ["changed", "missing"])
+def test_readonly_gui_tasks_do_not_validate_or_load_the_external_provider(qapp, tmp_path, monkeypatch, provider_problem):
+	from gmail_clean.ai import AIError
+	from gmail_clean.gui import ServiceTask
+	from gmail_clean.service import AppService
+	service = AppService(data_dir=tmp_path / "data", demo=True, count=2)
+	provider = tmp_path / "synthetic_provider.py"
+	provider.write_text("# approved synthetic source\n", encoding="utf-8")
+	if provider_problem == "changed":
+		provider.write_text("# synthetic source changed after approval\n", encoding="utf-8")
+	else:
+		provider.unlink()
+	def trust_blocked(*args, **kwargs):
+		raise AIError("ModuleTrustError", f"Synthetic provider is {provider_problem}; reapproval is required")
+	# Integration injects the same trust failure that the configuration and AI
+	# boundaries emit. Read-only operations must not call either boundary.
+	monkeypatch.setattr(AppService, "set_session_config", trust_blocked)
+	monkeypatch.setattr(AppService, "ai_for", trust_blocked)
+	observed = []
+	def operation(worker, progress):
+		worker.reload_config()
+		observed.append((worker.config.dry_run, worker.store.one("SELECT count(*) n FROM messages")["n"]))
+		with pytest.raises(AIError, match="reapproval"):
+			worker.ai_for()
+	try:
+		ServiceTask("provider-independent-readonly", service, operation).run()
+		assert observed == [(True, 0)]
+	finally:
+		service.close()

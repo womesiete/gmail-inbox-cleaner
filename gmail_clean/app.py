@@ -28,6 +28,8 @@ def parser():
 	result.add_argument("--model", help="Exact external model identifier; empty uses the module default")
 	result.add_argument("--credentials", type=Path, help="Installed-desktop OAuth client JSON for explicit connection")
 	result.add_argument("--live", action="store_true", help="Explicitly enable mailbox writes for this invocation")
+	result.add_argument("--max-actions", type=int, help="Maximum mailbox actions authorized for this invocation")
+	result.add_argument("--yes", action="store_true", help="Confirm live execution, including a plan above the configured write cap")
 	result.add_argument("--apply", action="store_true", help="Apply current approved proposals (requires live mode)")
 	result.add_argument("--backup", type=Path, help="Save a consistent SQLite backup after the run")
 	return result
@@ -97,8 +99,10 @@ def run_until_settled(service, job_id, progress=None, *, should_stop=None, sleep
 def main(argv=None) -> int:
 	multiprocessing.freeze_support()
 	args = parser().parse_args(argv)
-	if args.count < 1 or (args.benchmark is not None and args.benchmark < 1):
+	if args.count < 1 or (args.benchmark is not None and args.benchmark < 1) or (args.max_actions is not None and args.max_actions < 1):
 		parser().error("Counts must be positive")
+	if args.headless and args.live and args.max_actions is None and not args.yes:
+		parser().error("Headless --live requires --max-actions N or --yes")
 	directory = args.data_dir / ("demo" if args.demo else "live") if args.data_dir else data_directory(args.demo)
 	directory.mkdir(parents=True, exist_ok=True)
 	if args.benchmark:
@@ -107,7 +111,6 @@ def main(argv=None) -> int:
 		print(json.dumps(benchmark(args.benchmark, directory), indent=2))
 		return 0
 	service = None
-	cli_previous_dry_run = None
 	try:
 		if args.headless:
 			from .gui import acquire_instance_lock
@@ -115,10 +118,10 @@ def main(argv=None) -> int:
 			service = AppService(data_dir=directory, demo=args.demo, count=args.count)
 			# A console run always requires its own explicit --live choice, even
 			# when the desktop's saved preferences allow automatic execution.
-			cli_previous_dry_run = service.config.dry_run
-			config = Config.from_dict(service.config.to_dict())
-			config.dry_run = not args.live
-			service.update_config(config)
+			service.set_session_config(dry_run=not args.live)
+			service._session_write_confirmation = args.yes
+			if args.max_actions is not None:
+				service.set_session_config(max_actions_per_run=args.max_actions)
 		else:
 			from PyQt6.QtCore import QSettings
 			from PyQt6.QtWidgets import QApplication
@@ -138,7 +141,7 @@ def main(argv=None) -> int:
 				config.ai_model = args.model
 			if args.live:
 				config.dry_run = False
-			service.update_config(config)
+			service.set_session_config(**{name: getattr(config, name) for name in ("ai_module", "ai_model", "dry_run")})
 		if args.credentials:
 			service.connect(args.credentials)
 		if args.headless:
@@ -154,7 +157,9 @@ def main(argv=None) -> int:
 			if args.apply and summary["state"] == "completed":
 				if service.config.dry_run:
 					raise ValueError("Enable live mode explicitly before applying proposals")
-				summary["execution"] = service.apply_actions(job_id=job_id)
+				snapshot = service.plan_snapshot(job_id=job_id)
+				summary["execution_plan"] = snapshot
+				summary["execution"] = service.apply_actions(job_id=job_id, expected_plan_hash=snapshot["hash"], allow_over_limit=args.yes)
 			if args.backup:
 				summary["backup"] = service.backup(args.backup)
 			print(json.dumps(summary, indent=2))
@@ -199,10 +204,6 @@ def main(argv=None) -> int:
 		return 1
 	finally:
 		if service is not None:
-			if cli_previous_dry_run is not None:
-				config = Config.from_dict(service.config.to_dict())
-				config.dry_run = cli_previous_dry_run
-				service.update_config(config)
 			service.close()
 
 

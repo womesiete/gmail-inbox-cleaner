@@ -45,6 +45,8 @@ class AppService:
 		else:
 			self._clients = self._resource_owner._clients
 			self._clients_lock = self._resource_owner._clients_lock
+		self._config_overrides = dict(getattr(self._resource_owner, "_config_overrides", {}))
+		self._session_write_confirmation = getattr(self._resource_owner, "_session_write_confirmation", False)
 		self._cancel_event = threading.Event()
 		self._lease_depth = 0
 		self.current_job_id = None
@@ -70,6 +72,7 @@ class AppService:
 			self.config.label_meanings.setdefault("label_action", "requires_attention")
 		if demo and not self.config.ai_module:
 			self.config.ai_module = "gmail_clean.demo_ai"
+		self.config = Config.from_dict({**self.config.to_dict(), **self._config_overrides})
 		self._validate_demo_ai(self.config)
 		self.config.validate()
 		if config is not None or saved is None:
@@ -190,10 +193,24 @@ class AppService:
 		if self.demo and config.ai_module != "gmail_clean.demo_ai":
 			raise AIError("ConfigurationError", "Offline demo uses only gmail_clean.demo_ai. Launch Personal mode to configure an external AI module.")
 
+	def force_session_simulation(self):
+		"""Restrict one worker to read-only mode without approving or loading AI code."""
+		self._config_overrides["dry_run"] = True
+		self.config.dry_run = True
+		self.reload_config()
+
+	def set_session_config(self, **overrides):
+		"""Apply invocation-only preferences without writing a live flag to disk."""
+		candidate = Config.from_dict({**self.config.to_dict(), **overrides})
+		candidate.validate()
+		self._validate_demo_ai(candidate)
+		self._config_overrides.update(overrides)
+		self.reload_config()
+
 	def reload_config(self):
 		value = self.store.checkpoint("effective_preferences")
 		if value:
-			self.config = Config.from_dict(value)
+			self.config = Config.from_dict({**value, **self._config_overrides})
 			self.learning.enabled = self.config.learning_enabled
 
 	def update_config(self, config):
@@ -483,14 +500,14 @@ class AppService:
 	def plan_snapshot(self, action_ids=None, job_id=None):
 		return self.actions.plan_snapshot(action_ids, job_id)
 
-	def apply_actions(self, action_ids=None, job_id=None, should_stop=None, *, expected_plan_hash=None):
+	def apply_actions(self, action_ids=None, job_id=None, should_stop=None, *, expected_plan_hash=None, allow_over_limit=False, expected_dry_run=None):
 		with self.execution_lease():
 			self.reload_config()
-			return self.actions.apply(action_ids, job_id, should_stop=self._stop_callback(should_stop), expected_plan_hash=expected_plan_hash)
+			return self.actions.apply(action_ids, job_id, should_stop=self._stop_callback(should_stop), expected_plan_hash=expected_plan_hash, allow_over_limit=allow_over_limit or self._session_write_confirmation, expected_dry_run=expected_dry_run)
 
-	def undo(self, action_ids, should_stop=None):
+	def undo(self, action_ids, should_stop=None, *, allow_unverified=False, confirmed=False, allow_over_limit=False):
 		with self.execution_lease():
-			return self.actions.undo(action_ids, should_stop=self._stop_callback(should_stop))
+			return self.actions.undo(action_ids, should_stop=self._stop_callback(should_stop), allow_unverified=allow_unverified, confirmed=confirmed, allow_over_limit=allow_over_limit or self._session_write_confirmation)
 
 	def replan(self, should_stop=None):
 		should_stop = self._stop_callback(should_stop)

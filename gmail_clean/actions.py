@@ -17,6 +17,13 @@ if TYPE_CHECKING:
 	from .service import AppService
 
 
+class PlanConfirmationError(ValueError):
+	"""A content-free explanation the desktop may display without redaction."""
+	def __init__(self, message: str):
+		super().__init__(message)
+		self.safe_message = message
+
+
 class ActionExecutor:
 	def __init__(self, service: AppService):
 		self.s = service
@@ -27,6 +34,10 @@ class ActionExecutor:
 		self._batch_identity_cache = False
 		self._identity_verified = False
 		self._should_stop: Callable[[], bool] | None = None
+		self._undo_history_start = None
+		self._undo_history_evidence = None
+		self._reviewed_scope = None
+		self._expected_dry_run = None
 
 	def _stop_requested(self) -> bool:
 		return bool(self._should_stop and self._should_stop())
@@ -166,6 +177,30 @@ class ActionExecutor:
 		current = self.db.one("SELECT state FROM actions WHERE id=?", (action["id"],))
 		return bool(current and current["state"] in {"queued", "proposed", "retry"})
 
+	@staticmethod
+	def _intent_hash(action) -> str:
+		keys = ("id", "account_id", "job_id", "message_id", "action", "add_json", "remove_json", "before_json", "context_version", "precondition_version", "policy_version", "approval", "undo_of", "payload_json")
+		return digest({key: action[key] for key in keys})
+
+	def _assert_execution_mode(self) -> None:
+		if self._expected_dry_run is not None and self.s.config.dry_run != self._expected_dry_run:
+			raise PlanConfirmationError("Execution mode changed; review and confirm the current simulation/live setting before executing this plan")
+
+	def _assert_reviewed_scope(self, expected_hash=None) -> None:
+		if self._reviewed_scope is None:
+			return
+		action_ids, job_id, approved_ids = self._reviewed_scope
+		snapshot = self.plan_snapshot(action_ids, job_id)
+		if (expected_hash is not None and snapshot["hash"] != expected_hash) or not set(snapshot["action_ids"]) <= approved_ids:
+			raise PlanConfirmationError("The reviewed plan changed during preflight; review its count and hash again")
+
+	def _assert_intents_unchanged(self, ready) -> None:
+		self._assert_reviewed_scope()
+		for action, _ in ready:
+			current = self.db.one("SELECT * FROM actions WHERE id=?", (action["id"],))
+			if current is None or self._intent_hash(current) != self._intent_hash(action):
+				raise ValueError("The reviewed plan changed during preflight; review its count and hash again")
+
 	def plan_snapshot(self, action_ids=None, job_id=None) -> dict:
 		"""Hash the exact reviewed target IDs and write intents, independent of simulation."""
 		where = "state IN ('queued','proposed','uncertain','executing','retry')"
@@ -182,14 +217,23 @@ class ActionExecutor:
 		keys = ("id", "account_id", "job_id", "message_id", "action", "add_json", "remove_json", "before_json", "context_version", "precondition_version", "policy_version", "approval", "undo_of", "payload_json")
 		return {"count": len(rows), "hash": digest([{key: row[key] for key in keys} for row in rows]), "action_ids": [row["id"] for row in rows]}
 
-	def apply(self, action_ids=None, job_id=None, should_stop: Callable[[], bool] | None = None, *, expected_plan_hash: str | None = None) -> dict:
+	def apply(self, action_ids=None, job_id=None, should_stop: Callable[[], bool] | None = None, *, expected_plan_hash: str | None = None, allow_over_limit: bool = False, expected_dry_run: bool | None = None) -> dict:
 		self._batch_identity_cache = True
 		self._identity_verified = False
 		self._should_stop = should_stop
+		self._expected_dry_run = expected_dry_run
 		try:
-			if expected_plan_hash is not None and self.plan_snapshot(action_ids, job_id)["hash"] != expected_plan_hash:
+			self._assert_execution_mode()
+			action_ids = list(action_ids) if action_ids is not None else None
+			snapshot = self.plan_snapshot(action_ids, job_id)
+			if expected_plan_hash is not None and snapshot["hash"] != expected_plan_hash:
 				raise ValueError("The reviewed plan changed; inspect the count and hash again before execution")
-			return self._apply(action_ids, job_id)
+			if not self.s.config.dry_run and snapshot["count"] > self.s.config.max_actions_per_run and not allow_over_limit:
+				raise PlanConfirmationError(f"Plan of {snapshot['count']} actions exceeds the write cap of {self.s.config.max_actions_per_run}; explicit confirmation is required")
+			self._reviewed_scope = (action_ids, job_id, set(snapshot["action_ids"])) if expected_plan_hash is not None else None
+			# Freeze selection for every invocation, including unattended execution:
+			# a network callback must never add targets beyond the checked cap.
+			return self._apply(snapshot["action_ids"], job_id, reviewed_hash=expected_plan_hash)
 		finally:
 			# Neither another command nor a canceled/failed request may reuse stale
 			# live state, identity evidence, or a prior command's stop callback.
@@ -198,15 +242,19 @@ class ActionExecutor:
 			self._batch_identity_cache = False
 			self._identity_verified = False
 			self._should_stop = None
+			self._reviewed_scope = None
+			self._expected_dry_run = None
 
-	def _apply(self, action_ids=None, job_id=None) -> dict:
+	def _apply(self, action_ids=None, job_id=None, *, reviewed_hash=None) -> dict:
 		self.s.reload_config()
+		self._assert_execution_mode()
 		if self.s.config.dry_run:
 			return {"applied": 0, "dry_run": True, "message": "Simulation: no mailbox changes"}
 		if self._stop_requested():
 			return {"applied": 0, "dry_run": False, "stopped": True}
 		self.verify_identity()
 		self.s.refresh_labels()
+		self._assert_reviewed_scope(reviewed_hash)
 		where = "state IN ('queued','proposed','uncertain','executing','retry')"
 		params = []
 		if action_ids is not None:
@@ -265,6 +313,7 @@ class ActionExecutor:
 				# Configuration may change while another item in this chunk is
 				# checked. Apply the latest restrictions to every ready item.
 				self.s.reload_config()
+				self._assert_execution_mode()
 				if self.s.config.dry_run:
 					for action, _ in ready:
 						self.mark(action["id"], "proposed", "Simulation enabled before the network write")
@@ -284,8 +333,16 @@ class ActionExecutor:
 					return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 				# Persist the start of the write interval. A receipt checkpoint taken
 				# only after readback could skip a concurrent user edit before undo.
+				self._assert_intents_unchanged(ready)
 				before_write_history_id = self._checkpoint()
 				with self.db.transaction():
+					self.s.reload_config()
+					self._assert_execution_mode()
+					if self.s.config.dry_run:
+						for action, _ in ready:
+							self.mark(action["id"], "proposed", "Simulation enabled at the last write checkpoint")
+						ready = []
+					self._assert_intents_unchanged(ready)
 					# Check again after the network checkpoint, under the transaction
 					# that claims these intents. Another local worker may have edited
 					# a matching rule while the profile request was in flight.
@@ -296,6 +353,17 @@ class ActionExecutor:
 						self.db.execute("UPDATE actions SET state='executing',attempt_id=?,before_json=?,updated_at=? WHERE id=?", (attempt, encode(sorted(message.labels)), stamp(), action["id"]))
 				if not ready:
 					continue
+				# A durable attempt is not permission to ignore a newly enabled
+				# simulation setting while the request was still unsent.
+				self.s.reload_config()
+				if self.s.config.dry_run:
+					with self.db.transaction():
+						for action, _ in ready:
+							self.db.execute("UPDATE attempts SET state='cancelled_before_send',finished_at=? WHERE action_id=? AND state='sending'", (stamp(), action["id"]))
+							self.mark(action["id"], "proposed", "Simulation enabled before the network write")
+					self._assert_execution_mode()
+					continue
+				self._assert_execution_mode()
 				try:
 					if self._stop_requested():
 						with self.db.transaction():
@@ -464,7 +532,7 @@ class ActionExecutor:
 		else:
 			self.mark(action["id"], "conflict", "Partial/ambiguous effects after uncertain attempt")
 
-	def undo(self, action_ids, should_stop: Callable[[], bool] | None = None) -> dict:
+	def undo(self, action_ids, should_stop: Callable[[], bool] | None = None, *, allow_unverified=False, confirmed=False, allow_over_limit=False) -> dict:
 		queued = []
 		for aid in action_ids:
 			if should_stop and should_stop():
@@ -482,8 +550,19 @@ class ActionExecutor:
 			# A settings change can stale an unexecuted undo preview. Cancel that
 			# preview so a new explicit undo may use current restrictions.
 			self.db.execute("UPDATE actions SET state='cancelled',reason='Stale undo preview superseded',updated_at=? WHERE undo_of=? AND state='stale'", (stamp(), aid))
-			if self.db.one("SELECT id FROM actions WHERE undo_of=? AND state NOT IN ('cancelled','conflict')", (aid,)):
-				continue
+			existing = self.db.one("SELECT id,state,payload_json FROM actions WHERE undo_of=? AND state NOT IN ('cancelled','conflict')", (aid,))
+			if existing:
+				if existing["state"] in {"uncertain", "executing"}:
+					queued.append(existing["id"])
+					continue
+				if existing["state"] in {"queued", "proposed", "retry"}:
+					same_authorization = bool(json.loads(existing["payload_json"]).get("ownership_unverified_confirmation")) == bool(allow_unverified)
+					if same_authorization:
+						queued.append(existing["id"])
+						continue
+					self.mark(existing["id"], "cancelled", "Explicit undo authorization mode changed")
+				else:
+					continue
 			payload = json.loads(action["payload_json"])
 			if payload.get("ownership") != "confirmed_response":
 				self.mark(aid, "conflict", "Lost response leaves app ownership ambiguous; inspect Gmail before undo")
@@ -494,7 +573,7 @@ class ActionExecutor:
 			insert(self.db, "actions", {"id": uid, "job_id": action["job_id"], "message_id": action["message_id"], "state": "proposed" if self.s.config.dry_run else "queued", "action": "undo", "add_json": action["remove_json"], "remove_json": action["add_json"], "before_json": action["after_json"], "context_version": action["context_version"], "policy_version": self.s.config.revision, "approval": "manual", "reason": "Explicit undo of recorded app-owned changes", "undo_of": aid, "created_at": stamp(), "updated_at": stamp(), "payload_json": encode(payload)})
 			queued.append(uid)
 		if queued and not self.s.config.dry_run:
-			return self.apply(queued, should_stop=should_stop)
+			return self.apply(queued, should_stop=should_stop, allow_over_limit=allow_over_limit)
 		return {"queued": len(queued), "dry_run": self.s.config.dry_run, "stopped": bool(should_stop and should_stop())}
 
 	def preflight_undo(self, action, message, payload, add, remove):

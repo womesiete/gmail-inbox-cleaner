@@ -2,7 +2,7 @@
 
 ## Simulation and live actions
 
-Simulation is enabled by default. A job can discover messages, assess them, save feedback, and build an action ledger without changing Gmail. **Queued/proposed** does not mean **applied**. Inspect the target counts, exact dates, reasons, and exceptions in Plan before switching off simulation. Switching simulation off preserves the reviewed plan. Choose **Execute this plan** (or **Execute selected plan**) and confirm its exact action count and SHA-256 plan hash. If target IDs or write intents changed while the confirmation was open, execution refuses the old approval and requires another review.
+Simulation is enabled by default. A job can discover messages, assess them, save feedback, and build an action ledger without changing Gmail. **Queued/proposed** does not mean **applied**. Inspect the target counts, exact dates, reasons, and exceptions in Plan before switching off simulation. Switching simulation off preserves the reviewed plan. Commands submitted while Simulation is on remain read-only for their entire worker invocation, even if newer preferences enable live mode while they wait; the next live command requires a fresh explicit choice. Choose **Execute this plan** (or **Execute selected plan**) and confirm its exact action count and SHA-256 plan hash. If target IDs or write intents changed while the confirmation was open, execution refuses the old approval and requires another review.
 
 In live mode, an ordinary manual Archive or label command queues execution asynchronously; repeated confirmation dialogs are not part of the normal review flow. Direct selections apply only to the displayed explicit message IDs. The live executor still checks the account, scope, current protections, labels, context, and action versions. A setting change or new reply can make an approved proposal stale.
 
@@ -121,3 +121,10 @@ Undo uses the original explicit IDs and inverse app-owned deltas. It can restore
 | Pending action is stale | Refresh/review the item. New context, scope, protections, labels, or policy can invalidate the old approval. |
 | Another application instance owns the directory | Use the running instance or wait for clean exit. Lock/lease recovery protects jobs; do not bypass a live owner's lock. |
 | No console when diagnosing startup | Re-run with `.venv\Scripts\python.exe -m gmail_clean` so import/platform errors are visible. |
+
+
+## Write limits and console opt-in
+
+`max_actions_per_run` defaults to 1,000. A larger reviewed plan requires explicit confirmation of its exact count in **Execute this plan**. The limit also applies to automatic execution and undo; unattended execution cannot silently exceed it. Selected-action, cleanup-job, and keyboard undo paths ask for the same explicit count confirmation above the limit. Execution freezes the checked target IDs, so work added by another worker cannot expand the approved set or bypass the cap.
+
+Headless live runs require `--live --max-actions N` or `--live --yes`. Use `--max-actions` to impose an invocation limit; `--yes` explicitly confirms execution above the configured cap. The JSON result records the execution count and plan hash. Console `--live`, model, and module overrides exist only for that invocation and never persist a live preference, including after an interrupted or crashed run.

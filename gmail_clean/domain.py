@@ -90,6 +90,7 @@ class Config:
 	ai_timeout_seconds: float = 120.0
 	retrieval_batch_size: int = 25
 	execution_batch_size: int = 100
+	max_actions_per_run: int = 1000
 	max_retries: int = 3
 	retry_base_seconds: float = 2.0
 	maintenance_interval_minutes: int = 60
@@ -123,7 +124,7 @@ class Config:
 	def revision(self) -> str:
 		"""Execution-relevant revision; layout/logging changes do not stale plans."""
 		value = self.to_dict()
-		for key in ("dry_run", "shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras"):
+		for key in ("dry_run", "max_actions_per_run", "shortcuts", "log_level", "maintenance_interval_minutes", "retention_days", "estimated_cost_per_call", "extras"):
 			value.pop(key, None)
 		return canonical_hash(value)
 
@@ -134,7 +135,7 @@ class Config:
 			raise ValueError("Choose a valid IANA policy timezone") from exc
 		if self.latest_mode not in {"rolling", "fixed"}:
 			raise ValueError("Latest mode must be rolling or fixed")
-		for name in ("latest_days", "age_months", "age_days", "max_retries", "retention_days"):
+		for name in ("latest_days", "age_months", "age_days", "max_retries", "retention_days", "max_actions_per_run"):
 			if type(getattr(self, name)) is not int or getattr(self, name) < 0:
 				raise ValueError(f"{name} must be a non-negative integer")
 		if not 0 <= self.archive_threshold < self.keep_threshold <= 100:
