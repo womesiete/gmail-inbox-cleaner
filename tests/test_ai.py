@@ -208,14 +208,31 @@ def test_pause_and_serial_sequential_calls(tmp_path):
 
 
 def test_watchdog_terminates_only_local_work_and_records_abandonment(tmp_path):
-	path = module_file(tmp_path, "import time\ndef call_api(prompt):\n\ttime.sleep(2)\n\treturn 'late'\n")
-	with AIClient(path, timeout_s=1) as client:
+	path = module_file(tmp_path, "import time\nfrom pathlib import Path\ndef call_api(prompt):\n\tif prompt == 'ready':\n\t\treturn 'ready'\n\tPath(__file__).with_suffix('.started').write_text('started')\n\ttime.sleep(2)\n\treturn 'late'\n")
+	with AIClient(path) as client:
+		# Cold Windows spawn/import time is a separate lifecycle stage. Confirm
+		# readiness before testing the deliberately short active-call watchdog.
+		assert client.call("ready").text == "ready"
+		client.timeout_s = 1
 		with pytest.raises(AIError) as captured:
 			client.call("x")
+		assert (tmp_path / "private_test_module.started").read_text() == "started"
 		assert captured.value.category == "InterruptedRequest"
 		assert captured.value.request_id
 		assert client.request_state == "abandoned"
 		assert "billed" in str(captured.value)
+		assert client.worker_pid is None
+
+
+def test_import_watchdog_is_distinct_from_an_abandoned_provider_call(tmp_path):
+	path = module_file(tmp_path, "import time\ntime.sleep(2)\ndef call_api(prompt):\n\treturn 'unreachable'\n")
+	with AIClient(path, timeout_s=0.1) as client:
+		with pytest.raises(AIError) as captured:
+			client.call("x")
+		assert captured.value.category == "ImportInitializationError"
+		assert captured.value.configuration
+		assert not captured.value.request_id
+		assert client.request_state == "load_failed"
 		assert client.worker_pid is None
 
 

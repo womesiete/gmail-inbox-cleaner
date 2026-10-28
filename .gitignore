@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+/test-results.xml
 htmlcov/
 *.egg-info/
 build/

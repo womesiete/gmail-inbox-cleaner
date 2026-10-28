@@ -7,7 +7,7 @@ Checks recorded on **2026-10-28**, using **Linux and Python 3.12** in a project 
 | Check | Result |
 | --- | --- |
 | Editable installation, `python -m pip install -e '.[dev]'` | Passed. |
-| Complete suite, `QT_QPA_PLATFORM=offscreen python -m pytest -q` | 211 tests passed in 14.83 seconds, including final privacy, action ownership, GUI, and console opt-in regressions. |
+| Complete suite, `QT_QPA_PLATFORM=offscreen python scripts/ci_tests.py` | 220 tests passed in 13.94 seconds after the hosted-CI portability corrections below. |
 | Cross-component offline acceptance, `python -m pytest tests/test_acceptance.py -q` | 4 passed in 1.94 seconds. |
 | Full lint, `python -m ruff check gmail_clean tests scripts` | Passed with Ruff 0.9.10. |
 | Compile checks, `python -m compileall -q gmail_clean tests scripts` | Passed. |
@@ -15,6 +15,20 @@ Checks recorded on **2026-10-28**, using **Linux and Python 3.12** in a project 
 | Source/wheel packaging, `python -m build` | Passed; produced an sdist with documentation/scripts/tests and a wheel with application modules. |
 
 The [acceptance checklist](acceptance.md) maps requirement areas to specific test files. The GitHub Actions workflow defines Linux/Windows checks; creating that workflow does not establish that hosted CI or Windows-native execution has passed.
+
+## Hosted-CI portability corrections
+
+The first hosted run, [40697152081](https://github.com/womesiete/gmail-inbox-cleaner/actions/runs/40697152081), failed during tests on all four OS/Python combinations despite the earlier 211-test local Linux pass. Installation, compilation, and lint succeeded. Public annotations reported pytest exit code 3 on Linux and exit code 1 on Windows; they did not include the test traceback.
+
+The follow-up correction adds:
+
+- Query-only Windows process-liveness checks using `OpenProcess`, `GetExitCodeProcess`, and `CloseHandle`. Windows must never use POSIX-style `os.kill(pid, 0)` for lease probing. Regressions include a subprocess self-probe so unintended termination cannot look like a successful test exit.
+- Explicit Linux Qt native runtime dependencies and an offscreen QApplication startup check before pytest.
+- Separate AI worker readiness and active-call timeout tests, so cold Windows process startup is not mistaken for a timed-out provider request.
+- A test wrapper that preserves failures, emits a bounded traceback annotation, and saves JUnit/output files. Failed hosted jobs upload these diagnostics. The wrapper's failure path was separately checked with an intentionally failing synthetic test.
+- Current Node24-based versions of the checkout, Python setup, and artifact actions. The original Node20 deprecation annotations were warnings, not evidence of the test failure's cause.
+
+The local 220-test result above exercises all regressions. Native Windows behavior and the complete hosted matrix must additionally be assessed from the follow-up workflow run; a local result does not establish hosted success.
 
 ## Offline 3,000-message pipeline
 

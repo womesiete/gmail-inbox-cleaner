@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,3 +164,62 @@ def test_upgrade_from_first_schema_is_transactional(tmp_path):
 		store.execute("INSERT INTO jobs(id) VALUES('retained')")
 	with Store(path, "me@example.invalid") as store:
 		assert store.one("SELECT id FROM jobs WHERE id='retained'")
+
+
+@pytest.mark.parametrize("exit_code,query_succeeds,expected", [(259, True, True), (0, True, False), (1, True, False), (0, False, True)])
+def test_windows_lease_probe_uses_query_only_access_and_closes_handle(monkeypatch, exit_code, query_succeeds, expected):
+	from gmail_clean import storage
+
+	class NativeFunction:
+		def __init__(self, function):
+			self.function = function
+
+		def __call__(self, *args):
+			return self.function(*args)
+
+	calls = []
+	def open_process(access, inherit, pid):
+		calls.append(("open", access, inherit, pid))
+		return 0x123456789  # Exercise an opaque handle wider than a 32-bit integer.
+
+	def get_exit_code(handle, pointer):
+		calls.append(("query", handle))
+		pointer._obj.value = exit_code
+		return query_succeeds
+
+	api = SimpleNamespace(OpenProcess=NativeFunction(open_process), GetExitCodeProcess=NativeFunction(get_exit_code),
+		CloseHandle=NativeFunction(lambda handle: calls.append(("close", handle)) or True))
+	monkeypatch.setattr(storage, "_windows_process_api", lambda: (api, lambda: 0))
+	def forbidden_signal(*args):
+		raise AssertionError("A Windows liveness check must never signal a process")
+	monkeypatch.setattr(storage, "os", SimpleNamespace(name="nt", kill=forbidden_signal))
+	assert storage._pid_alive(1234) is expected
+	assert calls == [("open", 0x1000, False, 1234), ("query", 0x123456789), ("close", 0x123456789)]
+
+
+@pytest.mark.parametrize("native_error,expected", [(87, False), (5, True), (6, True)])
+def test_windows_lease_probe_does_not_recover_a_process_with_unknown_status(monkeypatch, native_error, expected):
+	from gmail_clean import storage
+
+	class NativeFunction:
+		def __init__(self, function):
+			self.function = function
+
+		def __call__(self, *args):
+			return self.function(*args)
+
+	def unexpected(*args):
+		raise AssertionError("An unopened handle must not be queried or closed")
+	api = SimpleNamespace(OpenProcess=NativeFunction(lambda *args: None), GetExitCodeProcess=NativeFunction(unexpected), CloseHandle=NativeFunction(unexpected))
+	monkeypatch.setattr(storage, "_windows_process_api", lambda: (api, lambda: native_error))
+	assert storage._windows_pid_alive(1234) is expected
+
+
+def test_current_process_lease_probe_is_non_destructive():
+	# Run in a child so a future Windows os.kill regression becomes a failed
+	# assertion rather than silently terminating the entire pytest process.
+	result = subprocess.run([sys.executable, "-c",
+		"import os; from gmail_clean.storage import _pid_alive; assert _pid_alive(os.getpid()); print('owner-is-alive')"],
+		capture_output=True, text=True, timeout=30, check=False)
+	assert result.returncode == 0, result.stderr
+	assert result.stdout.strip() == "owner-is-alive"

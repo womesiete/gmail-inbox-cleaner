@@ -445,6 +445,8 @@ class Store:
 def _pid_alive(pid: int) -> bool:
 	if pid <= 0:
 		return False
+	if os.name == "nt":
+		return _windows_pid_alive(pid)
 	try:
 		os.kill(pid, 0)
 	except ProcessLookupError:
@@ -454,3 +456,45 @@ def _pid_alive(pid: int) -> bool:
 	except OSError:
 		return False
 	return True
+
+
+def _windows_process_api():
+	"""Load Win32 functions lazily so importing the store stays portable."""
+	import ctypes
+	return ctypes.WinDLL("kernel32", use_last_error=True), ctypes.get_last_error
+
+
+def _windows_pid_alive(pid: int) -> bool:
+	"""Query a process without sending a signal or requesting termination rights.
+
+	Windows ``os.kill(pid, 0)`` does not provide the POSIX existence probe. Use
+	only limited query access, and retain the lease whenever access/query errors
+	leave the owner's state unknown. Only a missing or exited process is dead.
+	"""
+	import ctypes
+	from ctypes import wintypes
+
+	kernel32, last_error = _windows_process_api()
+	open_process = kernel32.OpenProcess
+	open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+	open_process.restype = wintypes.HANDLE
+	get_exit_code = kernel32.GetExitCodeProcess
+	get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+	get_exit_code.restype = wintypes.BOOL
+	close_handle = kernel32.CloseHandle
+	close_handle.argtypes = [wintypes.HANDLE]
+	close_handle.restype = wintypes.BOOL
+
+	# PROCESS_QUERY_LIMITED_INFORMATION; never PROCESS_TERMINATE or ALL_ACCESS.
+	handle = open_process(0x1000, False, pid)
+	if not handle:
+		# OpenProcess uses ERROR_INVALID_PARAMETER for a nonexistent process ID.
+		# Access denied and other unknown failures must not steal a live lease.
+		return last_error() != 87
+	try:
+		exit_code = wintypes.DWORD()
+		if not get_exit_code(handle, ctypes.byref(exit_code)):
+			return True
+		return exit_code.value == 259  # STILL_ACTIVE
+	finally:
+		close_handle(handle)
