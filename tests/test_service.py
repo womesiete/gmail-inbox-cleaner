@@ -225,7 +225,7 @@ def test_bulk_review_has_one_feedback_group_and_retention_keeps_undo_history(tmp
 		service.manual([item.id for item in messages], "archive")
 		assert service.store.one("SELECT count(DISTINCT group_id) n FROM feedback")["n"] == 1
 		assert service.store.one("SELECT count(*) n FROM actions")["n"] == 3
-		service.store.execute("UPDATE messages SET updated_at='2000-01-01T00:00:00+00:00'")
+		service.store.execute("UPDATE messages SET body_cached_at='2000-01-01T00:00:00+00:00'")
 		assert service.retention()["bodies_removed"] == 3
 		assert service.store.one("SELECT count(*) n FROM actions")["n"] == 3
 		assert all(not service.store.get_message(item.id).body for item in messages)

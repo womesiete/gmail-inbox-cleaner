@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -329,3 +330,30 @@ def test_trigger_ddl_is_migrated_once_and_bulk_upsert_is_atomic(tmp_path, monkey
 			store.upsert_messages([message('ok'), replace(message('bad'), account_id='wrong@example.invalid')])
 		assert store.get_message('ok') is None
 		assert store.one('PRAGMA synchronous')['synchronous'] == 2
+
+
+def test_cached_bodies_are_single_copy_and_expire_independent_of_refresh(tmp_path):
+	with Store(tmp_path / 'retention.sqlite', 'me@example.invalid') as store:
+		store.upsert_message(message())
+		assert 'body' not in json.loads(store.one('SELECT payload_json FROM messages')['payload_json'])
+		store.execute("UPDATE messages SET body_cached_at='2000-01-01T00:00:00+00:00'")
+		store.upsert_message(replace(message(), body=None, missing_content=True, content_hash=''))
+		assert store.get_message('m1').body == 'Receipt body'
+		store.execute("INSERT INTO feedback(id,message_id,action,created_at) VALUES('f','m1','keep','2000-01-01')")
+		store.execute("INSERT INTO examples(id,feedback_id,message_id,action,created_at,body) VALUES('e','f','m1','keep','2000-01-01','example body')")
+		assert store.prune_cache('2020-01-01T00:00:00+00:00') == 1
+		assert not store.one('SELECT body FROM examples')['body']
+		assert not store.get_message('m1').body
+		assert store.one('PRAGMA secure_delete')['secure_delete'] == 1
+
+
+
+def test_housekeeping_keeps_active_work_and_audit_rows(tmp_path):
+	with Store(tmp_path / 'housekeeping.sqlite', 'me@example.invalid') as store:
+		store.execute("INSERT INTO jobs(id,state,updated_at) VALUES('old','completed','2000-01-01'),('active','paused','2000-01-01')")
+		store.execute("INSERT INTO work_items(job_id,message_id,state) VALUES('old','m','completed'),('active','n','completed')")
+		store.execute("INSERT INTO errors(id,state,created_at) VALUES('resolved','closed','2000-01-01'),('open','open','2000-01-01')")
+		store.execute("INSERT INTO predictions(id,message_id,valid,created_at) VALUES('invalid','m',0,'2000-01-01'),('valid','m',1,'2000-01-01')")
+		assert store.housekeeping('2020-01-01') == {'work_items': 1, 'errors': 1, 'predictions': 1}
+		assert store.one("SELECT id FROM work_items WHERE job_id='active'")
+		assert store.one("SELECT id FROM errors WHERE id='open'")

@@ -641,7 +641,7 @@ class AppService:
 
 	def retention(self):
 		before = stamp(self.clock() - timedelta(days=self.config.retention_days))
-		return {"bodies_removed": self.store.prune_cache(before)}
+		return {"bodies_removed": self.store.prune_cache(before), "rows_removed": self.store.housekeeping(before)}
 
 	def backup(self, path):
 		return str(self.store.backup(path))

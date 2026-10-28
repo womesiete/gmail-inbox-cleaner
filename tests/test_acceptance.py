@@ -103,13 +103,13 @@ def test_backup_and_retention_preserve_feedback_plan_and_undo_ledger(tmp_path):
 			assert backup.execute("SELECT count(*) FROM actions").fetchone()[0] == before_actions
 			assert backup.execute("SELECT count(*) FROM feedback").fetchone()[0] == before_feedback
 			assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-		service.store.execute("UPDATE messages SET updated_at='2000-01-01T00:00:00+00:00' WHERE body!=''")
+		service.store.execute("UPDATE messages SET body_cached_at='2000-01-01T00:00:00+00:00' WHERE body!=''")
 		result = service.retention()
 		assert result["bodies_removed"] > 0
 		assert service.store.one("SELECT count(*) n FROM messages WHERE body!=''")["n"] == 0
 		assert service.store.one("SELECT count(*) n FROM actions")["n"] == before_actions
 		assert service.store.one("SELECT count(*) n FROM feedback")["n"] == before_feedback
-		# Learning examples have separate retention/reset controls from body cache.
+		# Learning feedback and example metadata survive body-cache retention.
 		assert service.store.one("SELECT count(*) n FROM examples")["n"] > 0
 	finally:
 		service.close()

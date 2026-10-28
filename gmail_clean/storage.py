@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _PROCESS_FALLBACK = uuid.uuid4().hex
 
 
@@ -208,6 +208,12 @@ _MIGRATIONS = [
 	""",
 	"""ALTER TABLE job_leases ADD COLUMN process_start TEXT NOT NULL DEFAULT '';""",
 	"""SELECT 1; -- Account guards are installed once with this migration.""",
+	"""
+	ALTER TABLE messages ADD COLUMN body_cached_at TEXT NOT NULL DEFAULT '';
+	UPDATE messages SET body_cached_at=updated_at WHERE body!='';
+	UPDATE messages SET payload_json=json_remove(payload_json,'$.body');
+	CREATE INDEX idx_messages_body_cached ON messages(body_cached_at,id) WHERE body!='';
+	""",
 ]
 
 _ACCOUNT_TABLES = (
@@ -239,6 +245,7 @@ class Store:
 		self.conn.execute("PRAGMA busy_timeout=5000")
 		self.conn.execute("PRAGMA journal_mode=WAL")
 		self.conn.execute("PRAGMA synchronous=FULL")
+		self.conn.execute("PRAGMA secure_delete=ON")
 		try:
 			self._migrate()
 			self._bind_account()
@@ -371,29 +378,31 @@ class Store:
 		headers = data.get("headers", {})
 		lower = {str(key).lower(): value for key, value in headers.items()}
 		labels = sorted(data.get("labels", []))
-		old = self.one("SELECT content_hash,body,payload_json FROM messages WHERE id=?", (data["id"],))
+		old = self.one("SELECT content_hash,body,truncated,missing_content,body_cached_at FROM messages WHERE id=?", (data["id"],))
 		# Metadata refreshes must not silently destroy an already cached body.
 		if old and not data.get("body") and data.get("missing_content", True):
-			previous = json.loads(old["payload_json"] or "{}")
+			previous = old
 			if previous.get("body"):
 				for field in ("body", "truncated", "missing_content", "content_hash"):
 					data[field] = previous.get(field, data.get(field))
 		body = data.get("body") or ""
 		now = utc_now()
+		cached_at = old["body_cached_at"] if old and old["body"] == body else (now if body else "")
+		payload = {key: value for key, value in data.items() if key != "body"}
 		self.execute("""INSERT INTO messages
 			(id,account_id,thread_id,internal_ms,labels_json,headers_json,list_id,sender,subject,snippet,body,
-			truncated,missing_content,content_hash,context_version,in_inbox,updated_at,payload_json)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+			truncated,missing_content,content_hash,context_version,in_inbox,updated_at,payload_json,body_cached_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
 			thread_id=excluded.thread_id,internal_ms=excluded.internal_ms,labels_json=excluded.labels_json,
 			headers_json=excluded.headers_json,list_id=excluded.list_id,sender=excluded.sender,subject=excluded.subject,snippet=excluded.snippet,
 			body=excluded.body,truncated=excluded.truncated,missing_content=excluded.missing_content,
 			content_hash=excluded.content_hash,context_version=excluded.context_version,in_inbox=excluded.in_inbox,
-			updated_at=excluded.updated_at,payload_json=excluded.payload_json""", (
+			updated_at=excluded.updated_at,payload_json=excluded.payload_json,body_cached_at=excluded.body_cached_at""", (
 			data["id"], self.account_id, data.get("thread_id", ""), data.get("internal_ms", 0),
 			canonical_json(labels), canonical_json(headers), str(lower.get("list-id", "")).strip().casefold(), parseaddr(str(lower.get("from", "")))[1].casefold(),
 			str(lower.get("subject", "")), data.get("snippet", ""), body, int(bool(data.get("truncated", False))),
 			int(bool(data.get("missing_content", not body))), data.get("content_hash", ""),
-			data.get("context_version", ""), int("INBOX" in labels), now, canonical_json(data),
+			data.get("context_version", ""), int("INBOX" in labels), now, canonical_json(payload), cached_at,
 		))
 
 	def get_message(self, message_id: str) -> Any | None:
@@ -525,14 +534,40 @@ class Store:
 
 	def prune_cache(self, before_utc: str) -> int:
 		"""Remove old cached bodies while retaining identifiers and audit/undo data."""
-		rows = self.query("SELECT id,payload_json FROM messages WHERE updated_at<? AND body!=''", (before_utc,))
-		with self.transaction():
-			for row in rows:
-				data = json.loads(row["payload_json"] or "{}")
-				data["body"] = ""
-				data["missing_content"] = True
-				self.execute("UPDATE messages SET body='',missing_content=1,payload_json=? WHERE id=?", (canonical_json(data), row["id"]))
-		return len(rows)
+		removed = 0
+		while True:
+			with self.transaction():
+				ids = self.query("SELECT id FROM messages WHERE body_cached_at<? AND body!='' ORDER BY id LIMIT 400", (before_utc,))
+				if not ids:
+					break
+				self.conn.executemany("UPDATE messages SET body='',missing_content=1,body_cached_at='',payload_json=json_set(json_remove(payload_json,'$.body'),'$.missing_content',json('true')) WHERE id=?", [(row["id"],) for row in ids])
+				removed += len(ids)
+		while True:
+			with self.transaction():
+				cursor = self.execute("UPDATE examples SET body='',payload_json=json_remove(payload_json,'$.body') WHERE rowid IN (SELECT rowid FROM examples WHERE created_at<? AND body!='' LIMIT 400)", (before_utc,))
+				if not cursor.rowcount:
+					break
+		self.checkpoint_wal(truncate=True)
+		return removed
+
+	def housekeeping(self, before_utc: str) -> dict:
+		"""Expire completed transient queues while retaining action/feedback audits."""
+		statements = {
+			"work_items": "DELETE FROM work_items WHERE id IN (SELECT w.id FROM work_items w JOIN jobs j ON j.id=w.job_id WHERE j.state='completed' AND j.updated_at<? AND w.state IN ('completed','failed') LIMIT 400)",
+			"errors": "DELETE FROM errors WHERE id IN (SELECT id FROM errors WHERE created_at<? AND state!='open' LIMIT 400)",
+			"predictions": "DELETE FROM predictions WHERE id IN (SELECT id FROM predictions WHERE created_at<? AND valid=0 LIMIT 400)",
+		}
+		counts = {}
+		for table, sql in statements.items():
+			counts[table] = 0
+			while True:
+				with self.transaction():
+					number = self.execute(sql, (before_utc,)).rowcount
+					counts[table] += number
+				if number < 400:
+					break
+		self.checkpoint_wal(truncate=True)
+		return counts
 
 	def close(self) -> None:
 		self._check_thread()
