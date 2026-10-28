@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import random
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -12,6 +16,41 @@ from .mime import parse_body
 
 METADATA_HEADERS = ["From", "To", "Cc", "Date", "Subject", "Message-ID", "In-Reply-To",
 	"References", "List-ID", "List-Unsubscribe", "Content-Type"]
+
+
+class QuotaLimiter:
+	"""A shared rolling-minute quota budget, including every multipart part.
+
+	Google's May 2026 schedule assigns metadata/full gets 20/60 units and
+	limits new projects to 6,000 units per user per minute. Older projects can
+	have grandfathered limits; this conservative default works for either.
+	https://developers.google.com/workspace/gmail/api/reference/quota
+	"""
+
+	def __init__(self, units_per_minute=6000, *, clock=time.monotonic, sleep=time.sleep):
+		self.limit = max(1, int(units_per_minute))
+		self.clock = clock
+		self.sleep = sleep
+		self._events = deque()
+		self._lock = threading.Lock()
+		self.consumed = 0
+
+	def acquire(self, units):
+		units = int(units)
+		if not 0 < units <= self.limit:
+			raise ValueError("A request quota must fit the minute budget")
+		while True:
+			with self._lock:
+				now = self.clock()
+				while self._events and self._events[0][0] <= now - 60:
+					self._events.popleft()
+				used = sum(event[1] for event in self._events)
+				if used + units <= self.limit:
+					self._events.append((now, units))
+					self.consumed += units
+					return
+				delay = max(0.001, 60 - (now - self._events[0][0]))
+			self.sleep(delay)
 
 
 class GmailError(RuntimeError):
@@ -59,6 +98,7 @@ def translate_error(exc: Exception, operation: str = "request", has_page: bool =
 		reasons = [str(item.get("reason", "")) for item in payload.get("error", {}).get("errors", [])]
 	except (ValueError, TypeError, AttributeError):
 		reasons = []
+		payload = {}
 	retry_after = None
 	if response is not None:
 		try:
@@ -73,7 +113,11 @@ def translate_error(exc: Exception, operation: str = "request", has_page: bool =
 	if operation == "history" and status == 404:
 		return HistoryExpired()
 	if operation in {"list", "history"} and has_page and status == 400:
-		return PageTokenExpired()
+		# A malformed query with a page token is still a data error. Only the
+		# provider's token-specific evidence permits restarting enumeration.
+		message = str(payload.get("error", {}).get("message", "")).casefold() if isinstance(payload, dict) else ""
+		if any(reason in {"invalidPageToken", "pageTokenExpired"} for reason in reasons) or ("pagetoken" in message.replace(" ", "").replace("_", "") and any(word in message for word in ("invalid", "expired"))):
+			return PageTokenExpired()
 	if status == 401:
 		return GmailError("auth", "Gmail authorization is invalid. Reconnect the account.", status=status)
 	if status == 403:
@@ -89,7 +133,7 @@ def translate_error(exc: Exception, operation: str = "request", has_page: bool =
 	if status >= 500:
 		return GmailError("transient", "Gmail is temporarily unavailable.", retry_after, status=status)
 	if status:
-		return GmailError("data", f"Gmail rejected the request (HTTP {status}).", status=status)
+		return GmailError("data", f"Gmail rejected the request (HTTP {status}).", status=status, reason=reasons[0] if reasons else None)
 	try:
 		from google.auth.exceptions import GoogleAuthError
 		if isinstance(exc, GoogleAuthError):
@@ -105,19 +149,33 @@ class GmailMailbox:
 
 	def __init__(self, service: Any, account_id: str | None = None,
 			retrieval_batch_size: int = 25, execution_batch_size: int = 100,
-			body_limit: int = 32_000) -> None:
+			body_limit: int = 32_000, quota_limiter: QuotaLimiter | None = None) -> None:
 		self.service = service
 		self.account_id = account_id
 		self.retrieval_batch_size = max(1, min(50, int(retrieval_batch_size)))
 		self.execution_batch_size = max(1, min(500, int(execution_batch_size)))
 		self.body_limit = max(128, int(body_limit))
 		self._catalog: list[dict] | None = None
+		self.quota_limiter = quota_limiter or QuotaLimiter()
+		self._sleep = time.sleep
+		self._random = random.random  # noqa: S311 -- retry jitter is not security-sensitive randomness.
+		self.on_label_error = None
 
-	def _execute(self, request: Any, operation: str = "request", has_page: bool = False) -> dict:
-		try:
-			return request.execute(num_retries=0) or {}
-		except Exception as exc:
-			raise translate_error(exc, operation, has_page) from None
+	def _execute(self, request: Any, operation: str = "request", has_page: bool = False,
+			*, idempotent: bool = True, quota_units: int = 1) -> dict:
+		for attempt in range(3 if idempotent else 1):
+			self.quota_limiter.acquire(quota_units)
+			try:
+				return request.execute(num_retries=0) or {}
+			except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
+				error = translate_error(exc, operation, has_page)
+				if not idempotent or not error.transient or attempt >= 2 or (error.retry_after or 0) > 60:
+					raise error from None
+				# Bound local retries. Longer Retry-After intervals remain durable
+				# job-level waits instead of blocking a transport worker indefinitely.
+				delay = max(error.retry_after or 0, min(32, 2 ** attempt + self._random()))
+				self._sleep(delay)
+		raise AssertionError("Unreachable retry exhaustion")
 
 	def profile(self) -> dict:
 		profile = self._execute(self.service.users().getProfile(userId="me"))
@@ -144,7 +202,7 @@ class GmailMailbox:
 			"includeSpamTrash": False}
 		if page_token:
 			params["pageToken"] = page_token
-		return self._execute(self.service.users().messages().list(**params), "list", bool(page_token))
+		return self._execute(self.service.users().messages().list(**params), "list", bool(page_token), quota_units=5)
 
 	def _request(self, message_id: str, body: bool) -> Any:
 		params: dict[str, Any] = {"userId": "me", "id": message_id, "format": "full" if body else "metadata"}
@@ -173,7 +231,7 @@ class GmailMailbox:
 		if body:
 			def fetch(attachment_id: str) -> dict:
 				return self._execute(self.service.users().messages().attachments().get(
-					userId="me", messageId=message_id, id=attachment_id))
+					userId="me", messageId=message_id, id=attachment_id), quota_units=20)
 			parsed = parse_body(item.get("payload", {}), fetch, max_chars=self.body_limit)
 		return Message(id=message_id, thread_id=str(item.get("threadId", message_id)),
 			internal_ms=internal_ms, labels=set(item.get("labelIds", [])), headers=headers,
@@ -183,7 +241,7 @@ class GmailMailbox:
 			attachments=parsed.attachments if parsed else [])
 
 	def get_message(self, message_id: str, body: bool = False) -> Message:
-		return self._decode(self._execute(self._request(message_id, body)), body)
+		return self._decode(self._execute(self._request(message_id, body), quota_units=60 if body else 20), body)
 
 	def get_messages(self, ids: list[str], body: bool = False) -> dict[str, Message | Exception]:
 		"""HTTP multipart batches have per-part results; transport success is not item success."""
@@ -192,14 +250,15 @@ class GmailMailbox:
 		for offset in range(0, len(ids), self.retrieval_batch_size):
 			batch_ids = ids[offset:offset + self.retrieval_batch_size]
 			raw: dict[str, dict | Exception] = {}
-			def callback(request_id: str, response: dict | None, exception: Exception | None) -> None:
+			def callback(request_id: str, response: dict | None, exception: Exception | None, raw=raw) -> None:
 				raw[request_id] = translate_error(exception) if exception is not None else (response or {})
 			batch = self.service.new_batch_http_request(callback=callback)
 			for message_id in batch_ids:
 				batch.add(self._request(message_id, body), request_id=message_id)
 			try:
+				self.quota_limiter.acquire(len(batch_ids) * (60 if body else 20))
 				batch.execute()
-			except Exception as exc:
+			except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
 				for message_id in batch_ids:
 					if message_id not in raw:
 						raw[message_id] = translate_error(exc)
@@ -210,14 +269,14 @@ class GmailMailbox:
 				else:
 					try:
 						results[message_id] = self._decode(value, body)
-					except Exception as exc:
+					except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
 						results[message_id] = translate_error(exc)
 		return results
 
 	def thread_metadata(self, thread_id: str) -> list[Message]:
 		# metadata format never fetches bodies of excluded/recent replies.
 		result = self._execute(self.service.users().threads().get(userId="me", id=thread_id,
-			format="metadata", metadataHeaders=METADATA_HEADERS))
+			format="metadata", metadataHeaders=METADATA_HEADERS), quota_units=40)
 		return [self._decode(item, False) for item in result.get("messages", [])]
 
 	def history(self, start: str, page_token: str | None = None) -> dict:
@@ -225,7 +284,7 @@ class GmailMailbox:
 		if page_token:
 			params["pageToken"] = page_token
 		# Do not filter labelId=INBOX: doing so can lose removal events.
-		return self._execute(self.service.users().history().list(**params), "history", bool(page_token))
+		return self._execute(self.service.users().history().list(**params), "history", bool(page_token), quota_units=2)
 
 	def modify(self, ids: list[str], add: list[str], remove: list[str]) -> None:
 		"""Apply label deltas only. Callers ledger/preflight/reconcile each explicit ID."""
@@ -235,9 +294,20 @@ class GmailMailbox:
 		catalog = self._catalog if self._catalog is not None else self.labels()
 		allowed = {item["id"] for item in catalog if item["type"] == "user"} | {"INBOX"}
 		if not set(add).issubset(allowed) or not set(remove).issubset(allowed) or set(add) & set(remove):
+			self._catalog = None
+			if self.on_label_error is not None:
+				self.on_label_error()
 			raise GmailError("permission", "Only INBOX and existing user-label deltas are allowed.")
 		for offset in range(0, len(ids), self.execution_batch_size):
-			self._execute(self.service.users().messages().batchModify(userId="me", body={
-				"ids": ids[offset:offset + self.execution_batch_size],
-				"addLabelIds": sorted(set(add)), "removeLabelIds": sorted(set(remove))}))
+			try:
+				self._execute(self.service.users().messages().batchModify(userId="me", body={
+					"ids": ids[offset:offset + self.execution_batch_size],
+					"addLabelIds": sorted(set(add)), "removeLabelIds": sorted(set(remove))}),
+					"modify", idempotent=False, quota_units=50)
+			except GmailError as exc:
+				if exc.status in {400, 404}:
+					self._catalog = None
+					if self.on_label_error is not None:
+						self.on_label_error()
+				raise
 		# batchModify has an empty response; the application must verify each effect.

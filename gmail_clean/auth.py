@@ -184,7 +184,8 @@ class TokenStore:
 
 class AuthManager:
 	def __init__(self, data_dir: str | Path, retrieval_batch_size: int = 25,
-			execution_batch_size: int = 100, body_limit: int = 32_000) -> None:
+			execution_batch_size: int = 100, body_limit: int = 32_000, quota_limiter=None) -> None:
+		self.quota_limiter = quota_limiter
 		self.tokens = TokenStore(data_dir)
 		self.retrieval_batch_size = retrieval_batch_size
 		self.execution_batch_size = execution_batch_size
@@ -196,7 +197,7 @@ class AuthManager:
 		from .gmail import GmailMailbox
 		service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
 		box = GmailMailbox(service, retrieval_batch_size=self.retrieval_batch_size,
-			execution_batch_size=self.execution_batch_size, body_limit=self.body_limit)
+			execution_batch_size=self.execution_batch_size, body_limit=self.body_limit, quota_limiter=self.quota_limiter)
 		box.identity()  # Verify the actually connected account, never trust a UI hint.
 		self.credentials = credentials
 		return box

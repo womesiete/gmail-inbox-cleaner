@@ -21,6 +21,8 @@ from .storage import LeaseBusyError, Store
 
 
 class AppService:
+	supports_context_cache = True
+
 	def __init__(self, store=None, mailbox=None, config=None, data_dir=None, demo=False, count=3000, clock=utc_now, ai_factory=None, _worker_owner=None):
 		self.demo = demo
 		self._closed = False
@@ -51,6 +53,7 @@ class AppService:
 			self._workers_lock = threading.RLock()
 			self._abort_event = threading.Event()
 			self._label_cache = {}
+			self._quota_limiters = {}
 			self._label_cache_lock = threading.RLock()
 		else:
 			self._clients = self._resource_owner._clients
@@ -168,6 +171,14 @@ class AppService:
 		self._configure_services()
 		return True
 
+	def _quota_limiter(self):
+		from .gmail import QuotaLimiter
+		owner = self._resource_owner
+		with owner._label_cache_lock:
+			if self.account_id not in owner._quota_limiters:
+				owner._quota_limiters[self.account_id] = QuotaLimiter()
+			return owner._quota_limiters[self.account_id]
+
 	@property
 	def mailbox(self):
 		if self._closed:
@@ -179,10 +190,17 @@ class AppService:
 				raise AuthenticationError("The Gmail connection was disconnected or changed. Connect again or open a fresh worker.")
 		if self._mailbox is None:
 			from .auth import AuthManager
-			self._mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit).mailbox()
+			self._mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit, quota_limiter=self._quota_limiter()).mailbox()
 			self._check_identity()
 		from .gmail import GmailMailbox
 		if isinstance(self._mailbox, GmailMailbox):
+			self._mailbox.quota_limiter = self._quota_limiter()
+			self._mailbox.on_label_error = self.invalidate_labels
+			owner = self._resource_owner
+			with owner._label_cache_lock:
+				cached = owner._label_cache.get(self.account_id)
+				if self._mailbox._catalog is None and cached and time.monotonic() - cached[0] < 60:
+					self._mailbox._catalog = [dict(label) for label in cached[1]]
 			self._mailbox.body_limit = self.config.body_limit
 			self._mailbox.retrieval_batch_size = self.config.retrieval_batch_size
 			self._mailbox.execution_batch_size = self.config.execution_batch_size
@@ -451,7 +469,7 @@ class AppService:
 		self._override_cache = dict.fromkeys(ids)
 		for chunk in chunks(ids):
 			marks = placeholders(chunk)
-			for row in self.store.query(f"SELECT * FROM manual_overrides WHERE message_id IN ({marks})", chunk):
+			for row in self.store.query(f"SELECT * FROM manual_overrides WHERE message_id IN ({marks})", chunk):  # noqa: S608 -- generated placeholders only; values stay bound
 				self._override_cache[row["message_id"]] = {**json.loads(row["payload_json"]), **row}
 		self._policy_depth += 1
 		try:
@@ -469,6 +487,9 @@ class AppService:
 				owner._label_cache[self.account_id] = (time.monotonic(), [dict(label) for label in labels])
 			else:
 				labels = [dict(label) for label in cached[1]]
+		from .gmail import GmailMailbox
+		if isinstance(self._mailbox, GmailMailbox):
+			self._mailbox._catalog = [dict(label) for label in labels]
 		for label in labels:
 			label["meaning"] = self.config.label_meanings.get(label["id"], "neutral")
 		current = self.store.labels()
@@ -483,13 +504,17 @@ class AppService:
 		with owner._label_cache_lock:
 			owner._label_cache.pop(self.account_id, None)
 
-	def context_messages(self, message, window, config=None):
+	def context_messages(self, message, window, config=None, *, threads=None, bodies=None):
 		"""Optional context obeys the same body privacy bounds; never action targets."""
 		config = config or self.config
 		if not (config.sent_context_enabled or config.archived_context_enabled):
 			return []
-		result = []
-		for member in self.mailbox.thread_metadata(message.thread_id):
+		threads = {} if threads is None else threads
+		bodies = {} if bodies is None else bodies
+		if message.thread_id not in threads:
+			threads[message.thread_id] = self.mailbox.thread_metadata(message.thread_id)
+		allowed = []
+		for member in threads[message.thread_id]:
 			if member.id == message.id or not window.contains(member.internal_ms):
 				continue
 			if not resolve_window(self.config, window.anchor_utc).contains(member.internal_ms) or {"SPAM", "TRASH", "DRAFT"} & member.labels or self.excluded(member) or content_excluded(member, config):
@@ -498,26 +523,58 @@ class AppService:
 			if row and row["category"] in config.excluded_categories:
 				continue
 			if ("SENT" in member.labels and config.sent_context_enabled and self.config.sent_context_enabled) or ("INBOX" not in member.labels and "SENT" not in member.labels and config.archived_context_enabled and self.config.archived_context_enabled):
-				result.append(self._bound_body(self.mailbox.get_message(member.id, body=True), config.body_limit))
-			if len(result) >= 8:
+				allowed.append(member.id)
+			if len(allowed) >= 8:
 				break
+		missing = [mid for mid in allowed if mid not in bodies]
+		if missing:
+			bodies.update(self.mailbox.get_messages(missing, body=True))
+		result = []
+		for mid in allowed:
+			value = bodies.get(mid)
+			if isinstance(value, Exception):
+				raise value
+			if value is None:
+				raise ValueError("Missing context body result")
+			result.append(self._bound_body(value, config.body_limit))
 		return result
 
 	def download_bodies(self, ids, should_stop=None):
 		should_stop = self._stop_callback(should_stop)
 		window = resolve_window(self.config, self.clock())
 		count = 0
-		for mid in ids:
+		ids = list(dict.fromkeys(ids))
+		for offset in range(0, len(ids), self.config.retrieval_batch_size):
 			if should_stop():
 				break
-			meta = self.mailbox.get_message(mid, body=False)
-			if not self.eligible(meta, window) or self.excluded(meta):
+			chunk = ids[offset:offset + self.config.retrieval_batch_size]
+			metadata = self.mailbox.get_messages(chunk, body=False)
+			allowed = []
+			for mid in chunk:
+				meta = metadata.get(mid)
+				if isinstance(meta, Exception):
+					raise meta
+				if meta is not None and self.eligible(meta, window) and not self.excluded(meta):
+					allowed.append(mid)
+			if not allowed or should_stop():
 				continue
-			message = self._bound_body(self.mailbox.get_message(mid, body=True))
-			message.context_version = context_hash(self.mailbox.thread_metadata(message.thread_id), self.config.sent_context_enabled)
-			message.content_hash = content_hash(message)
-			self.store.upsert_message(message)
-			count += 1
+			messages = self.mailbox.get_messages(allowed, body=True)
+			threads = {}
+			for mid in allowed:
+				if should_stop():
+					break
+				message = messages.get(mid)
+				if isinstance(message, Exception):
+					raise message
+				if message is None:
+					continue
+				message = self._bound_body(message)
+				if message.thread_id not in threads:
+					threads[message.thread_id] = self.mailbox.thread_metadata(message.thread_id)
+				message.context_version = context_hash(threads[message.thread_id], self.config.sent_context_enabled)
+				message.content_hash = content_hash(message)
+				self.store.upsert_message(message)
+				count += 1
 		return {"downloaded": count}
 
 	def manual(self, ids, action, label_ids=None, reason="", scope="message", defer_until=None, displayed_revision=None, displayed_protections=None, displayed_contexts=None, displayed_context_versions=None, should_stop=None):
@@ -539,17 +596,28 @@ class AppService:
 		# Perform network preflight before opening the bulk feedback transaction:
 		# a slow provider must not hold SQLite's writer lock for the whole group.
 		validated = []
-		for mid in dict.fromkeys(ids):
+		ids = list(dict.fromkeys(ids))
+		cached = self.store.get_messages(ids)
+		candidates = [mid for mid in ids if mid in cached and (action == "mistaken_archive" or self.eligible(cached[mid], window))]
+		live_metadata = self.mailbox.get_messages(candidates, body=False) if candidates and not should_stop() else {}
+		threads = {}
+		for mid in candidates:
 			if should_stop():
 				break
-			message = self.store.get_message(mid)
+			message = cached.get(mid)
 			original = self.store.one("SELECT id FROM actions WHERE message_id=? AND action='archive' AND undo_of IS NULL AND state IN ('applied','reconciled') ORDER BY updated_at DESC LIMIT 1", (mid,)) if action == "mistaken_archive" else None
 			# An explicitly identified mistaken app archive uses the ledger's narrow
 			# undo exception. It never fetches or classifies an out-of-window body.
 			if not message or (not original and not self.eligible(message, window)):
 				continue
-			live = self.mailbox.get_message(mid, body=False)
-			live.context_version = context_hash(self.mailbox.thread_metadata(live.thread_id), self.config.sent_context_enabled)
+			live = live_metadata.get(mid)
+			if isinstance(live, Exception):
+				raise live
+			if live is None:
+				continue
+			if live.thread_id not in threads:
+				threads[live.thread_id] = self.mailbox.thread_metadata(live.thread_id)
+			live.context_version = context_hash(threads[live.thread_id], self.config.sent_context_enabled)
 			expected_context = displayed_contexts.get(mid, "") if displayed_contexts is not None else message.context_version
 			if not original and (not self.eligible(live, window) or live.context_version != expected_context or message.context_version != expected_context):
 				self.store.execute("UPDATE messages SET decision='review' WHERE id=?", (mid,))

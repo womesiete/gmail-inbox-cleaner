@@ -133,8 +133,8 @@ def test_gmail_write_guard_batches_minimal_deltas_and_history_has_no_inbox_filte
 
 def test_errors_are_structured_and_never_include_provider_sensitive_payloads():
 	assert isinstance(translate_error(HttpFailure(404), "history"), HistoryExpired)
-	assert isinstance(translate_error(HttpFailure(400), "list", True), PageTokenExpired)
-	assert isinstance(translate_error(HttpFailure(400), "history", True), PageTokenExpired)
+	assert isinstance(translate_error(HttpFailure(400, "invalidPageToken"), "list", True), PageTokenExpired)
+	assert isinstance(translate_error(HttpFailure(400, "invalidPageToken"), "history", True), PageTokenExpired)
 	assert translate_error(HttpFailure(403, "userRateLimitExceeded", "4")).retry_after == 4
 	assert translate_error(HttpFailure(403, "userRateLimitExceeded")).transient
 	assert not translate_error(HttpFailure(403, "insufficientPermissions")).transient
@@ -477,3 +477,51 @@ def test_token_readers_replacements_and_delete_use_one_shared_path_lock(tmp_path
 	assert observed == {"read", "replace", "delete"}
 	assert not owners and busy == {"readers": 0, "writers": 0}
 	assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_page_token_error_translation_does_not_mask_other_bad_requests():
+	assert translate_error(HttpFailure(400, "invalidArgument"), "list", True).kind == "data"
+	assert isinstance(translate_error(HttpFailure(400, "invalidPageToken"), "list", True), PageTokenExpired)
+
+
+def test_quota_limiter_accounts_current_metadata_body_and_batch_units():
+	from gmail_clean.gmail import QuotaLimiter
+	now = [0.0]
+	waits = []
+	def sleep(delay):
+		waits.append(delay)
+		now[0] += delay
+	limiter = QuotaLimiter(units_per_minute=6000, clock=lambda: now[0], sleep=sleep)
+	service = FakeGoogle()
+	service.payloads = {"a": gmail_message("a"), "b": gmail_message("b")}
+	box = GmailMailbox(service, quota_limiter=limiter)
+	box.get_messages(["a", "b"], body=False)  # 2 * 20, not one multipart unit.
+	box.get_messages(["a", "b"], body=True)  # 2 * 60.
+	assert limiter.consumed == 160
+	limiter.acquire(5840)
+	limiter.acquire(20)
+	assert waits and waits[-1] == pytest.approx(60)
+	assert limiter.consumed == 6020
+
+
+def test_idempotent_read_retries_with_jitter_but_modify_is_not_retried():
+	service = FakeGoogle()
+	box = GmailMailbox(service)
+	waits = []
+	box._sleep = waits.append
+	box._random = lambda: 0.25
+	class Flaky:
+		def __init__(self):
+			self.calls = 0
+		def execute(self, **kwargs):
+			self.calls += 1
+			if self.calls < 3:
+				raise HttpFailure(503)
+			return {"ok": True}
+	request = Flaky()
+	assert box._execute(request) == {"ok": True}
+	assert waits == [1.25, 2.25]
+	request = Flaky()
+	with pytest.raises(GmailError):
+		box._execute(request, "modify", idempotent=False, quota_units=50)
+	assert request.calls == 1

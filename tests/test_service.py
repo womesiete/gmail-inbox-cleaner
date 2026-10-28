@@ -509,3 +509,65 @@ def test_rules_revision_cache_and_phase_override_prefetch(tmp_path, monkeypatch)
 		assert sum("SELECT * FROM manual_overrides" in sql for sql in queries) == 1
 	finally:
 		service.close()
+
+
+def test_bulk_manual_and_download_reuse_thread_metadata(tmp_path, monkeypatch):
+	service = make_service(tmp_path)
+	try:
+		messages = [cache(service, f"d{index:015x}") for index in (3, 5, 7)]
+		thread_id = messages[0].thread_id
+		for message in messages:
+			service.mailbox.messages[message.id].thread_id = thread_id
+		for message in messages:
+			cache(service, message.id)
+		counts = {"single": 0, "bulk": 0, "thread": 0}
+		original_bulk = service.mailbox.get_messages
+		original_thread = service.mailbox.thread_metadata
+		def bulk(ids, body=False):
+			counts["bulk"] += 1
+			return original_bulk(ids, body)
+		def thread(tid):
+			counts["thread"] += 1
+			return original_thread(tid)
+		monkeypatch.setattr(service.mailbox, "get_messages", bulk)
+		monkeypatch.setattr(service.mailbox, "thread_metadata", thread)
+		# The demo bulk adapter internally calls get_message; count only service
+		# calls by recording the caller instead of replacing the adapter method.
+		import inspect
+		original_single = service.mailbox.get_message
+		def single(*args, **kwargs):
+			if inspect.currentframe().f_back.f_globals.get("__name__") == "gmail_clean.service":
+				counts["single"] += 1
+			return original_single(*args, **kwargs)
+		monkeypatch.setattr(service.mailbox, "get_message", single)
+		assert len(service.manual([message.id for message in messages], "keep")) == 0
+		assert counts == {"single": 0, "bulk": 1, "thread": 1}
+		counts.update(single=0, bulk=0, thread=0)
+		assert service.download_bodies([message.id for message in messages]) == {"downloaded": 3}
+		assert counts == {"single": 0, "bulk": 2, "thread": 1}
+	finally:
+		service.close()
+
+
+def test_optional_context_uses_one_body_batch_and_shared_phase_cache(tmp_path, monkeypatch):
+	config = Config(ai_module="gmail_clean.demo_ai", sent_context_enabled=True)
+	service = make_service(tmp_path, config=config)
+	try:
+		message = service.mailbox.messages[f"d{7:015x}"]
+		for index in range(3):
+			service.mailbox.add_message(Message(f"sent-{index}", message.thread_id,
+				epoch_ms(ANCHOR - timedelta(days=40)), {"SENT"}, body="synthetic context", account_id=DEMO_ACCOUNT))
+		batches = []
+		original = service.mailbox.get_messages
+		def bulk(ids, body=False):
+			batches.append((list(ids), body))
+			return original(ids, body)
+		monkeypatch.setattr(service.mailbox, "get_messages", bulk)
+		threads, bodies = {}, {}
+		window = resolve_window(config, ANCHOR)
+		first = service.context_messages(message, window, threads=threads, bodies=bodies)
+		second = service.context_messages(message, window, threads=threads, bodies=bodies)
+		assert len(first) == len(second) == 3
+		assert batches == [([f"sent-{index}" for index in range(3)], True)]
+	finally:
+		service.close()
