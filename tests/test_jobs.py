@@ -636,6 +636,9 @@ def test_example_statistics_reuse_assessment_but_changed_prompt_text_reassesses(
 	assert same_prompt["state"] == "completed"
 	assert len(service.ai.calls) == 1
 	service._examples[0]["body"] = "Please reply"
+	# Real learning edits invalidate matching predictions; this injected example
+	# list bypasses LearningService, so model that durable invalidation here.
+	service.store.execute("UPDATE predictions SET valid=0 WHERE message_id='old'")
 	service.store.set_checkpoint("full_reconciliation", None)
 	_, _, changed_prompt = run_new(service)
 	assert changed_prompt["state"] == "completed"
@@ -771,3 +774,42 @@ def test_local_transition_queue_uses_one_batch_transaction(tmp_path, monkeypatch
 	finally:
 		value.store.conn.set_trace_callback(None)
 		value.store.close()
+
+
+def test_periodic_reconciliation_fetches_only_new_ids_with_valid_history(service):
+	service.mailbox.messages = {str(i): mail(str(i)) for i in range(20)}
+	runner, _, _ = run_new(service)
+	service.mailbox.metadata_fetches.clear()
+	service.mailbox.messages["new"] = mail("new")
+	service.now += timedelta(days=2)
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert set(service.mailbox.metadata_fetches) == {"new"}
+	assert runner.checkpoint("full_reconciliation") is not None
+	service.mailbox.metadata_fetches.clear()
+	service.mailbox.expired_history.add(runner.checkpoint("history_id"))
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert set(service.mailbox.metadata_fetches) == set(service.mailbox.messages)
+
+
+def test_history_expiring_during_listing_forces_next_metadata_refresh(service, monkeypatch):
+	service.mailbox.messages = {"old": mail()}
+	runner, _, _ = run_new(service)
+	service.store.set_checkpoint("full_reconciliation", None)
+	original = service.mailbox.history
+	calls = []
+	def expires_during_listing(start, page_token=None):
+		calls.append(start)
+		if len(calls) == 2:
+			raise HistoryExpired()
+		return original(start, page_token)
+	monkeypatch.setattr(service.mailbox, "history", expires_during_listing)
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert runner.checkpoint("history_id") is None
+	assert runner.checkpoint("full_reconciliation") is None
+	service.mailbox.metadata_fetches.clear()
+	_, _, result = run_new(service)
+	assert result["state"] == "completed"
+	assert "old" in service.mailbox.metadata_fetches

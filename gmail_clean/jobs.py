@@ -230,6 +230,7 @@ class JobRunner:
 			self.save_payload(job, payload)
 		start = self.checkpoint("history_id")
 		full = start is None
+		payload.setdefault("refresh_all", start is None)
 		if not payload.get("history_done") and start:
 			try:
 				if not self.sync_history(job, start, should_stop):
@@ -240,6 +241,7 @@ class JobRunner:
 					raise
 				full = True
 				payload["reconciliation"] = True
+				payload["refresh_all"] = True
 			payload["history_done"] = True
 			self.save_payload(job, payload)
 		last_full = self.checkpoint("full_reconciliation")
@@ -264,6 +266,7 @@ class JobRunner:
 			payload["page_token"] = None
 			self.save_payload(job, payload)
 		if not payload.get("enumerated"):
+			local_inbox = {row["id"] for row in self.db.query("SELECT id FROM messages WHERE in_inbox=1")}
 			restarts = 0
 			while True:
 				if self.held(job, should_stop):
@@ -281,7 +284,8 @@ class JobRunner:
 					raise
 				with self.db.transaction():
 					for item in page.get("messages", []):
-						self.queue(job, item["id"])
+						if payload.get("refresh_all") or item["id"] not in local_inbox:
+							self.queue(job, item["id"])
 					payload["page_token"] = page.get("nextPageToken")
 					payload["enumerated"] = not bool(payload["page_token"])
 					self.save_payload(job, payload)
@@ -291,6 +295,7 @@ class JobRunner:
 				if payload["enumerated"]:
 					break
 		# Reconcile arrivals/removals DURING non-atomic enumeration before any mutations.
+		history_valid = True
 		try:
 			if not self.sync_history(job, payload["initial_history"], should_stop):
 				return False
@@ -298,14 +303,17 @@ class JobRunner:
 			from .gmail import HistoryExpired
 			if not isinstance(exc, HistoryExpired):
 				raise
-			# Do not advance the expired checkpoint. Next run must fully reconcile.
+			# Clear both boundaries so a valid later checkpoint cannot incorrectly
+			# authorize the new-ID-only optimization across this uncovered interval.
+			history_valid = False
+			self.set_checkpoint("history_id", None)
 			self.set_checkpoint("full_reconciliation", None)
 		# Quiet time-driven transitions still need work, but an unchanged decided
 		# inbox does not need a complete Gmail metadata refresh on every cycle.
-		self.queue_local_transitions(job, window, config, full=bool(payload.get("full")))
+		self.queue_local_transitions(job, window, config, full=bool(payload.get("refresh_all")))
 		payload = self.payload(job)
-		if payload.get("full"):
-			# Detect locally cached items that disappeared from the inbox listing too.
+		if payload.get("full") and history_valid:
+			# Full enumeration completes only with a covered history interval.
 			self.set_checkpoint("full_reconciliation", stamp(window.anchor_utc))
 		payload["discovered"] = True
 		self.save_payload(job, payload)
