@@ -65,7 +65,7 @@ class AppService:
 			self.account_id = self._identity_from_disk()
 			if self._mailbox is not None:
 				self.account_id = self._mailbox.identity().casefold()
-			self.store = Store(self._database(self.account_id), self.account_id)
+			self.store = Store(self._database(self.account_id), self.account_id, check_integrity=_worker_owner is None)
 		self._connection_generation = self._connection_state().get("generation", "")
 		saved = self.store.checkpoint("effective_preferences")
 		self.config = Config.from_dict(config.to_dict()) if config is not None else Config.from_dict(saved or {})
@@ -642,6 +642,15 @@ class AppService:
 	def retention(self):
 		before = stamp(self.clock() - timedelta(days=self.config.retention_days))
 		return {"bodies_removed": self.store.prune_cache(before), "rows_removed": self.store.housekeeping(before)}
+
+	def schedule_restore(self, path):
+		Store.verify_backup(path, self.account_id)
+		request = self.data_dir / "restore-request.json"
+		with path_lock(request):
+			request.write_text(encode({"source": str(Path(path).resolve()), "account_id": self.account_id}), encoding="utf-8")
+			if os.name != "nt":
+				os.chmod(request, 0o600)
+		return {"message": "Verified backup scheduled. Close and restart the application to restore; current data will be backed up first."}
 
 	def backup(self, path):
 		return str(self.store.backup(path))

@@ -357,3 +357,29 @@ def test_housekeeping_keeps_active_work_and_audit_rows(tmp_path):
 		assert store.housekeeping('2020-01-01') == {'work_items': 1, 'errors': 1, 'predictions': 1}
 		assert store.one("SELECT id FROM work_items WHERE job_id='active'")
 		assert store.one("SELECT id FROM errors WHERE id='open'")
+
+
+def test_verified_restore_requires_confirmation_and_preserves_previous_database(tmp_path):
+	source = tmp_path / 'source.sqlite'
+	target = tmp_path / 'target.sqlite'
+	with Store(source, 'me@example.invalid') as store:
+		store.upsert_message(message('saved'))
+	with Store(target, 'me@example.invalid') as store:
+		store.upsert_message(message('current'))
+	with pytest.raises(ValueError, match='confirm'):
+		Store.restore_backup(source, target, account_id='me@example.invalid')
+	Store.restore_backup(source, target, confirmed=True, account_id='me@example.invalid')
+	with Store(target, 'me@example.invalid') as restored:
+		assert restored.get_message('saved')
+		assert not restored.get_message('current')
+	assert list(tmp_path.glob('target.sqlite.pre-restore-*.sqlite3'))
+
+
+def test_corrupt_database_is_reported_without_modifying_original(tmp_path):
+	path = tmp_path / 'corrupt.sqlite'
+	data = b'not a sqlite database'
+	path.write_bytes(data)
+	from gmail_clean.storage import StorageCorruptionError
+	with pytest.raises(StorageCorruptionError, match='restore'):
+		Store(path, 'me@example.invalid')
+	assert path.read_bytes() == data

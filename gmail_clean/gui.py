@@ -628,6 +628,7 @@ class MainWindow(QMainWindow):
 		layout.addWidget(self.maintenance_label)
 		data_bar = QHBoxLayout()
 		data_bar.addWidget(self._button("Backup database…", self._backup))
+		data_bar.addWidget(self._button("Restore on next launch…", self._restore_backup))
 		data_bar.addWidget(self._button("Break stuck lease…", self._break_lease))
 		data_bar.addWidget(self._button("Apply cache retention", lambda: self._submit("Apply retention", lambda svc, p: svc.retention())))
 		data_bar.addStretch()
@@ -1553,6 +1554,11 @@ class MainWindow(QMainWindow):
 			return
 		if QMessageBox.warning(self, "Break execution lease?", "The old worker will be fenced. An in-flight Gmail request may still finish. Stop the old process before continuing. Break this lease?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
 			self._submit("Breaking stuck execution lease", lambda svc, p: svc.store.break_lease("mailbox_execution", confirmed=True, owner_token=row["owner_token"]), pool=self.preview_pool)
+
+	def _restore_backup(self):
+		path, _ = QFileDialog.getOpenFileName(self, "Restore verified backup on next launch", "", "SQLite (*.sqlite *.sqlite3)")
+		if path and QMessageBox.warning(self, "Restore local state?", "On the next launch, replace local state with this account's verified backup? Current state will be backed up first. Gmail changes are not reversed by restoring a database.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+			self._submit("Verifying and scheduling restore", lambda svc, p: svc.schedule_restore(path))
 
 	def _backup(self):
 		path, _ = QFileDialog.getSaveFileName(self, "Consistent database backup", "gmail-clean-backup.sqlite", "SQLite (*.sqlite)")

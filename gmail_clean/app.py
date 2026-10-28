@@ -39,6 +39,9 @@ def parser():
 
 	result.add_argument("--break-lease", action="store_true", help="Break a stuck execution lease and exit")
 	result.add_argument("--confirm-break-lease", action="store_true", help="Confirm an in-flight request may still complete")
+	result.add_argument("--restore-backup", type=Path, help="Restore a verified backup before opening workers and exit")
+	result.add_argument("--restore-account", help="Expected account identity for restore")
+	result.add_argument("--confirm-restore", action="store_true", help="Confirm replacing local state from the backup")
 	result.add_argument("--backup", type=Path, help="Save a consistent SQLite backup after the run")
 	return result
 
@@ -144,6 +147,25 @@ def break_lease_metadata(directory: Path, *, demo: bool, confirmed: bool) -> dic
 	return {"broken": broken, "message": "Observed execution lease fenced; an in-flight request may still complete. Normal execution still requires the instance lock." if broken else "No matching lease was broken; the owner may have changed."}
 
 
+def _restore_before_open(args, directory):
+	request = directory / "restore-request.json"
+	if args.restore_backup:
+		if not args.restore_account:
+			raise ValueError("--restore-account is required to verify the backup identity")
+		source, account = args.restore_backup, args.restore_account.casefold()
+		confirmed = args.confirm_restore
+	elif request.exists():
+		data = json.loads(request.read_text(encoding="utf-8"))
+		source, account, confirmed = data["source"], data["account_id"], True
+	else:
+		return False
+	target = directory / ("unconnected.sqlite" if account == "unconnected" else "mailbox-" + digest(account)[:12] + ".sqlite")
+	Store.restore_backup(source, target, confirmed=confirmed, account_id=account)
+	if request.exists():
+		request.unlink()
+	return bool(args.restore_backup)
+
+
 def main(argv=None) -> int:
 	multiprocessing.freeze_support()
 	args = parser().parse_args(argv)
@@ -180,6 +202,9 @@ def main(argv=None) -> int:
 		if args.headless:
 			from .gui import acquire_instance_lock
 			lock = acquire_instance_lock(directory)
+			if _restore_before_open(args, directory):
+				lock.unlock()
+				return 0
 			service = AppService(data_dir=directory, demo=args.demo, count=args.count)
 			# A console run always requires its own explicit --live choice, even
 			# when the desktop's saved preferences allow automatic execution.
@@ -192,6 +217,9 @@ def main(argv=None) -> int:
 			application.setApplicationName("Gmail Inbox Cleaner")
 			application.setOrganizationName("GmailInboxCleaner")
 			lock = acquire_instance_lock(directory)
+			if _restore_before_open(args, directory):
+				lock.unlock()
+				return 0
 			settings = QSettings("GmailInboxCleaner", "Demo" if args.demo else "Personal")
 			config = load_preferences(settings)
 			service = AppService(config=config, data_dir=directory, demo=args.demo, count=args.count)

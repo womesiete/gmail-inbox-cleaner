@@ -20,6 +20,12 @@ SCHEMA_VERSION = 7
 _PROCESS_FALLBACK = uuid.uuid4().hex
 
 
+class StorageCorruptionError(RuntimeError):
+	"""Local state failed verification; the original is retained for recovery."""
+
+	summary = "Local database integrity check failed. Keep the original file and restore a verified backup."
+
+
 class AccountMismatchError(RuntimeError):
 	"""A database belongs to a different authenticated mailbox."""
 
@@ -229,7 +235,7 @@ class Store:
 	by database triggers, including for direct SQL inserts by core services.
 	"""
 
-	def __init__(self, path: str | Path, account_id: str):
+	def __init__(self, path: str | Path, account_id: str, *, check_integrity: bool = True):
 		if not account_id or not account_id.strip():
 			raise ValueError("An authenticated account identity is required")
 		self.path = Path(path) if str(path) != ":memory:" else ":memory:"
@@ -241,17 +247,25 @@ class Store:
 			self.path.parent.mkdir(parents=True, exist_ok=True)
 		self.conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=5.0)
 		self.conn.row_factory = sqlite3.Row
-		self.conn.execute("PRAGMA foreign_keys=ON")
-		self.conn.execute("PRAGMA busy_timeout=5000")
-		self.conn.execute("PRAGMA journal_mode=WAL")
-		self.conn.execute("PRAGMA synchronous=FULL")
-		self.conn.execute("PRAGMA secure_delete=ON")
 		try:
+			if check_integrity and self.conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+				raise StorageCorruptionError(StorageCorruptionError.summary)
+			self.conn.execute("PRAGMA foreign_keys=ON")
+			self.conn.execute("PRAGMA busy_timeout=5000")
+			self.conn.execute("PRAGMA journal_mode=WAL")
+			self.conn.execute("PRAGMA synchronous=FULL")
+			self.conn.execute("PRAGMA secure_delete=ON")
 			self._migrate()
 			self._bind_account()
+		except sqlite3.DatabaseError as exc:
+			self.conn.close()
+			if getattr(exc, "sqlite_errorcode", 0) & 255 not in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
+				raise
+			raise StorageCorruptionError(StorageCorruptionError.summary) from exc
 		except Exception:
 			self.conn.close()
 			raise
+
 		if self.path != ":memory:" and os.name != "nt":
 			os.chmod(self.path, 0o600)
 
@@ -528,6 +542,68 @@ class Store:
 		target.parent.mkdir(parents=True, exist_ok=True)
 		with contextlib.closing(sqlite3.connect(str(target))) as other:
 			self.conn.backup(other)
+			if other.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+				raise StorageCorruptionError("Backup integrity check failed; keep the source database")
+		if os.name != "nt":
+			os.chmod(target, 0o600)
+		return target
+
+	@staticmethod
+	def verify_backup(source: str | Path, account_id: str | None = None) -> str:
+		"""Verify an existing backup without creating or modifying its source."""
+		path = Path(source).resolve()
+		if not path.is_file():
+			raise ValueError("Backup file does not exist")
+		try:
+			with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+				if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+					raise StorageCorruptionError("Backup integrity check failed")
+				rows = connection.execute("SELECT id FROM accounts").fetchall()
+				if len(rows) != 1 or (account_id is not None and rows[0][0] != account_id.casefold()):
+					raise AccountMismatchError("Backup belongs to another account")
+				return rows[0][0]
+		except sqlite3.DatabaseError as exc:
+			raise StorageCorruptionError("Backup integrity check failed") from exc
+
+	@staticmethod
+	def restore_backup(source: str | Path, destination: str | Path, *, confirmed: bool = False, account_id: str | None = None) -> Path:
+		"""Restore only while the application instance lock excludes other users.
+
+		Call before opening application workers. Keep a verified pre-restore copy
+		of healthy state (or a byte copy of corrupt state) for reversal/inspection.
+		"""
+		if not confirmed:
+			raise ValueError("Please confirm restoring the database backup")
+		Store.verify_backup(source, account_id)
+		source = Path(source).resolve()
+		target = Path(destination).resolve()
+		if source == target:
+			raise ValueError("Restore source must differ from destination")
+		target.parent.mkdir(parents=True, exist_ok=True)
+		if target.exists():
+			previous = Path(str(target) + f".pre-restore-{uuid.uuid4().hex}.sqlite3")
+			try:
+				with contextlib.closing(sqlite3.connect(str(target))) as current:
+					with contextlib.closing(sqlite3.connect(str(previous))) as saved:
+						current.backup(saved)
+						if saved.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+							raise sqlite3.DatabaseError("Current database is corrupt")
+			except sqlite3.DatabaseError:
+				import shutil
+				shutil.copy2(target, previous)
+				# Preserve corrupt state before removing it and its unusable journals.
+				target.unlink()
+				for suffix in ("-wal", "-shm"):
+					journal = Path(str(target) + suffix)
+					if journal.exists():
+						shutil.copy2(journal, str(previous) + suffix)
+						journal.unlink()
+		with contextlib.closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as saved:
+			with contextlib.closing(sqlite3.connect(str(target))) as restored:
+				saved.backup(restored)
+				restored.execute("DELETE FROM job_leases")
+				restored.commit()
+		Store.verify_backup(target, account_id)
 		if os.name != "nt":
 			os.chmod(target, 0o600)
 		return target
