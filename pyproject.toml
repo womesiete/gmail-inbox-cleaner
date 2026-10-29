@@ -64,9 +64,11 @@ indent-style = "tab"
 [tool.coverage.run]
 source = ["gmail_clean"]
 relative_files = true
+concurrency = ["multiprocessing", "thread"]
+parallel = true
 
 [tool.coverage.report]
-fail_under = 75
+fail_under = 85
 show_missing = true
 
 [tool.mypy]

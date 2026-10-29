@@ -11,7 +11,7 @@ def test_coverage_gate_is_configured_for_the_application():
 	config = tomllib.loads((ROOT / "pyproject.toml").read_text())
 	coverage = config["tool"]["coverage"]
 	assert coverage["run"]["source"] == ["gmail_clean"]
-	assert coverage["report"]["fail_under"] >= 75
+	assert coverage["report"]["fail_under"] >= 85
 	assert "--cov=gmail_clean" in (ROOT / "scripts" / "ci_tests.py").read_text()
 
 

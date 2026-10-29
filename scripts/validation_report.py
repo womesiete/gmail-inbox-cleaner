@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import os
 from pathlib import Path
 import platform
+import tomllib
 import xml.etree.ElementTree as ET
 
 
@@ -24,6 +25,8 @@ def render(junit: Path, coverage: Path, *, status: str, revision: str) -> str:
 	if coverage.is_file():
 		root = ET.parse(coverage).getroot()  # noqa: S314 - local coverage-generated summary only
 		coverage_text = f"{float(root.get('line-rate', 0)) * 100:.2f}%"
+	configuration = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+	coverage_gate = configuration["tool"]["coverage"]["report"]["fail_under"]
 	return f"""# Generated validation record
 
 Generated on {datetime.now(UTC).date().isoformat()} by `scripts/validation_report.py` from JUnit and coverage summaries. CI regenerates this file and publishes it as a per-platform artifact. Historical manual measurements are retained in [the implementation record](history/validation-2026-10-28.md).
@@ -36,7 +39,7 @@ Generated on {datetime.now(UTC).date().isoformat()} by `scripts/validation_repor
 | Tests collected | {counts['tests']} |
 | Failures / errors / skipped | {counts['failures']} / {counts['errors']} / {counts['skipped']} |
 | Pytest elapsed seconds | {elapsed:.2f} |
-| Application line coverage | {coverage_text} (gate: 75%) |
+| Application line coverage | {coverage_text} (gate: {coverage_gate:g}%) |
 
 The workflow also checks compilation, expanded Ruff rules, typed core modules, the offline pipeline, source/wheel builds, dependency auditing, and a Windows frozen-executable smoke test. The status reflects the generating job; consult the Actions run for individual check results. These tests use synthetic mail and fixture transports. No live Gmail or private AI performance is claimed. This report intentionally excludes test failure text, mail, settings, and credentials.
 """
