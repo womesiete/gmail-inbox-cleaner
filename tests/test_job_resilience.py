@@ -96,3 +96,47 @@ def test_typed_transport_interruption_pauses_without_retry_or_attempt(tmp_path):
 		assert runner.retry_deadline(job) is None
 	finally:
 		service.store.close()
+
+
+@pytest.mark.parametrize("interrupted_recovery", [False, True])
+def test_rate_limit_shrink_recovers_after_clean_batches_and_survives_runner_restart(tmp_path, monkeypatch, interrupted_recovery):
+	messages = [mail(f"target-{index:03d}") for index in range(60)]
+	service = PipelineService(tmp_path / "adaptive.sqlite", messages)
+	try:
+		service.config.retrieval_batch_size = 8
+		original = service.mailbox.get_messages
+		metadata_sizes = []
+		first = True
+		def retrieve(ids, body=False):
+			nonlocal first
+			stage = service.store.one("SELECT stage FROM jobs ORDER BY created_at DESC LIMIT 1")["stage"]
+			if stage == "metadata":
+				metadata_sizes.append(len(ids))
+			if first:
+				first = False
+				return {mid: GmailError("rate_limit", "Synthetic rate-limit burst") for mid in ids}
+			result = original(ids, body)
+			if interrupted_recovery and stage == "metadata" and len(metadata_sizes) == 3:
+				result[ids[0]] = GmailError("data", "One malformed result interrupts a clean recovery streak")
+			return result
+		monkeypatch.setattr(service.mailbox, "get_messages", retrieve)
+		runner = JobRunner(service)
+		job = runner.new()
+		assert runner.run(job)["state"] == "waiting"
+		assert runner.payload(job)["batch_sizes"]["metadata"] == 4
+		service.now = runner.retry_deadline(job)
+		# The new runner has no in-memory adaptation state; SQLite owns the limit.
+		runner = JobRunner(service)
+		checkpoints = []
+		def progress(_):
+			checkpoints.append(runner.payload(job))
+		result = runner.run(job, progress=progress)
+		assert result["state"] == "completed" and result["failed"] == int(interrupted_recovery)
+		expected = [8, 4, 4, 4, 4, 4, 8] if interrupted_recovery else [8, 4, 4, 4, 8]
+		assert metadata_sizes[:len(expected)] == expected
+		assert any(payload.get("batch_clean", {}).get("metadata") == 1 for payload in checkpoints)
+		assert max(metadata_sizes) == service.config.retrieval_batch_size
+		assert "batch_sizes" not in runner.payload(job)
+		assert "batch_clean" not in runner.payload(job)
+	finally:
+		service.store.close()

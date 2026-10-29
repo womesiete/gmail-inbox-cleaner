@@ -23,6 +23,7 @@ _AssessmentWork = tuple[dict, Message, list[dict], str]
 class JobRunner:
 	TRANSPORT_FAILURE_THRESHOLD = 3
 	POISON_RESUME_LIMIT = 3
+	CLEAN_BATCHES_FOR_GROWTH = 3
 
 	def __init__(self, service: AppService):
 		self.s = service
@@ -214,7 +215,7 @@ class JobRunner:
 				if not self.process_stage(job, stage, window, config, progress, should_stop):
 					return self.summary(job)
 			payload = self.payload(job)
-			for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation"):
+			for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation", "batch_sizes", "batch_clean"):
 				payload.pop(key, None)
 			self.save_payload(job, payload)
 			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
@@ -429,11 +430,41 @@ class JobRunner:
 					processed = self._metadata_stage(job, rows, window, effective)
 				else:
 					processed = self._classification_stage(job, stage, rows, window, effective)
+				self._record_batch_result(job, stage, rows, effective)
 				if not processed:
 					continue
 			if progress:
 				counts = self.summary(job)
 				progress(f"{stage.title()}: {counts['completed']:,} stages completed; {counts['failed']:,} errors")
+
+	def _record_batch_result(self, job: str, stage: str, rows: list[dict], config: Config) -> None:
+		"""Recover a throttled batch size only after durable, consecutive clean batches."""
+		payload = self.payload(job)
+		sizes = payload.get("batch_sizes", {})
+		if stage not in sizes:
+			return
+		ids = [row["id"] for row in rows]
+		unclean = any(self.db.one(
+			f"SELECT COUNT(*) n FROM work_items WHERE id IN ({placeholders(selected)}) AND state!='completed'",  # noqa: S608 - only generated bind markers are interpolated
+			selected,
+		)["n"] for selected in chunks(ids))
+		clean = payload.setdefault("batch_clean", {})
+		clean[stage] = 0 if unclean else int(clean.get(stage, 0)) + 1
+		if clean[stage] >= self.CLEAN_BATCHES_FOR_GROWTH:
+			configured = config.ai_batch_size if stage == "classification" else config.retrieval_batch_size
+			sizes[stage] = min(configured, max(sizes[stage] + 1, sizes[stage] * 2))
+			clean[stage] = 0
+			# A recovered streak also ends the previous quota burst's retry budget.
+			if payload.get("backoff", {}).get("kind") == "rate_limit":
+				payload.pop("backoff", None)
+			if sizes[stage] >= configured:
+				sizes.pop(stage, None)
+				clean.pop(stage, None)
+		if not sizes:
+			payload.pop("batch_sizes", None)
+		if not clean:
+			payload.pop("batch_clean", None)
+		self.save_payload(job, payload)
 
 	def _body_stage(self, job: str, rows: list[dict], window: Window, config: Config) -> bool:
 		rows = self._prepare_body_batch(job, rows, window, config)
@@ -955,15 +986,16 @@ class JobRunner:
 		elif kind == "rate_limit":
 			payload = self.payload(job)
 			backoff = payload.get("backoff", {})
-			if not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
-				round_number = int(backoff.get("attempts", 0)) + 1
+			payload.setdefault("batch_clean", {})[row["stage"]] = 0
+			if backoff.get("kind") != "rate_limit" or not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
+				round_number = (int(backoff.get("attempts", 0)) if backoff.get("kind") == "rate_limit" else 0) + 1
 				delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 				batch_size = config.ai_batch_size if row["stage"] == "classification" else config.retrieval_batch_size
 				sizes = payload.setdefault("batch_sizes", {})
 				sizes[row["stage"]] = max(1, sizes.get(row["stage"], batch_size) // 2)
 				backoff = {"kind": kind, "due": stamp(self.s.clock() + timedelta(seconds=delay)), "attempts": round_number, "batch_size": sizes[row["stage"]]}
 				payload["backoff"] = backoff
-				self.save_payload(job, payload)
+			self.save_payload(job, payload)
 			due = backoff["due"]
 			state = "retry"
 			if backoff["attempts"] > config.max_retries:
