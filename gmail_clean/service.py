@@ -70,6 +70,7 @@ class AppService:
 		self._session_write_confirmation = getattr(self._resource_owner, "_session_write_confirmation", False)
 		self._cancel_event = threading.Event()
 		self._lease_depth = 0
+		self._runner_lease_depth = 0
 		self.current_job_id = None
 		if demo and mailbox is not None:
 			from .demo import DemoMailbox
@@ -244,8 +245,7 @@ class AppService:
 		from .gmail import GmailMailbox
 		if isinstance(self._mailbox, GmailMailbox):
 			self._mailbox.quota_limiter = self._quota_limiter()
-			if hasattr(self._mailbox, "cancelled"):
-				self._mailbox.cancelled = lambda: self._cancel_event.is_set() or self._resource_owner._abort_event.is_set()
+			self._mailbox.cancelled = self._stop_callback()
 			self._mailbox.on_label_error = self.invalidate_labels
 			owner = self._resource_owner
 			with owner._label_cache_lock:
@@ -384,6 +384,14 @@ class AppService:
 	def _stop_callback(self, should_stop=None):
 		"""Preserve explicit pause/stop signals while adding local shutdown."""
 		def requested():
+			# Lease repair may fence a worker while its network/provider request
+			# remains in flight. Its next local boundary must stop before a write.
+			for name, depth in (("mailbox_runner", self._runner_lease_depth), ("mailbox_execution", self._lease_depth)):
+				if depth:
+					try:
+						self.store.require_lease(name)
+					except LeaseBusyError:
+						return "paused"
 			signal = should_stop() if should_stop is not None else False
 			return signal or self._cancel_event.is_set() or self._resource_owner._abort_event.is_set()
 		return requested
@@ -412,21 +420,59 @@ class AppService:
 			return len(owner._active_workers)
 
 	@contextlib.contextmanager
-	def execution_lease(self):
+	def execution_lease(self, *, track_mutation=True):
+		"""Serialize mailbox writers independently of long-running assessment.
+
+		Runner-only local commits use the same writer fence without advancing the
+		external mutation revision. Explicit apply/undo advances it on entry and
+		exit so an AI result cannot overwrite intervening action receipts.
+		"""
+		outer = self._lease_depth == 0
 		if self._lease_depth == 0 and not self.store.acquire_lease("mailbox_execution"):
-			raise LeaseBusyError("Another worker is using this mailbox; pause it before executing")
+			raise LeaseBusyError("Another mailbox writer is active; retry after it finishes")
 		self._lease_depth += 1
 		try:
+			if outer and track_mutation:
+				self._advance_writer_revision()
 			with self.store.lease_heartbeat("mailbox_execution"):
 				yield
 		finally:
 			self._lease_depth -= 1
 			if self._lease_depth == 0:
+				if track_mutation:
+					with contextlib.suppress(LeaseBusyError):
+						self.store.require_lease("mailbox_execution")
+						self._advance_writer_revision()
 				self.store.release_lease("mailbox_execution")
 
+	def _advance_writer_revision(self):
+		with self.store.transaction():
+			self.store.set_checkpoint("mailbox_writer_revision", int(self.store.checkpoint("mailbox_writer_revision", 0)) + 1)
+
+	@contextlib.contextmanager
+	def runner_lease(self):
+		"""Keep one discovery/classification runner while allowing explicit writes."""
+		if self._runner_lease_depth == 0 and not self.store.acquire_lease("mailbox_runner"):
+			raise LeaseBusyError("Another cleanup runner is active for this mailbox")
+		self._runner_lease_depth += 1
+		try:
+			with self.store.lease_heartbeat("mailbox_runner"):
+				yield
+		finally:
+			self._runner_lease_depth -= 1
+			if self._runner_lease_depth == 0:
+				self.store.release_lease("mailbox_runner")
+
 	def heartbeat(self, job=None):
+		if self._runner_lease_depth:
+			self.store.heartbeat("mailbox_runner")
 		if self._lease_depth:
 			self.store.heartbeat("mailbox_execution")
+
+	def assert_runner_ownership(self):
+		"""A delayed/fenced runner must never recover a successor's durable work."""
+		if self._runner_lease_depth:
+			self.store.require_lease("mailbox_runner")
 
 	def new_job(self):
 		self.reload_config()
@@ -439,7 +485,7 @@ class AppService:
 			signal = should_stop()
 			self.control_job(job_id, signal if signal in {"paused", "stopped"} else "paused")
 			return self.jobs.summary(job_id)
-		with self.execution_lease():
+		with self.runner_lease():
 			self.reload_config()
 			self.current_job_id = job_id
 			from .diagnostics import event
@@ -447,6 +493,7 @@ class AppService:
 			try:
 				self.refresh_labels()
 			except Exception as exc:  # noqa: BLE001 - label discovery failure becomes a stored system pause before job entry
+				self.assert_runner_ownership()
 				self.error("discovery", exc, job_id=job_id)
 				self.jobs.handle_exception(job_id, exc, self.config)
 				return self.jobs.summary(job_id)

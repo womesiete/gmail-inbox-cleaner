@@ -35,6 +35,14 @@ class AccountMismatchError(RuntimeError):
 class LeaseBusyError(RuntimeError):
 	"""Another living owner is executing the job."""
 
+	kind = "transient"
+
+
+class LeaseLostError(LeaseBusyError):
+	"""A confirmed repair or successor fenced this worker's prior ownership."""
+
+	kind = "interrupted"
+
 
 def utc_now() -> str:
 	return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -516,12 +524,12 @@ class Store:
 		now = datetime.now(timezone.utc)
 		cursor = self.execute("UPDATE job_leases SET heartbeat_at=?,expires_at=? WHERE name=? AND owner_token=?", (now.isoformat(), (now + timedelta(seconds=ttl_seconds)).isoformat(), name, self._owner_token))
 		if cursor.rowcount != 1:
-			raise LeaseBusyError("Execution lease was lost")
+			raise LeaseLostError("Execution lease was lost")
 
 	def require_lease(self, name: str) -> None:
 		row = self.one("SELECT owner_token,pid FROM job_leases WHERE name=?", (name,))
 		if not row or row["owner_token"] != self._owner_token or row["pid"] != os.getpid():
-			raise LeaseBusyError("This worker does not own the execution lease")
+			raise LeaseLostError("This worker does not own the execution lease")
 
 	def release_lease(self, name: str) -> None:
 		self.execute("DELETE FROM job_leases WHERE name=? AND owner_token=?", (name, self._owner_token))
@@ -539,7 +547,7 @@ class Store:
 						cursor = connection.execute("UPDATE job_leases SET heartbeat_at=?,expires_at=? WHERE name=? AND owner_token=?", (now.isoformat(), (now + timedelta(seconds=ttl_seconds)).isoformat(), name, self._owner_token))
 						connection.commit()
 						if cursor.rowcount != 1:
-							raise LeaseBusyError("Execution lease was lost")
+							raise LeaseLostError("Execution lease was lost")
 			except Exception as exc:  # noqa: BLE001 - heartbeat thread relays lease loss to its owner for safe cleanup
 				error.append(exc)
 		thread = None
@@ -549,7 +557,7 @@ class Store:
 		try:
 			yield
 			if error:
-				raise LeaseBusyError("Lease heartbeat failed; execution must stop") from error[0]
+				raise LeaseLostError("Lease heartbeat failed; execution must stop") from error[0]
 		finally:
 			stop.set()
 			if thread:

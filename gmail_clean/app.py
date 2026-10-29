@@ -144,9 +144,9 @@ def break_lease_metadata(directory: Path, *, demo: bool, confirmed: bool) -> dic
 	if not path.is_file():
 		return {"broken": False, "message": "No existing account database or execution lease"}
 	with Store(path, account) as store:
-		row = store.one("SELECT owner_token FROM job_leases WHERE name='mailbox_execution'")
-		broken = bool(row) and store.break_lease("mailbox_execution", confirmed=True, owner_token=row["owner_token"])
-	return {"broken": broken, "message": "Observed execution lease fenced; an in-flight request may still complete. Normal execution still requires the instance lock." if broken else "No matching lease was broken; the owner may have changed."}
+		rows = store.query("SELECT name,owner_token FROM job_leases WHERE name IN ('mailbox_execution','mailbox_runner')")
+		broken = [row["name"] for row in rows if store.break_lease(row["name"], confirmed=True, owner_token=row["owner_token"])]
+	return {"broken": bool(broken), "leases": broken, "message": "Observed runner/writer leases fenced; an in-flight request may still complete. Normal execution still requires the instance lock." if broken else "No matching lease was broken; the owner may have changed."}
 
 
 def _restore_before_open(args, directory):

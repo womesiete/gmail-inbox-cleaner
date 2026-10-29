@@ -44,6 +44,10 @@ class MainWindow(QMainWindow):
 		self.pool.setMaxThreadCount(1)
 		self.preview_pool = QThreadPool(self)
 		self.preview_pool.setMaxThreadCount(1)
+		# Local lease repair cannot queue behind either a slow cleanup runner or
+		# the mailbox writer it needs to fence.
+		self.repair_pool = QThreadPool(self)
+		self.repair_pool.setMaxThreadCount(1)
 		self.tasks, self.callbacks = {}, {}
 		self.models, self.views, self.model_specs = {}, {}, {}
 		self.stop_event = threading.Event()
@@ -912,7 +916,7 @@ class MainWindow(QMainWindow):
 			if answer != QMessageBox.StandardButton.Yes:
 				return
 		self._submit("Executing reviewed plan" if not expected_dry_run else "Simulating approved plans",
-			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set, expected_plan_hash=snapshot["hash"], allow_over_limit=snapshot["count"] > self.service.config.max_actions_per_run, expected_dry_run=expected_dry_run))
+			lambda svc, p: svc.apply_actions(action_ids=ids, should_stop=self.stop_event.is_set, expected_plan_hash=snapshot["hash"], allow_over_limit=snapshot["count"] > self.service.config.max_actions_per_run, expected_dry_run=expected_dry_run), pool=self.preview_pool)
 
 	def _undo_scope_changed(self, *args):
 		self._describe_undo_scope(self._selected("history"))
@@ -945,7 +949,7 @@ class MainWindow(QMainWindow):
 			answer = QMessageBox.warning(self, "Confirm recorded undo", details, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
 			if answer != QMessageBox.StandardButton.Yes:
 				return
-		self._submit(title, lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set, allow_unverified=allow_unverified, confirmed=allow_unverified, allow_over_limit=over_limit))
+		self._submit(title, lambda svc, p: svc.undo(ids, should_stop=self.stop_event.is_set, allow_unverified=allow_unverified, confirmed=allow_unverified, allow_over_limit=over_limit), pool=self.preview_pool)
 
 	def _undo_job(self):
 		rows = self._selected("history")
@@ -1103,12 +1107,14 @@ class MainWindow(QMainWindow):
 			self._submit("Revoking Google consent and removing protected local tokens", lambda svc, p: svc.disconnect(revoke=True))
 
 	def _break_lease(self):
-		row = self.service.store.one("SELECT owner_token FROM job_leases WHERE name='mailbox_execution'")
-		if not row:
-			self.statusBar().showMessage("No execution lease is held")
+		rows = self.service.store.query("SELECT name,owner_token FROM job_leases WHERE name IN ('mailbox_execution','mailbox_runner')")
+		if not rows:
+			self.statusBar().showMessage("No cleanup runner or mailbox writer lease is held")
 			return
 		if QMessageBox.warning(self, "Break execution lease?", "The old worker will be fenced. An in-flight Gmail request may still finish. Stop the old process before continuing. Break this lease?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
-			self._submit("Breaking stuck execution lease", lambda svc, p: svc.store.break_lease("mailbox_execution", confirmed=True, owner_token=row["owner_token"]), pool=self.preview_pool)
+			def repair(svc, progress):
+				return {"broken": [row["name"] for row in rows if svc.store.break_lease(row["name"], confirmed=True, owner_token=row["owner_token"])]}
+			self._submit("Breaking stuck execution leases", repair, pool=self.repair_pool)
 
 	def _restore_backup(self):
 		path, _ = QFileDialog.getOpenFileName(self, "Restore verified backup on next launch", "", "SQLite (*.sqlite *.sqlite3)")
@@ -1180,6 +1186,7 @@ class MainWindow(QMainWindow):
 					self.service.abort_workers()
 				self.pool.clear()
 				self.preview_pool.clear()
+				self.repair_pool.clear()
 				self._close_deadline.start(3000)
 				self.statusBar().showMessage("Stopping local workers and closing. An interrupted remote request may still complete or be billed.")
 			event.ignore()
@@ -1218,7 +1225,7 @@ class MainWindow(QMainWindow):
 						signal.disconnect()
 					except TypeError:
 						pass  # A task can finish before all UI receivers are detached.
-			_DrainingWork((self.pool, self.preview_pool), self.tasks)
+			_DrainingWork((self.pool, self.preview_pool, self.repair_pool), self.tasks)
 			self.tasks = {}
 			self.callbacks.clear()
 			self._running_job = False

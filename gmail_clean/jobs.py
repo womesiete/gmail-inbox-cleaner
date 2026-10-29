@@ -8,6 +8,7 @@ import math
 import random
 import time
 from collections import defaultdict
+from functools import wraps
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -15,12 +16,22 @@ from .ai import PROMPT_VERSION
 from .stage_cache import StageMetadataCache
 from .domain import Assessment, Config, Message, Window, content_excluded, content_hash, context_hash, epoch_ms, message_safety_flags, recommend, resolve_age_cutoff, resolve_window
 from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
+from .storage import LeaseLostError
 
 if TYPE_CHECKING:
 	from .service import AppService
 
 
 _AssessmentWork = tuple[dict, Message, list[dict], str]
+
+
+def _runner_owned(method):
+	"""Fence delayed recovery helpers before they can edit a successor's work."""
+	@wraps(method)
+	def call(self, *args, **kwargs):
+		with self._owned_transaction():
+			return method(self, *args, **kwargs)
+	return call
 
 
 class JobRunner:
@@ -53,9 +64,22 @@ class JobRunner:
 		})
 		return job_id
 
+	def _assert_runner(self) -> None:
+		check = getattr(self.s, "assert_runner_ownership", None)
+		if callable(check):
+			check()
+
+	@contextlib.contextmanager
+	def _owned_transaction(self):
+		"""Validate the runner token atomically with durable recovery mutations."""
+		with self.db.transaction():
+			self._assert_runner()
+			yield
+
 	def payload(self, job: str) -> dict:
 		return json.loads(self.db.one("SELECT payload_json FROM jobs WHERE id=?", (job,))["payload_json"])
 
+	@_runner_owned
 	def save_payload(self, job: str, payload: dict) -> None:
 		self.db.execute("UPDATE jobs SET payload_json=?,updated_at=? WHERE id=?", (encode(payload), stamp(), job))
 
@@ -63,9 +87,20 @@ class JobRunner:
 		row = self.db.one("SELECT value_json FROM checkpoints WHERE key=?", (key,))
 		return json.loads(row["value_json"]) if row else default
 
+	@_runner_owned
 	def set_checkpoint(self, key: str, value) -> None:
 		insert(self.db, "checkpoints", {"key": key, "value_json": encode(value), "updated_at": stamp()}, replace=True)
 
+	def _stage_lease(self):
+		"""Short local-state stages share the mailbox writer fence, never AI I/O."""
+		if callable(getattr(self.s, "execution_lease", None)):
+			self.s.heartbeat()
+			# Access validates the connection generation after a slow provider call.
+			_ = self.s.mailbox
+			return self.s.execution_lease(track_mutation=False)
+		return contextlib.nullcontext()
+
+	@_runner_owned
 	def queue(self, job: str, message_id: str, stage: str = "metadata") -> None:
 		self.db.execute(
 			"INSERT OR IGNORE INTO work_items(job_id,message_id,stage,state) VALUES(?,?,?,'pending')",
@@ -73,6 +108,7 @@ class JobRunner:
 		)
 
 	def held(self, job: str, should_stop: Callable | None) -> bool:
+		self._assert_runner()
 		row = self.db.one("SELECT state FROM jobs WHERE id=?", (job,))
 		if row["state"] in {"paused", "stopped"}:
 			return True
@@ -81,12 +117,13 @@ class JobRunner:
 			return True
 		signal = should_stop() if callable(should_stop) else False
 		if signal:
-			state = signal if signal in {"paused", "stopped"} else "paused"
-			payload = self.payload(job)
-			payload["pause"] = {"origin": "user", "kind": state, "reason": "Paused by the user", "due": None}
-			self.save_payload(job, payload)
-			self.db.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job))
-			return True
+			with self._owned_transaction():
+				state = signal if signal in {"paused", "stopped"} else "paused"
+				payload = self.payload(job)
+				payload["pause"] = {"origin": "user", "kind": state, "reason": "Paused by the user", "due": None}
+				self.save_payload(job, payload)
+				self.db.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", (state, stamp(), job))
+				return True
 		return False
 
 	def rules_revision(self) -> str:
@@ -129,7 +166,7 @@ class JobRunner:
 				AND p.prompt_version=?) AS has_assessment
 			FROM messages m WHERE m.in_inbox=1 AND NOT EXISTS
 				(SELECT 1 FROM work_items w WHERE w.job_id=? AND w.message_id=m.id AND w.stage='metadata')""", (PROMPT_VERSION, job))
-		with self.db.transaction():
+		with self._owned_transaction():
 			for row in rows:
 				if not window.contains(row["internal_ms"]):
 					continue
@@ -211,36 +248,42 @@ class JobRunner:
 		self.save_payload(job, payload)
 		window = Window.from_dict(json.loads(row["window_json"]))
 		config = Config.from_dict(json.loads(row["config_json"]))
-		# Recovered running items were never acknowledged; stages are idempotent.
-		self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND state='running'", (job,))
-		self.db.execute("UPDATE jobs SET state='running',updated_at=? WHERE id=?", (stamp(), job))
+		with self._owned_transaction():
+			# Recovered running items were never acknowledged; stages are idempotent.
+			self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND state='running'", (job,))
+			self.db.execute("UPDATE jobs SET state='running',updated_at=? WHERE id=?", (stamp(), job))
 		try:
 			if not self.payload(job).get("discovered"):
 				with self.record_quota(job, "discovery"):
 					if not self.discover(job, window, config, progress, should_stop):
 						return self.summary(job)
 			for stage in ("metadata", "body", "classification"):
-				self.db.execute("UPDATE jobs SET stage=?,updated_at=? WHERE id=?", (stage, stamp(), job))
+				with self._owned_transaction():
+					self.db.execute("UPDATE jobs SET stage=?,updated_at=? WHERE id=?", (stage, stamp(), job))
 				with self.record_quota(job, stage):
 					if not self.process_stage(job, stage, window, config, progress, should_stop):
 						return self.summary(job)
-			payload = self.payload(job)
-			for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation", "batch_sizes", "batch_clean"):
-				payload.pop(key, None)
-			self.save_payload(job, payload)
-			self._metadata_caches.pop(job, None)
-			self._stage_cache = None
-			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
-			self.set_checkpoint("boundary_latest", window.to_dict()["latest_exclusive"])
-			self.set_checkpoint("boundary_window", {"earliest_date": config.earliest_date, "latest_mode": config.latest_mode, "latest_days": config.latest_days, "latest_date": config.latest_date, "timezone": config.timezone})
-			completed_inputs = self.payload(job)
-			self.set_checkpoint("boundary_anchor", stamp(window.anchor_utc))
-			self.set_checkpoint("boundary_policy_revision", completed_inputs.get("policy_revision", config.revision))
-			self.set_checkpoint("boundary_rules_revision", completed_inputs.get("rules_revision", self.rules_revision()))
-			self.set_checkpoint("boundary_prompt_version", completed_inputs.get("prompt_version", PROMPT_VERSION))
+			with self._owned_transaction():
+				payload = self.payload(job)
+				for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation", "batch_sizes", "batch_clean"):
+					payload.pop(key, None)
+				self.save_payload(job, payload)
+				self._metadata_caches.pop(job, None)
+				self._stage_cache = None
+				self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
+				self.set_checkpoint("boundary_latest", window.to_dict()["latest_exclusive"])
+				self.set_checkpoint("boundary_window", {"earliest_date": config.earliest_date, "latest_mode": config.latest_mode, "latest_days": config.latest_days, "latest_date": config.latest_date, "timezone": config.timezone})
+				completed_inputs = self.payload(job)
+				self.set_checkpoint("boundary_anchor", stamp(window.anchor_utc))
+				self.set_checkpoint("boundary_policy_revision", completed_inputs.get("policy_revision", config.revision))
+				self.set_checkpoint("boundary_rules_revision", completed_inputs.get("rules_revision", self.rules_revision()))
+				self.set_checkpoint("boundary_prompt_version", completed_inputs.get("prompt_version", PROMPT_VERSION))
 			if self.s.config.auto_execute and not self.s.config.dry_run:
 				self.s.apply_actions(job_id=job, should_stop=should_stop)
+		except LeaseLostError:
+			raise
 		except Exception as exc:  # noqa: BLE001 - job boundary persists a kind-aware resumable pause
+			self._assert_runner()
 			self.s.error("job", exc, job_id=job)
 			self.handle_exception(job, exc, config)
 			if progress:
@@ -307,7 +350,7 @@ class JobRunner:
 						restarts += 1
 						continue
 					raise
-				with self.db.transaction():
+				with self._owned_transaction():
 					for item in page.get("messages", []):
 						if payload.get("refresh_all") or item["id"] not in local_inbox:
 							self.queue(job, item["id"])
@@ -365,7 +408,7 @@ class JobRunner:
 					restarts += 1
 					continue
 				raise
-			with self.db.transaction():
+			with self._owned_transaction():
 				for event in page.get("history", []):
 					# Specific event arrays avoid duplicating generic 'messages' entries.
 					for kind in ("messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"):
@@ -469,9 +512,11 @@ class JobRunner:
 			batch_policy = self.s.policy_batch([row["message_id"] for row in rows]) if hasattr(self.s, "policy_batch") else contextlib.nullcontext()
 			with batch_policy:
 				if stage == "body":
-					processed = self._body_stage(job, rows, window, effective)
+					with self._stage_lease():
+						processed = self._body_stage(job, rows, window, effective)
 				elif stage == "metadata":
-					processed = self._metadata_stage(job, rows, window, effective)
+					with self._stage_lease():
+						processed = self._metadata_stage(job, rows, window, effective)
 				else:
 					processed = self._classification_stage(job, stage, rows, window, effective)
 				self._record_batch_result(job, stage, rows, effective)
@@ -543,7 +588,7 @@ class JobRunner:
 			and self.s.eligible(message, window) and not self.excluded(message, config)
 			and (not json.loads(row["payload_json"]).get("download_only", False) or config.download_all_bodies)
 		)
-		with self.db.transaction():
+		with self._owned_transaction():
 			for row in rows:
 				old = self.db.get_message(row["message_id"])
 				message = live_metadata.get(row["message_id"], ValueError("Missing body-preflight metadata"))
@@ -605,6 +650,7 @@ class JobRunner:
 				allowed.append(row)
 		return allowed
 
+	@_runner_owned
 	def _mark_running(self, job: str, stage: str, rows: list[dict]) -> None:
 		ids = [r["message_id"] for r in rows]
 		for selected in chunks(ids):
@@ -623,12 +669,12 @@ class JobRunner:
 			message for message in results.values()
 			if not isinstance(message, Exception) and self.s.eligible(message, window)
 		) if stage == "metadata" else {}
-		with self.db.transaction():
+		with self._owned_transaction():
 			for row in rows:
 				mid = row["message_id"]
 				result = results.get(mid, ValueError("Missing retrieval result"))
 				try:
-					with self.db.transaction():
+					with self._owned_transaction():
 						if isinstance(result, Exception):
 							raise result
 						if stage == "metadata":
@@ -726,7 +772,7 @@ class JobRunner:
 		now = self.s.clock().astimezone(UTC)
 		day_key = "ai_budget_daily:" + now.date().isoformat()
 		cost = config.estimated_cost_per_call
-		with self.db.transaction():
+		with self._owned_transaction():
 			payload = self.payload(job)
 			usage = payload.get("ai_usage", {"calls": 0, "estimated_cost": 0.0})
 			daily = self.checkpoint(day_key, {"calls": 0, "estimated_cost": 0.0})
@@ -751,7 +797,9 @@ class JobRunner:
 		return True
 
 	def classify(self, job: str, rows: list[dict], window: Window, config: Config) -> None:
-		pending, threads = self._prepare_classification(job, rows, window, config)
+		with self._stage_lease():
+			pending, threads = self._prepare_classification(job, rows, window, config)
+			writer_revision = int(self.db.checkpoint("mailbox_writer_revision", 0))
 		if not pending:
 			return
 		exclusions = {"senders": config.excluded_senders, "domains": config.excluded_domains, "label_ids": config.excluded_label_ids, "categories": config.excluded_categories}
@@ -759,7 +807,7 @@ class JobRunner:
 		if getattr(self.s, "supports_context_cache", False):
 			context_options.update(threads=threads, bodies={})
 		for (route, _), group in pending.items():
-			if not self._classify_group(job, route, group, window, config, exclusions, context_options):
+			if not self._classify_group(job, route, group, window, config, exclusions, context_options, writer_revision=writer_revision):
 				return
 
 	def _prepare_classification(self, job: str, rows: list[dict], window: Window, config: Config) -> tuple[dict[tuple[str, str], list[_AssessmentWork]], dict]:
@@ -787,7 +835,8 @@ class JobRunner:
 			message.body, message.truncated, message.missing_content = stored.body, stored.truncated, stored.missing_content
 			message.content_flags = list(stored.content_flags)
 			message.context_version, message.content_hash = stored.context_version, stored.content_hash
-		self.db.upsert_message(message)
+		with self._owned_transaction():
+			self.db.upsert_message(message)
 		if not stored or not self.s.eligible(message, window) or self.excluded(message, config):
 			if stored:
 				self.save_recommendation(job, message, None, "review" if self.s.eligible(message, window) else "skip", "Classification preflight found changed scope or content-sharing state", window)
@@ -799,14 +848,16 @@ class JobRunner:
 			members = threads[message.thread_id]
 			message.context_version = context_hash(members, config.sent_context_enabled)
 			newer_excluded = self._newer_excluded(message, members, window)
-			self.db.upsert_message(message)
+			with self._owned_transaction():
+				self.db.upsert_message(message)
 			if stored.context_version != message.context_version or newer_excluded or message.missing_content or not message.body:
-				self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
-				self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
-				self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
-				self.save_recommendation(job, message, None, "review", "Conversation/content changed or is incomplete before AI submission", window)
-				self.done(job, message.id, "classification")
-				return None
+				with self._owned_transaction():
+					self.db.execute("UPDATE predictions SET valid=0 WHERE message_id=?", (message.id,))
+					self.db.execute("DELETE FROM manual_overrides WHERE message_id=?", (message.id,))
+					self.db.execute("UPDATE messages SET defer_until_utc=NULL,deadline_utc=NULL WHERE id=?", (message.id,))
+					self.save_recommendation(job, message, None, "review", "Conversation/content changed or is incomplete before AI submission", window)
+					self.done(job, message.id, "classification")
+					return None
 		except Exception as exc:  # noqa: BLE001 - one classification preflight failure must preserve other targets
 			self.fail(job, row, exc, config)
 			return None
@@ -833,7 +884,7 @@ class JobRunner:
 		return None
 
 	def _classify_group(self, job: str, route: str, group: list[_AssessmentWork], window: Window, config: Config,
-			exclusions: dict, context_options: dict[str, Any]) -> bool:
+			exclusions: dict, context_options: dict[str, Any], *, writer_revision: int | None = None) -> bool:
 		try:
 			examples = group[0][2]
 			contexts = {}
@@ -849,22 +900,34 @@ class JobRunner:
 			for row, _, _, _ in group:
 				self.fail(job, row, exc, config)
 			return True
-		for row, message, _, version in group:
-			try:
-				assessment = batch.assessments.get(message.id)
-				if assessment is None:
-					raise ValueError(batch.errors.get(message.id, "Missing assessment"))
-				decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-				telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
-				with self.db.transaction():
-					self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
-					self.done(job, message.id, "classification")
-			except Exception as exc:  # noqa: BLE001 - save failure retries only the unresolved classification item
+		try:
+			with self._stage_lease():
+				if writer_revision is not None and int(self.db.checkpoint("mailbox_writer_revision", 0)) != writer_revision:
+					# Apply/undo may run while the model is working. Discard this stale
+					# result and repeat ordinary live preflight before reconsidering it.
+					# Reserved provider spend remains counted even when no result is saved.
+					for row, _, _, _ in group:
+						self.db.execute("UPDATE work_items SET state='pending' WHERE id=? AND state='running'", (row["id"],))
+					return True
+				for row, message, _, version in group:
+					try:
+						assessment = batch.assessments.get(message.id)
+						if assessment is None:
+							raise ValueError(batch.errors.get(message.id, "Missing assessment"))
+						decision = recommend(message, assessment, config, window, manual_override=self.s.override(message), rules=self.s.rules())
+						telemetry = {**batch.telemetry, "example_version": digest(self.example_signature(examples)), "route_category": route}
+						with self._owned_transaction():
+							self.save_recommendation(job, message, assessment, decision.action, decision.reason, window, version, telemetry, label_ids=decision.label_ids, approval="manual" if decision.evidence_source == "manual" else "automatic")
+							self.done(job, message.id, "classification")
+					except Exception as exc:  # noqa: BLE001 - save failure retries only the unresolved classification item
+						self.fail(job, row, exc, config)
+		except Exception as exc:  # noqa: BLE001 - a busy/fenced writer leaves classification resumable
+			for row, _, _, _ in group:
 				self.fail(job, row, exc, config)
 		return True
 
 	def save_recommendation(self, job, message, assessment, action, reason, window, version="", telemetry=None, label_ids=None, approval="automatic"):
-		with self.db.transaction():
+		with self._owned_transaction():
 			if assessment:
 				self.db.execute("UPDATE messages SET decision=?,category=?,deadline_utc=? WHERE id=?", (action, assessment.category, assessment.deadline_utc, message.id))
 			else:
@@ -880,6 +943,7 @@ class JobRunner:
 				bypass = (self.s.override(message) or {}).get("protection_bypass", []) if approval == "manual" else []
 				self.s.actions.plan(job, message, "label", list(label_ids), reason, approval, window, bypass)
 
+	@_runner_owned
 	def done(self, job: str, mid: str, stage: str) -> None:
 		self._transport_succeeded(job)
 		if (job, mid, stage) in self._auth_paused_items:
@@ -985,6 +1049,7 @@ class JobRunner:
 			return None
 		return self.s.clock() if work["immediate"] else datetime.fromisoformat(work["due"]) if work["due"] else None
 
+	@_runner_owned
 	def handle_exception(self, job: str, exc: Exception, config: Config) -> None:
 		"""Keep operational pauses distinct from the user's explicit pause."""
 		kind = getattr(exc, "kind", "") or ("rate_limit" if getattr(exc, "category", "") == "RateLimitError" else "unexpected")
@@ -1021,12 +1086,14 @@ class JobRunner:
 		due = stamp(self.s.clock() + timedelta(seconds=delay)) if attempt <= config.max_retries else None
 		self.pause_system(job, kind, reason, due=due, attempts=attempt)
 
+	@_runner_owned
 	def pause_system(self, job: str, kind: str, reason: str, *, due=None, attempts=0) -> None:
 		payload = self.payload(job)
 		payload["pause"] = {"origin": "system", "kind": kind, "reason": reason, "due": due, "attempts": attempts}
 		self.save_payload(job, payload)
 		self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(self.s.clock()), job))
 
+	@_runner_owned
 	def fail(self, job: str, row: dict, exc: Exception, config: Config) -> None:
 		current = self.db.one("SELECT state,attempts FROM work_items WHERE id=?", (row["id"],))
 		if not current or current["state"] == "completed":
