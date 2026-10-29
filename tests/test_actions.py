@@ -916,3 +916,50 @@ def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_m
 		assert state(app, aid)["state"] == "proposed"
 	assert not app.mailbox.calls
 	assert not app.store.one("SELECT id FROM attempts")
+
+
+@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict')])
+def test_unsent_write_failure_closes_attempt_without_uncertainty(app, kind, expected):
+	from gmail_clean.gmail import GmailError, PreSendError
+	aid = plan(app, seed(app), ['Label_added'])
+	def not_sent(*args):
+		raise PreSendError(GmailError(kind, 'Synthetic failure before transport'))
+	app.mailbox.modify = not_sent
+	assert app.actions.apply([aid])['applied'] == 0
+	assert state(app, aid)['state'] == expected
+	assert app.store.one('SELECT state,finished_at FROM attempts WHERE action_id=?', (aid,))['state'] == 'not_sent'
+	assert not app.store.one("SELECT id FROM attempts WHERE state='sending'")
+	assert not app.store.one("SELECT id FROM actions WHERE state IN ('executing','uncertain')")
+
+
+@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict')])
+def test_catalog_is_validated_before_attempt_transaction(app, kind, expected):
+	from gmail_clean.gmail import GmailError, PreSendError
+	aid = plan(app, seed(app), ['Label_added'])
+	def validate(add, remove, *, refresh=False):
+		assert refresh
+		assert not app.store.one('SELECT id FROM attempts')
+		raise PreSendError(GmailError(kind, 'Catalog fetch failed' if kind == 'network' else 'Required label was deleted'))
+	app.mailbox.validate_labels = validate
+	assert app.actions.apply([aid])['applied'] == 0
+	assert state(app, aid)['state'] == expected
+	assert not app.store.one('SELECT id FROM attempts') and not app.mailbox.calls
+
+
+def test_rejected_write_catalog_recovery_failure_does_not_leave_sending_attempt(app):
+	from gmail_clean.gmail import GmailError
+	aid = plan(app, seed(app), ['Label_added'])
+	original_refresh = app.refresh_labels
+	def refresh():
+		if app.store.one("SELECT id FROM attempts WHERE state='not_applied'"):
+			raise GmailError('network', 'Catalog recovery unavailable')
+		original_refresh()
+	app.refresh_labels = refresh
+	app.invalidate_labels = lambda: None
+	def rejected(*args):
+		raise GmailError('missing', 'Deleted label', status=404)
+	app.mailbox.modify = rejected
+	assert app.actions.apply([aid])['applied'] == 0
+	assert state(app, aid)['state'] == 'retry'
+	assert app.store.one('SELECT state FROM attempts')['state'] == 'not_applied'
+	assert not app.store.one("SELECT id FROM attempts WHERE state='sending'")

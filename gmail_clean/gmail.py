@@ -56,14 +56,25 @@ class QuotaLimiter:
 
 class GmailError(RuntimeError):
 	def __init__(self, kind: str, message: str, retry_after: float | None = None,
-			status: int | None = None, reason: str | None = None) -> None:
+			status: int | None = None, reason: str | None = None, *, sent: bool | None = None) -> None:
 		super().__init__(message)
 		self.kind = kind
 		self.safe_message = message
 		self.retry_after = retry_after
 		self.status = status
 		self.reason = reason
+		# None means transport completion is unknown. False is reserved for a
+		# failure proven to precede request.execute(), never a lost response.
+		self.sent = sent
 		self.transient = kind in {"network", "transient", "rate_limit"}
+
+
+class PreSendError(GmailError):
+	"""The mutation was not sent; no uncertain-write reconciliation is needed."""
+
+	def __init__(self, error: GmailError) -> None:
+		super().__init__(error.kind, error.safe_message, error.retry_after,
+			status=error.status, reason=error.reason, sent=False)
 
 
 class HistoryExpired(GmailError):
@@ -176,7 +187,10 @@ class GmailMailbox:
 	def _execute(self, request: Any, operation: str = "request", has_page: bool = False,
 			*, idempotent: bool = True, quota_units: int = 1) -> dict:
 		for attempt in range(3 if idempotent else 1):
-			self.quota_limiter.acquire(quota_units)
+			try:
+				self.quota_limiter.acquire(quota_units)
+			except Exception as exc:  # noqa: BLE001 - quota failures occur before the transport has sent a request
+				raise PreSendError(translate_error(exc)) from None
 			try:
 				return request.execute(num_retries=0) or {}
 			except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
@@ -298,25 +312,41 @@ class GmailMailbox:
 		# Do not filter labelId=INBOX: doing so can lose removal events.
 		return self._execute(self.service.users().history().list(**params), "history", bool(page_token), quota_units=2)
 
-	def modify(self, ids: list[str], add: list[str], remove: list[str]) -> None:
-		"""Apply label deltas only. Callers ledger/preflight/reconcile each explicit ID."""
-		ids = list(dict.fromkeys(ids))
-		if not ids:
-			return
-		catalog = self._catalog if self._catalog is not None else self.labels()
+	def validate_labels(self, add: list[str], remove: list[str], *, refresh: bool = False) -> None:
+		"""Resolve and validate the live catalog before a write attempt is created."""
+		try:
+			catalog = self.labels() if refresh or self._catalog is None else self._catalog
+		except Exception as exc:  # noqa: BLE001 - catalog retrieval is read-only and precedes the mutation
+			raise PreSendError(translate_error(exc)) from None
 		allowed = {item["id"] for item in catalog if item["type"] == "user"} | {"INBOX"}
 		if not set(add).issubset(allowed) or not set(remove).issubset(allowed) or set(add) & set(remove):
 			self._catalog = None
 			if self.on_label_error is not None:
 				self.on_label_error()
-			raise GmailError("permission", "Only INBOX and existing user-label deltas are allowed.")
+			raise PreSendError(GmailError("permission", "Only INBOX and existing user-label deltas are allowed."))
+
+	def modify(self, ids: list[str], add: list[str], remove: list[str]) -> None:
+		"""Apply label deltas only. Callers ledger/preflight/reconcile each explicit ID."""
+		ids = list(dict.fromkeys(ids))
+		if not ids:
+			return
+		self.validate_labels(add, remove)
 		for offset in range(0, len(ids), self.execution_batch_size):
 			try:
-				self._execute(self.service.users().messages().batchModify(userId="me", body={
+				try:
+					request = self.service.users().messages().batchModify(userId="me", body={
 					"ids": ids[offset:offset + self.execution_batch_size],
-					"addLabelIds": sorted(set(add)), "removeLabelIds": sorted(set(remove))}),
+					"addLabelIds": sorted(set(add)), "removeLabelIds": sorted(set(remove))})
+				except Exception as exc:  # noqa: BLE001 - constructing the request cannot have sent its body
+					raise PreSendError(translate_error(exc)) from None
+				self._execute(request,
 					"modify", idempotent=False, quota_units=50)
 			except GmailError as exc:
+				if offset and exc.sent is False:
+					# A multi-chunk caller may already have committed earlier chunks.
+					# Only the usual per-chunk caller can safely claim nothing was sent.
+					raise GmailError(exc.kind, exc.safe_message, exc.retry_after,
+						status=exc.status, reason=exc.reason) from None
 				if exc.status in {400, 404}:
 					self._catalog = None
 					if self.on_label_error is not None:

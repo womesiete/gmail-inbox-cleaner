@@ -568,3 +568,31 @@ def test_invalid_grant_remains_auth_failure_through_execute_and_batch(detail):
 	assert caught.value.kind == 'auth' and not caught.value.transient and not delays
 	service.payloads['failed'] = failure
 	assert box.get_messages(['failed'])['failed'].kind == 'auth'
+
+
+@pytest.mark.parametrize('catalog_failure', [False, True])
+def test_write_catalog_failures_are_definitely_unsent(catalog_failure):
+	from gmail_clean.gmail import PreSendError
+	service = FakeGoogle()
+	box = GmailMailbox(service)
+	box._sleep = lambda _: None
+	service.results['list'] = HttpFailure(503) if catalog_failure else {'labels': []}
+	with pytest.raises(PreSendError) as caught:
+		box.modify(['a'], ['user1'], [])
+	assert caught.value.sent is False
+	assert caught.value.kind == ('transient' if catalog_failure else 'permission')
+	assert not any(name == 'batchModify' for name, _ in service.calls)
+
+
+def test_quota_failure_before_write_is_definitely_unsent():
+	from gmail_clean.gmail import PreSendError
+	service = FakeGoogle()
+	box = GmailMailbox(service)
+	box._catalog = [{'id': 'user1', 'type': 'user'}]
+	class FailedLimiter:
+		def acquire(self, units):
+			raise GmailError('network', 'Synthetic limiter unavailable')
+	box.quota_limiter = FailedLimiter()
+	with pytest.raises(PreSendError) as caught:
+		box.modify(['a'], ['user1'], [])
+	assert caught.value.sent is False and caught.value.kind == 'network'

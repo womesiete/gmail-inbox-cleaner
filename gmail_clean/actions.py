@@ -345,6 +345,15 @@ class ActionExecutor:
 				# Persist the start of the write interval. A receipt checkpoint taken
 				# only after readback could skip a concurrent user edit before undo.
 				self._assert_intents_unchanged(ready)
+				try:
+					validate = getattr(self.s.mailbox, "validate_labels", None)
+					if callable(validate):
+						validate(list(add), list(remove), refresh=True)
+				except Exception as exc:  # noqa: BLE001 - a failed live catalog check cannot create a sending attempt
+					for action, _ in ready:
+						self.mark(action["id"], "retry" if getattr(exc, "transient", False) else "conflict", safe_error(exc))
+						self.s.error("preflight", exc, job_id=action["job_id"], message_id=action["message_id"])
+					continue
 				before_write_history_id = self._checkpoint()
 				with self.db.transaction():
 					self.s.reload_config()
@@ -384,18 +393,36 @@ class ActionExecutor:
 						return {"applied": applied, "examined": len(actions), "dry_run": self.s.config.dry_run, "stopped": True}
 					self.s.mailbox.modify([action["message_id"] for action, _ in ready], list(add), list(remove))
 				except Exception as exc:  # noqa: BLE001 - write transport failure must preserve definite or uncertain durable outcomes
+					if getattr(exc, "sent", None) is False:
+						with self.db.transaction():
+							for action, _ in ready:
+								self.db.execute("UPDATE attempts SET state='not_sent',error=?,finished_at=? WHERE action_id=? AND state='sending'", (safe_error(exc), stamp(), action["id"]))
+								self.mark(action["id"], "retry" if getattr(exc, "transient", False) or getattr(exc, "kind", "") == "interrupted" else "conflict", "Write was not sent: " + safe_error(exc))
+								self.s.error("execution", exc, job_id=action["job_id"], message_id=action["message_id"])
+						continue
 					status = getattr(exc, "status", None)
 					if status is not None and 400 <= status < 500 and status != 408:
+						# Close definite rejections before any further network reads.
+						# A failed catalog refresh must not leave an unsent/rejected
+						# attempt stuck in the sending state.
+						with self.db.transaction():
+							for action, _ in ready:
+								self.db.execute("UPDATE attempts SET state='not_applied',error=?,finished_at=? WHERE action_id=? AND state='sending'", (safe_error(exc), stamp(), action["id"]))
+								self.mark(action["id"], "retry", "Gmail rejected the write; no uncertain attempt remains")
 						# An explicit rejection has no successful response to own. Cheap
 						# bulk readback distinguishes existing effects before any replay.
 						self._prefetch([action["message_id"] for action, _ in ready])
 						if status in {400, 404} and callable(getattr(self.s, "invalidate_labels", None)):
 							self.s.invalidate_labels()
-							self.s.refresh_labels()
+							try:
+								self.s.refresh_labels()
+							except Exception as catalog_error:  # noqa: BLE001 - rejection remains definite even when catalog recovery is offline
+								for action, _ in ready:
+									self.s.error("execution", catalog_error, job_id=action["job_id"], message_id=action["message_id"])
+								continue
 						retry_ids = []
 						with self.db.transaction():
 							for action, _ in ready:
-								self.db.execute("UPDATE attempts SET state='not_applied',error=?,finished_at=? WHERE action_id=? AND state='sending'", (safe_error(exc), stamp(), action["id"]))
 								observed = self._prefetched_messages.get(action["message_id"])
 								if observed is not None and set(add) <= observed.labels and not (set(remove) & observed.labels):
 									self.mark(action["id"], "satisfied", "Effects present after rejected request; no ownership claimed")
