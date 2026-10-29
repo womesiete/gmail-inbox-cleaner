@@ -104,6 +104,7 @@ class Config:
 	ai_batch_size: int = 1
 	ai_timeout_seconds: float = 120.0
 	retrieval_batch_size: int = 25
+	metadata_cache_ttl_seconds: int = 60
 	execution_batch_size: int = 100
 	max_actions_per_run: int = 1000
 	max_retries: int = 3
@@ -148,6 +149,8 @@ class Config:
 		return canonical_hash(value)
 
 	def validate(self) -> None:
+		if type(self.metadata_cache_ttl_seconds) is not int or not 0 <= self.metadata_cache_ttl_seconds <= 300:
+			raise ValueError("metadata_cache_ttl_seconds must be 0–300; zero disables metadata reuse")
 		if self.ai_module_sha256 and not re.fullmatch(r"[0-9a-f]{64}", self.ai_module_sha256):
 			raise ValueError("AI module SHA-256 must be a lowercase 64-character fingerprint")
 		try:

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable, cast
 
 from .domain import Message, as_utc, content_hash, epoch_ms, iso_utc
-from .gmail import GmailError, HistoryExpired, PageTokenExpired
+from .gmail import GmailError, HistoryExpired, PageTokenExpired, QuotaLimiter
 
 DEMO_ACCOUNT = "demo@example.invalid"
 DEMO_LABELS = [
@@ -152,6 +152,16 @@ def generate_messages(count: int = 3000, anchor: datetime | None = None) -> Iter
 		yield message
 
 
+class DemoQuotaLimiter(QuotaLimiter):
+	"""Model real quota charges while advancing an offline clock instead of waiting."""
+	def __init__(self, units_per_minute=6000):
+		self.simulated_seconds = 0.0
+		super().__init__(units_per_minute, clock=lambda: self.simulated_seconds, sleep=self._advance)
+
+	def _advance(self, seconds):
+		self.simulated_seconds += seconds
+
+
 class DemoMailbox:
 	is_demo = True
 	account_id = DEMO_ACCOUNT
@@ -159,6 +169,7 @@ class DemoMailbox:
 	def __init__(self, state_path: str | Path | None = None, count: int = 3000,
 			anchor: datetime | None = None) -> None:
 		self.path = Path(state_path) if state_path is not None else None
+		self.quota_limiter = DemoQuotaLimiter()
 		self._lock = _path_lock(self.path)
 		self._read_depth = 0
 		self._write_depth = 0
@@ -293,22 +304,26 @@ class DemoMailbox:
 
 	@_synchronized
 	def identity(self) -> str:
+		self.quota_limiter.acquire(1)
 		self._fail("identity")
 		return DEMO_ACCOUNT
 
 	@_synchronized
 	def profile(self) -> dict:
+		self.quota_limiter.acquire(1)
 		self._fail("profile")
 		return {"emailAddress": DEMO_ACCOUNT, "historyId": str(self._history_id),
 			"messagesTotal": len(self.messages), "threadsTotal": len(self._threads)}
 
 	@_synchronized
 	def labels(self) -> list[dict]:
+		self.quota_limiter.acquire(1)
 		self._fail("labels")
 		return [dict(item) for item in self._labels]
 
 	@_synchronized
 	def list_messages(self, query: str, page_token: str | None = None, page_size: int = 500) -> dict:
+		self.quota_limiter.acquire(5)
 		self._fail("list")
 		offset = 0
 		if page_token:
@@ -338,6 +353,7 @@ class DemoMailbox:
 
 	@_synchronized
 	def get_message(self, message_id: str, body: bool = False) -> Message:
+		self.quota_limiter.acquire(60 if body else 20)
 		self._fail("get")
 		if message_id not in self.messages:
 			raise GmailError("missing", "The synthetic message no longer exists.")
@@ -363,11 +379,17 @@ class DemoMailbox:
 
 	@_synchronized
 	def thread_metadata(self, thread_id: str) -> list[Message]:
+		self.quota_limiter.acquire(40)
 		self._fail("thread")
-		return [self.get_message(item, False) for item in self._threads.get(thread_id, []) if item in self.messages]
+		members = [Message.from_dict(self.messages[mid].to_dict()) for mid in self._threads.get(thread_id, []) if mid in self.messages]
+		for message in members:
+			message.body = None
+			message.missing_content = True
+		return members
 
 	@_synchronized
 	def history(self, start: str, page_token: str | None = None) -> dict:
+		self.quota_limiter.acquire(2)
 		self._fail("history")
 		try:
 			since = int(start)
@@ -389,6 +411,7 @@ class DemoMailbox:
 	def modify(self, ids: list[str], add: list[str], remove: list[str]) -> None:
 		with self._disk_write_lock():
 			self._sync_from_disk()
+			self.quota_limiter.acquire(50 * max(1, (len(set(ids)) + 499) // 500))
 			self._fail("modify")
 			allowed = {item["id"] for item in self._labels if item["type"] == "user"} | {"INBOX"}
 			if not set(add).issubset(allowed) or not set(remove).issubset(allowed) or set(add) & set(remove):

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .ai import PROMPT_VERSION
+from .stage_cache import StageMetadataCache
 from .domain import Assessment, Config, Message, Window, content_excluded, content_hash, context_hash, epoch_ms, message_safety_flags, recommend, resolve_age_cutoff, resolve_window
 from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
@@ -32,6 +33,8 @@ class JobRunner:
 		self.db = service.store
 		self._transport_failure_jobs: set[str] = set()
 		self._auth_paused_items: set[tuple[str, str, str]] = set()
+		self._metadata_caches: dict[str, StageMetadataCache] = {}
+		self._stage_cache: StageMetadataCache | None = None
 
 	def new(self) -> str:
 		config = self.s.config
@@ -210,16 +213,20 @@ class JobRunner:
 		self.db.execute("UPDATE jobs SET state='running',updated_at=? WHERE id=?", (stamp(), job))
 		try:
 			if not self.payload(job).get("discovered"):
-				if not self.discover(job, window, config, progress, should_stop):
-					return self.summary(job)
+				with self.record_quota(job, "discovery"):
+					if not self.discover(job, window, config, progress, should_stop):
+						return self.summary(job)
 			for stage in ("metadata", "body", "classification"):
 				self.db.execute("UPDATE jobs SET stage=?,updated_at=? WHERE id=?", (stage, stamp(), job))
-				if not self.process_stage(job, stage, window, config, progress, should_stop):
-					return self.summary(job)
+				with self.record_quota(job, stage):
+					if not self.process_stage(job, stage, window, config, progress, should_stop):
+						return self.summary(job)
 			payload = self.payload(job)
 			for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation", "batch_sizes", "batch_clean"):
 				payload.pop(key, None)
 			self.save_payload(job, payload)
+			self._metadata_caches.pop(job, None)
+			self._stage_cache = None
 			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
 			self.set_checkpoint("boundary_latest", window.to_dict()["latest_exclusive"])
 			self.set_checkpoint("boundary_window", {"earliest_date": config.earliest_date, "latest_mode": config.latest_mode, "latest_days": config.latest_days, "latest_date": config.latest_date, "timezone": config.timezone})
@@ -372,6 +379,36 @@ class JobRunner:
 			token = payload[key]
 
 
+	def _metadata(self, job, ids, config):
+		# Resolve the service property for every batch so disconnect/generation
+		# fencing cannot be bypassed by a cache holding an earlier raw adapter.
+		mailbox = self.s.mailbox
+		cache = self._metadata_caches.get(job)
+		if cache is None or cache.mailbox is not mailbox:
+			clock_options = {"clock": mailbox.quota_limiter.clock} if getattr(mailbox, "is_demo", False) else {}
+			cache = StageMetadataCache(mailbox, config.metadata_cache_ttl_seconds,
+				history_id=self.checkpoint("history_id"), **clock_options)
+			self._metadata_caches[job] = cache
+		cache.ttl = config.metadata_cache_ttl_seconds
+		self._stage_cache = cache
+		result = cache.metadata(ids)
+		return result
+
+	@contextlib.contextmanager
+	def record_quota(self, job, stage):
+		limiter = getattr(self.s.mailbox, "quota_limiter", None)
+		before = getattr(limiter, "consumed", 0)
+		try:
+			yield
+		finally:
+			used = getattr(limiter, "consumed", 0) - before
+			payload = self.payload(job)
+			usage = payload.setdefault("quota_usage", {})
+			usage[stage] = usage.get(stage, 0) + used
+			if self._stage_cache is not None:
+				payload.setdefault("stage_history", {})[stage] = self._stage_cache.history_id
+			self.save_payload(job, payload)
+
 	def _prefetch_threads(self, messages) -> dict:
 		"""Fetch conversation evidence before taking SQLite's writer lock.
 
@@ -383,7 +420,7 @@ class JobRunner:
 			if isinstance(message, Exception) or message.thread_id in threads:
 				continue
 			try:
-				threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+				threads[message.thread_id] = self._stage_cache.thread(message.thread_id) if self._stage_cache is not None else self.s.mailbox.thread_metadata(message.thread_id)
 			except Exception as exc:  # noqa: BLE001 - thread transport failures are returned as per-thread evidence
 				threads[message.thread_id] = exc
 		return threads
@@ -491,7 +528,7 @@ class JobRunner:
 		# A paused body queue may predate stricter settings or a manual keep.
 		# Recheck before requesting any content, not after downloading it.
 		try:
-			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
+			live_metadata = self._metadata(job, [row["message_id"] for row in rows], config)
 		except Exception as exc:  # noqa: BLE001 - metadata transport failure is assigned to unresolved work only
 			live_metadata = {row["message_id"]: exc for row in rows}
 		allowed = []
@@ -574,7 +611,7 @@ class JobRunner:
 	def _retrieve_stage_batch(self, job: str, stage: str, rows: list[dict], window: Window, config: Config) -> None:
 		ids = [row["message_id"] for row in rows]
 		try:
-			results = self.s.mailbox.get_messages(ids, body=stage == "body")
+			results = self.s.mailbox.get_messages(ids, body=True) if stage == "body" else self._metadata(job, ids, config)
 		except Exception as exc:  # noqa: BLE001 - multipart failure produces independent per-item error results
 			results = {mid: exc for mid in ids}
 		threads = self._prefetch_threads(
@@ -723,7 +760,7 @@ class JobRunner:
 	def _prepare_classification(self, job: str, rows: list[dict], window: Window, config: Config) -> tuple[dict[tuple[str, str], list[_AssessmentWork]], dict]:
 		pending: dict[tuple[str, str], list[_AssessmentWork]] = defaultdict(list)
 		try:
-			live_metadata = self.s.mailbox.get_messages([row["message_id"] for row in rows], body=False)
+			live_metadata = self._metadata(job, [row["message_id"] for row in rows], config)
 		except Exception as exc:  # noqa: BLE001 - classification metadata transport failure remains per-item evidence
 			live_metadata = {row["message_id"]: exc for row in rows}
 		threads: dict[str, Any] = {}
@@ -753,7 +790,7 @@ class JobRunner:
 			return None
 		try:
 			if message.thread_id not in threads:
-				threads[message.thread_id] = self.s.mailbox.thread_metadata(message.thread_id)
+				threads[message.thread_id] = self._stage_cache.thread(message.thread_id) if self._stage_cache is not None else self.s.mailbox.thread_metadata(message.thread_id)
 			members = threads[message.thread_id]
 			message.context_version = context_hash(members, config.sent_context_enabled)
 			newer_excluded = self._newer_excluded(message, members, window)
@@ -1057,6 +1094,8 @@ class JobRunner:
 		payload = self.payload(job)
 		if payload.get("ai_usage"):
 			result["ai_usage"] = payload["ai_usage"]
+		if payload.get("quota_usage"):
+			result["quota_usage"] = {**payload["quota_usage"], "total": sum(payload["quota_usage"].values())}
 		pause = payload.get("pause")
 		if pause:
 			result["pause"] = pause
