@@ -49,14 +49,14 @@ def test_headless_resumes_due_transient_retries_with_frozen_job_scope(tmp_path):
 		service.close()
 
 
-def test_retry_exhaustion_and_configuration_pause_do_not_loop_forever(tmp_path):
+def test_transport_recovery_and_configuration_pause_do_not_loop_forever(tmp_path):
 	clock = Clock()
 	service = AppService(demo=True, count=4, data_dir=tmp_path / "transient", clock=clock, config=Config(max_retries=1))
 	try:
 		for _ in range(2):
 			service.mailbox.inject_error("get_messages", GmailError("network", "Synthetic offline retry"))
 		result = run_until_settled(service, service.new_job(), sleep=clock.sleep)
-		assert result["state"] == "completed" and result["failed"] > 0
+		assert result["state"] == "completed" and result["failed"] == 0
 		assert clock.waits
 	finally:
 		service.close()
@@ -228,7 +228,7 @@ def test_headless_recovers_system_discovery_pause_with_bounded_backoff(tmp_path)
 		service.close()
 
 
-def test_headless_system_discovery_retries_stop_at_job_budget(tmp_path):
+def test_headless_discovery_outage_recovers_beyond_the_item_retry_budget(tmp_path):
 	clock = Clock()
 	service = AppService(demo=True, count=4, data_dir=tmp_path, clock=clock, config=Config(max_retries=1))
 	try:
@@ -236,9 +236,8 @@ def test_headless_system_discovery_retries_stop_at_job_budget(tmp_path):
 			service.mailbox.inject_error("list", GmailError("network", "Synthetic persistent interruption"))
 		job = service.new_job()
 		result = run_until_settled(service, job, sleep=clock.sleep)
-		pause = service.jobs.payload(job)["pause"]
-		assert result["state"] == "paused" and pause["origin"] == "system"
-		assert pause["due"] is None and pause["attempts"] == 2
+		assert result["state"] == "completed" and result["failed"] == 0
+		assert "pause" not in service.jobs.payload(job)
 		assert clock.waits and sum(clock.waits) < 300
 	finally:
 		service.close()

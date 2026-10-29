@@ -21,9 +21,14 @@ _AssessmentWork = tuple[dict, Message, list[dict], str]
 
 
 class JobRunner:
+	TRANSPORT_FAILURE_THRESHOLD = 3
+	POISON_RESUME_LIMIT = 3
+
 	def __init__(self, service: AppService):
 		self.s = service
 		self.db = service.store
+		self._transport_failure_jobs: set[str] = set()
+		self._auth_paused_items: set[tuple[str, str, str]] = set()
 
 	def new(self) -> str:
 		config = self.s.config
@@ -189,7 +194,11 @@ class JobRunner:
 		if row["state"] == "waiting" and backoff.get("due") and datetime.fromisoformat(backoff["due"]) > self.s.clock():
 			return self.summary(job)
 		payload = json.loads(row["payload_json"])
+		if payload.get("transport_failures"):
+			self._transport_failure_jobs.add(job)
+		self._auth_paused_items.update((job, item["message_id"], item["stage"]) for item in self.db.query("SELECT message_id,stage FROM work_items WHERE job_id=? AND payload_json LIKE ?", (job, '%"auth_pauses"%')))
 		payload.pop("pause", None)
+		payload["resume_generation"] = int(payload.get("resume_generation", 0)) + 1
 		self.save_payload(job, payload)
 		window = Window.from_dict(json.loads(row["window_json"]))
 		config = Config.from_dict(json.loads(row["config_json"]))
@@ -205,7 +214,7 @@ class JobRunner:
 				if not self.process_stage(job, stage, window, config, progress, should_stop):
 					return self.summary(job)
 			payload = self.payload(job)
-			for key in ("pause", "backoff", "system_retries"):
+			for key in ("pause", "backoff", "system_retries", "transport_failures", "resume_generation"):
 				payload.pop(key, None)
 			self.save_payload(job, payload)
 			self.db.execute("UPDATE jobs SET stage='review',state='completed',updated_at=? WHERE id=?", (stamp(), job))
@@ -794,7 +803,70 @@ class JobRunner:
 				self.s.actions.plan(job, message, "label", list(label_ids), reason, approval, window, bypass)
 
 	def done(self, job: str, mid: str, stage: str) -> None:
+		self._transport_succeeded(job)
+		if (job, mid, stage) in self._auth_paused_items:
+			row = self.db.one("SELECT id,payload_json FROM work_items WHERE job_id=? AND message_id=? AND stage=?", (job, mid, stage))
+			self._auth_paused_items.discard((job, mid, stage))
+		else:
+			row = None
+		if row:
+			item = json.loads(row["payload_json"])
+			if item.pop("auth_pauses", None) is not None:
+				self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (encode(item), row["id"]))
 		self.db.execute("UPDATE work_items SET state='completed',error='',next_attempt_utc=NULL WHERE job_id=? AND message_id=? AND stage=?", (job, mid, stage))
+
+	def _transport_succeeded(self, job: str) -> None:
+		"""One acknowledged item breaks an outage streak without losing other retries."""
+		if job not in self._transport_failure_jobs:
+			return
+		self._transport_failure_jobs.discard(job)
+		payload = self.payload(job)
+		changed = payload.pop("transport_failures", None) is not None
+		if payload.get("backoff", {}).get("kind") in {"network", "transient"}:
+			payload.pop("backoff", None)
+			changed = True
+		if changed:
+			self.save_payload(job, payload)
+
+	def _transport_wait(self, job: str, kind: str, exc: Exception, config: Config) -> str:
+		"""Outages use durable job waits, never an individual item's retry budget.
+
+		A multipart failure shares one backoff round. Brief failures allow other
+		already fetched items to finish; a sustained streak holds the next batch.
+		The wait remains automatically resumable for outages of any duration.
+		"""
+		self._transport_failure_jobs.add(job)
+		payload = self.payload(job)
+		backoff = payload.get("backoff", {})
+		if backoff.get("kind") not in {"network", "transient"} or not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
+			streak = int(payload.get("transport_failures", 0)) + 1
+			payload["transport_failures"] = streak
+			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(streak, 8) + random.random()))  # noqa: S311 - retry jitter affects scheduling only, never security decisions
+			backoff = {"kind": kind, "due": stamp(self.s.clock() + timedelta(seconds=delay)), "attempts": streak}
+			payload["backoff"] = backoff
+			self.save_payload(job, payload)
+		if int(payload.get("transport_failures", 0)) >= self.TRANSPORT_FAILURE_THRESHOLD:
+			self.db.execute("UPDATE jobs SET state='waiting',updated_at=? WHERE id=?", (stamp(self.s.clock()), job))
+		return str(backoff["due"])
+
+	def _poison_item(self, job: str, row: dict, kind: str) -> bool:
+		"""Quarantine an item only after repeated explicit resumes fail on it again."""
+		self._auth_paused_items.add((job, row["message_id"], row["stage"]))
+		item = json.loads(self.db.one("SELECT payload_json FROM work_items WHERE id=?", (row["id"],))["payload_json"])
+		generation = int(self.payload(job).get("resume_generation", 0))
+		previous = item.get("auth_pauses", {})
+		if previous.get("generation") == generation:
+			return int(previous.get("resumes", 0)) >= self.POISON_RESUME_LIMIT
+		resumes = int(previous.get("resumes", 0)) + 1 if previous.get("generation") == generation - 1 and previous.get("kind") == kind else 0
+		item["auth_pauses"] = {"kind": kind, "generation": generation, "resumes": resumes}
+		self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (encode(item), row["id"]))
+		return resumes >= self.POISON_RESUME_LIMIT
+
+	def _pause_interrupted(self, job: str, reason: str) -> None:
+		payload = self.payload(job)
+		payload["pause"] = {"origin": "user", "kind": "interrupted", "reason": reason, "due": None}
+		self.save_payload(job, payload)
+		self.db.execute("UPDATE jobs SET state='paused',updated_at=? WHERE id=?", (stamp(self.s.clock()), job))
 
 	def retry_deadline(self, job: str):
 		"""Return an automatic retry deadline; user pauses never have one."""
@@ -821,6 +893,13 @@ class JobRunner:
 		if getattr(exc, "configuration", False):
 			kind = "configuration"
 		reason = safe_error(exc)
+		if kind == "interrupted":
+			self._pause_interrupted(job, reason)
+			return
+		if kind in {"network", "transient"}:
+			self._transport_wait(job, kind, exc, config)
+			self.db.execute("UPDATE jobs SET state='waiting' WHERE id=?", (job,))
+			return
 		if kind in {"auth", "permission", "account", "configuration", "data"}:
 			self.pause_system(job, kind, reason)
 			return
@@ -859,12 +938,20 @@ class JobRunner:
 		attempt = current["attempts"]
 		due = None
 		state = "pending"
-		if kind in {"auth", "permission", "account", "configuration", "quota"}:
-			if kind == "quota":
+		if kind == "interrupted":
+			self._pause_interrupted(job, reason)
+		elif kind in {"network", "transient"}:
+			due = self._transport_wait(job, kind, exc, config)
+			state = "retry"
+		elif kind in {"auth", "permission", "account", "configuration", "quota"}:
+			if kind in {"auth", "permission"} and self._poison_item(job, row, kind):
+				state = "failed"
+			elif kind == "quota":
 				reset = float(getattr(exc, "retry_after", 0) or 0)
 				now = self.s.clock()
 				due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
-			self.pause_system(job, kind, reason, due=due)
+			if state != "failed":
+				self.pause_system(job, kind, reason, due=due)
 		elif kind == "rate_limit":
 			payload = self.payload(job)
 			backoff = payload.get("backoff", {})

@@ -365,7 +365,7 @@ def test_history_replay_never_counts_as_feedback(service):
 	assert len(service.ai.calls) == 1
 
 
-def test_retry_wait_and_retry_exhaustion_preserve_per_item_progress(service):
+def test_transport_wait_preserves_items_until_the_network_recovers(service):
 	service.config.max_retries = 1
 	service.mailbox.messages = {"old": mail(), "other": mail("other")}
 	service.mailbox.retrieval_errors["old"] = GmailError("network", "Synthetic offline condition")
@@ -375,9 +375,12 @@ def test_retry_wait_and_retry_exhaustion_preserve_per_item_progress(service):
 	assert service.store.one("SELECT state FROM work_items WHERE message_id='other' AND stage='metadata'")["state"] == "completed"
 	service.now += timedelta(minutes=10)
 	second = runner.run(job)
-	assert second["state"] == "completed"
-	assert second["failed"] == 1
-	assert [item["message_id"] for item in service.actions.planned] == ["other"]
+	assert second["state"] == "waiting" and second["failed"] == 0
+	service.mailbox.retrieval_errors.clear()
+	service.now += timedelta(minutes=10)
+	third = runner.run(job)
+	assert third["state"] == "completed" and third["failed"] == 0
+	assert {item["message_id"] for item in service.actions.planned} == {"old", "other"}
 	assert len(service.errors) == 2
 
 
@@ -686,7 +689,8 @@ def test_fail_policy_preserves_decisions_and_separates_job_blocks(service, kind)
 	elif kind == "data":
 		assert work["state"] == "failed" and work["attempts"] == 1
 	else:
-		assert work["state"] == "retry" and work["attempts"] == 1
+		assert work["state"] == "retry" and work["attempts"] == 0
+		assert datetime.fromisoformat(work["next_attempt_utc"]) >= service.now + timedelta(seconds=75)
 
 
 @pytest.mark.parametrize('stage,commit_cap', [('metadata', 3), ('body', 4)])
