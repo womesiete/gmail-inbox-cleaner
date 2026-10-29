@@ -46,7 +46,7 @@ The application runs when you launch it; it does not install a background servic
 - [Architecture, persistence, recovery, and security](docs/architecture.md)
 - [Acceptance coverage and validation commands](docs/acceptance.md)
 - [Recorded test and scale-check results](docs/validation.md)
-- [Reliability and performance fixes: both review rounds](docs/reliability-fixes.md)
+- [Reliability and performance fixes: all review rounds](docs/reliability-fixes.md)
 - [Integration boundary and phased lint/type review](docs/integration-boundaries.md)
 - [Changelog](CHANGELOG.md)
 - [Original implementation requirements](docs/history/implementation-plan.txt)
@@ -64,8 +64,8 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 .\.venv\Scripts\python.exe -m build
 ```
 
-Linux/macOS use `.venv/bin/python` and `QT_QPA_PLATFORM=offscreen python -m pytest`. Tests use synthetic messages, temporary databases, and fake transports; they require no Gmail credentials or provider access. CI defines Windows and Linux jobs; a workflow definition is not a claim that hosted CI or Windows packaging has already passed.
+Linux/macOS use `.venv/bin/python` and `QT_QPA_PLATFORM=offscreen .venv/bin/python scripts/ci_tests.py` for the combined coverage gate. Tests use synthetic messages, temporary databases, and fake transports; they require no Gmail credentials or provider access. CI defines Windows and Linux jobs; a workflow definition is not a claim that hosted CI or Windows packaging has already passed.
 
 Google OAuth approval and the user's private AI module are deployment dependencies. The live Gmail adapter and isolated module adapter are separate from the synthetic demo; account access and real provider behavior require testing on the configured PC.
 
-Final offline checks and before/after timings: [validation and measurements](docs/performance-2026-10-28.md).
+Current [validation record](docs/validation.md) and [quota measurements](docs/quota-validation.md) cover the latest follow-up. Earlier [offline timing measurements](docs/performance-2026-10-28.md) remain historical evidence.

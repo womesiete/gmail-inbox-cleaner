@@ -85,7 +85,7 @@ remain separate from local synthetic evidence.
 | 8 | Classify provider errors through an optional hook with retry metadata. | `tests/test_ai_hook.py` |
 | 9 | Validate cached stage metadata through Gmail history; retain live write preflights. | `tests/test_stage_cache.py`, [quota measurements](quota-validation.md) |
 | 10 | Configure the quota budget and show consumption and ETA. | `tests/test_quota_preferences.py` |
-| 11 | Keep one runner and one writer; permit reviewed writes during provider calls. | Runner/writer concurrency and fencing tests. |
+| 11 | Keep one runner and one writer; permit reviewed writes during provider calls. | `tests/test_lease_concurrency.py` |
 | 12 | Use randomized boundaries and structured prompt flags. | `tests/test_ai_prompt.py` |
 | 13 | Require review for hidden/instruction-like content; isolate prompts and old automatic plans. | `tests/test_input_safety.py`, `tests/test_actions.py` |
 | 14 | Select substantive MIME alternatives and recover malformed blocked tags conservatively. | `tests/test_mime.py` |
