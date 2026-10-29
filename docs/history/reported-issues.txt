@@ -1,3 +1,11 @@
+HISTORICAL ISSUE REPORT — RESOLVED
+
+The reported issues below were addressed by the reliability follow-ups. This
+original report is retained for provenance; its descriptions are not current
+application behavior. See docs/reliability-fixes.md for the implementation and
+regression-test checklist, and docs/quota-validation.md for current synthetic
+quota measurements.
+
 ### Stability & Reliability Issues
 
 1. **Jobs with transient retry items become permanently stranded in the `'waiting'` state (`gmail_clean/jobs.py`, `gmail_clean/gui.py`)**: When all remaining items in a stage hit a transient error (such as a network blip or rate limit) and transition to `state='retry'` with a future `next_attempt_utc`, `JobRunner.process_stage()` sets the job state to `'waiting'` and returns `False`, terminating `run_job()`. Neither the headless CLI (`gmail_clean/app.py`) nor `MainWindow` (`gmail_clean/gui.py`) schedules a timer or sleeps until `next_attempt_utc` to resume the job. Worse, `MainWindow._maintenance_tick()` queries `WHERE state IN ('pending','running','paused','waiting','retry')` and refuses to start new maintenance runs while a `'waiting'` job exists, leaving the pipeline stuck indefinitely until manual user intervention.

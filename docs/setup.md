@@ -8,7 +8,7 @@ Use Windows 10/11 and Python 3.11. A regular project virtual environment is supp
 cd C:\Projects\gmail-inbox-cleaner
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
+.\.venv\Scripts\python.exe -m pip install -c constraints.txt -e '.[dev]'
 .\.venv\Scripts\python.exe -m gmail_clean --demo
 ```
 
@@ -43,11 +43,11 @@ For External apps in **Testing**, Gmail consent and offline refresh tokens expir
 
 ### Disconnect and reconnect
 
-Disconnect removes the locally stored authorization and prevents further calls from that local connection. For server-side revocation, remove the application's access in your Google Account's third-party connections. Reconnect through browser consent after expired/revoked credentials. A different Gmail identity cannot reuse an existing account-bound operational database; select a separate data directory if intentionally changing accounts.
+**Disconnect** removes this installation's protected authorization and invalidates its in-memory connection. **Disconnect and revoke** also asks Google to revoke the application's consent after confirmation. If revocation fails, the application reports it; retry or remove access in your Google Account's third-party connections. Local databases and backups remain. Reconnect through browser consent after expired or revoked credentials; account-bound databases and connection generations keep workers attached to the intended account.
 
 ## Token and local-data protection
 
-Refresh credentials are kept out of QSettings, SQLite, source control, and normal logs. On Windows, compact credential JSON is stored through `keyring` in Windows Credential Manager, with DPAPI per-user encryption as a fallback. No plaintext-file fallback is provided. The OAuth client JSON and private module remain outside source control.
+Refresh credentials are kept out of QSettings, SQLite, source control, and normal logs. On Windows, compact credential JSON is stored through `keyring` in Windows Credential Manager, with DPAPI per-user encryption as a fallback. Linux SecretService, libsecret, and KWallet and the macOS keychain are also supported; secure chainer members are resolved by priority. Personal Settings displays the resolved backend. The Windows Credential Manager payload bound applies only on Windows. No plaintext-file fallback is provided. The OAuth client JSON and private module remain outside source control.
 
 Message caches, SQLite databases, exported rules, QSettings, and backups are **not inherently encrypted**. They rely on the Windows user's directory permissions and device protection. Use a private Windows account, appropriate folder ACLs, and disk encryption if needed. Check permissions when choosing `--data-dir` or a backup destination. A shared or synchronized folder is a deliberate exposure choice. Retention settings can remove cached bodies; removing cache content does not remove Gmail messages or audit receipts.
 
@@ -94,3 +94,29 @@ powershell -ExecutionPolicy Bypass -File scripts\package_windows.ps1 -HiddenImpo
 ```
 
 This creates `dist\GmailInboxCleaner\GmailInboxCleaner.exe` with PyInstaller's windowed, one-directory mode. Keep the directory together. Credentials, mailbox caches, and private `.py` files are not bundled. Arbitrary external-module dependencies may need extra PyInstaller hooks or hidden imports. The source virtual-environment route remains the supported development setup; smoke-test the packaged application and spawned AI worker on the target Windows PC.
+
+## Job recovery, quota, and input safety
+
+Transport outages retain durable waiting deadlines without spending per-item
+attempts. Backoff is jittered and capped around five minutes; the headless wait
+budget remains five minutes per invocation, so a longer outage may require a
+later resume. A real invalid grant still requires reconnection. Repeated resumes
+blocked by the same auth/permission item quarantine that item so others can run.
+Clean batches recover throttled batch sizes. Stopping also interrupts quota waits.
+
+Configure `quota_units_per_minute` in Settings or use
+`--quota-units-per-minute 15000` for one invocation; the default remains 6,000.
+The shared rolling counter retains prior spending when the budget changes.
+Progress includes consumed units and an approximate ETA. The job-scoped metadata
+cache uses complete Gmail history coverage before reuse; all live write and undo
+preflights remain in place. See [quota validation](quota-validation.md) for measured
+synthetic stage costs, cache validity, and the limits of the ETA.
+
+On the first startup after the parser upgrade, legacy normalized body/example caches and automatic pending assessments are invalidated so the new parser can inspect fresh content. Manual choices and applied/undo receipts are retained. Messages containing hidden text or instruction-like content force review.
+Flagged content is excluded from shared prompts and examples, with missing
+conversation evidence carried into affected assessments. AI batching still
+defaults to one; increasing it displays a Settings warning. Preview displays
+literal plain text and blocks remote resources. Random request-specific prompt
+boundaries and structured completeness flags avoid re-parsing email-controlled
+strings. Unknown provider errors do not retry automatically. Unusable provider
+retry-delay metadata pauses for inspection rather than scheduling an earlier retry.

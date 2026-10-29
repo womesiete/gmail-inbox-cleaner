@@ -12,13 +12,13 @@ flowchart TD
     Service --> AI["Spawned AI process / serial IPC"]
 ```
 
-`domain.py` contains configuration, messages, assessments, frozen windows, canonical hashes, calendar arithmetic, and deterministic recommendations. `gmail.py`, `auth.py`, and `mime.py` implement real Gmail integration and body parsing. `demo.py` supplies a synthetic mailbox; `demo_ai.py` implements the exact external-module surface without network calls. `ai.py` owns prompts, strict response validation, module isolation, and structured error transport. `storage.py` owns schema migrations and thread-affine SQLite access; `learning.py` manages feedback, examples, and rules. `jobs.py` coordinates durable discovery/retrieval/classification. Application/action services compose those parts; the GUI and CLI call the same core behavior.
+`domain.py` contains configuration, messages, assessments, frozen windows, canonical hashes, calendar arithmetic, and deterministic recommendations. `gmail.py`, `auth.py`, and `mime.py` implement real Gmail integration and body parsing. `demo.py` supplies a synthetic mailbox; `demo_ai.py` implements the exact external-module surface without network calls. `ai.py` owns prompts, strict response validation, module isolation, and structured error transport. `storage.py` owns schema migrations and thread-affine SQLite access; `learning.py` manages feedback, examples, and rules. `jobs.py` coordinates durable discovery/retrieval/classification. `stage_cache.py` covers read-stage snapshot reuse with complete Gmail history intervals; it never supplies an execution preflight. Application/action services compose those parts; the GUI and CLI call the same core behavior.
 
 `gui.py` preserves the desktop import surface. `gui_window.py` owns the window workflow, `gui_preferences.py` owns preferences/settings and instance locking, `gui_preview.py` owns safe previews, `gui_workers.py` owns task signals and worker cleanup, and `gui_dialogs.py` owns label/rule dialogs. The extraction preserves the existing class/function behavior and comments; characterization tests cover the public facade and durable stop behavior.
 
-Live Gmail clients and database connections belong to their worker. GUI signals carry results back to the main Qt thread. The application reuses isolated AI clients between tasks; calls remain serialized, and a worker closes only its own SQLite connection. The AI child process has no SQLite connection: it loads one module, processes serializable requests sequentially, and returns text/metadata or a typed error record over IPC. Local termination is recorded as interrupted work, not proof that a remote provider canceled billing. The offline DemoMailbox has a synchronized API and can be shared across tasks without repeatedly parsing its state file.
+Live Gmail HTTP clients and database connections belong to their worker. A resource owner shares one lock-protected credential session: workers build separate transports, synchronize refresh, and persist only a rotated refresh token. Disconnect, reconnect, and observed connection-generation changes fence obsolete sessions, including refreshes still in flight. GUI signals carry results back to the main Qt thread. The application reuses isolated AI clients between tasks; calls remain serialized, and a worker closes only its own SQLite connection. The AI child process has no SQLite connection: it loads one module, processes serializable requests sequentially, and returns text/metadata or a typed error record over IPC. Local termination is recorded as interrupted work, not proof that a remote provider canceled billing. The offline DemoMailbox has a synchronized API and can be shared across tasks without repeatedly parsing its state file.
 
-Large tables use SQL filtering/sorting and bounded LRU page caches. They do not create widgets for every record or sort 50,000 cached bodies through an in-memory proxy. Message previews block external resource loading and active content. An explicit click is required to open a link.
+Large tables use SQL filtering/sorting and bounded LRU page caches. They do not create widgets for every record or sort 50,000 cached bodies through an in-memory proxy. Message previews render literal plain text and block all resource loading and active content. Open in Gmail remains an explicit navigation action.
 
 ## Runtime locations and account isolation
 
@@ -109,7 +109,7 @@ stateDiagram-v2
 
 Discovery, metadata/body retrieval, classification, review/plan, execution, and undo retain stage-specific records. In-flight work is recovered from durable state after a crash. Pausing or stopping retains checkpoints; it does not roll back completed network work. Authentication and configuration failures pause affected work; known rate/transient conditions use bounded jittered backoff; permanent/unknown failures remain inspectable.
 
-The stage runner still returns a durable `waiting` state when retry items are not due. The desktop refresh timer resumes due waiting jobs when idle; the headless runner waits in interruptible slices of at most 30 seconds and resumes them. Stored pause origins distinguish user controls from system failures. Due system retries resume automatically; authentication/configuration blocks and user-paused/stopped jobs require correction or explicit resume. Headless waiting is bounded to five minutes per invocation, retaining later deadlines. Rate limits share a job backoff and adaptive batch size without consuming item attempts; per-job/daily AI reservations are persisted before provider calls. The GUI sends pause/stop signals to the owning worker instead of contending for SQLite writes on the GUI thread. Rule previews and selected-text downloads use a separate pool from long cleanup jobs.
+The stage runner still returns a durable `waiting` state when retry items are not due. The desktop refresh timer resumes due waiting jobs when idle; the headless runner waits in interruptible slices of at most 30 seconds and resumes them. Stored pause origins distinguish user controls from system failures. Due system retries resume automatically; authentication/configuration blocks and user-paused/stopped jobs require correction or explicit resume. Headless waiting is bounded to five minutes per invocation, retaining later deadlines. Transport failures use durable jittered backoff without consuming item attempts. Repeating auth/permission items are quarantined after three resumes; malformed retry metadata requires manual inspection. Rate limits share job backoff and adaptive batch size, which recovers after three clean batches; per-job/daily AI reservations are persisted before provider calls. The GUI sends pause/stop signals to the owning worker instead of contending for SQLite writes on the GUI thread. Rule previews, selected-text downloads, and reviewed writes use a separate pool from long cleanup jobs; lease repair has its own pool.
 
 Closing stops new work, requests cooperative cancellation, and aborts isolated AI processes promptly. After a three-second window-close deadline, pools still blocked in external network calls are detached without terminating Qt threads or closing their worker-owned stores from another thread. A standalone launcher then ends its own process after local cleanup and writes `shutdown-notice.log`; WAL transactions and pre-write action attempts support recovery at the next launch. A remote request may still complete or be billed. An embedded `MainWindow` closes its window while the host retains responsibility for remaining workers.
 
@@ -154,3 +154,25 @@ Checked 2026-10-28:
 ## Durable-boundary crash characterization
 
 Offline subprocess regressions terminate with `os._exit` before the attempt insert, immediately after the demo transport commits, and immediately before the receipt is recorded. Reopening SQLite rolls back an unfinished intent transaction; a durable `executing` intent instead requires readback reconciliation. A recovered successful remote effect is recorded without another modify request and keeps ownership marked ambiguous after the lost response. The tests assert that all three boundaries produce exactly one durable synthetic mailbox transition after recovery.
+
+## Read-stage quota and content evidence
+
+`metadata_cache_ttl_seconds` defaults to 60 (0–300, zero disables reuse). Every
+reuse checks all Gmail history pages; complete unchanged coverage renews the
+snapshot even across a long job. Changed IDs and threads are evicted, expired
+history/page cursors force fresh reads, and failed history calls never permit
+stale reuse. Connection-generation checks still run for every metadata batch.
+The cache is job-scoped and discarded at completion. Read-stage accounting and
+ETA details are in [quota validation](quota-validation.md).
+
+A parser-version checkpoint invalidates legacy normalized message/example bodies, predictions, and pending automatic plans once during upgrade, preserving manual choices and execution/undo receipts. Maintenance refetches required bodies through the normal privacy gates. Parsed messages persist hidden/instruction-like `content_flags`. Domain policy
+forces review for automatic decisions, while explicit current-item manual choices
+retain precedence. Flagged context is omitted and related assessments become
+incomplete. Prompt construction returns structured payload/completeness data and
+uses random request-specific delimiters; email-controlled text is never re-parsed
+as the application envelope. AI exception hooks transport validated categories
+and retry metadata over IPC, preserving unknown errors as manual review failures.
+
+Coverage includes multiprocessing workers through parallel data files and a final
+combine step after pytest exits. `scripts/ci_tests.py` enforces the combined 85%
+gate; generated validation records read the configured threshold.

@@ -1,0 +1,73 @@
+HISTORICAL APPROVED PLAN — IMPLEMENTED
+
+Current behavior and regression evidence: docs/reliability-fixes.md.
+
+Ground rules for the implementer
+Make one item per commit, each with tests built on the existing fakes. No live Gmail is needed. 
+Before finishing each item, run ruff check, mypy and scripts/ci_tests.py. The baseline is 451 passing tests and about 83% coverage. 
+Don't change defaults except where an item says so. 
+A. Stability and correctness
+1. The keyring allowlist rejects common Linux setups (auth.py, TokenStore._keyring; reproduced).
+With two viable secure backends (for example SecretService plus libsecret), keyring.get_keyring() returns ChainerBackend. Its module name matches nothing on the allowlist, so every credential save and load fails. 
+Change: resolve the real backends behind a chainer, pick the highest-priority allowed one, and add libsecret to the allowlist. Show the resolved backend name in Settings and in the error. 
+Also apply the 2,560-byte Credential Manager limit on Windows only. 
+Also wrap an OSError from _select_backend (after a successful set_password) in AuthenticationError. 
+Tests: a fake chainer with allowed and disallowed members, a large payload on non-Windows, and a marker-write failure. 
+2. A network blip during token refresh is treated as an auth failure (gmail.py, translate_error; reproduced).
+TransportError subclasses GoogleAuthError, so it maps to a non-transient auth error and pauses the whole job until the user steps in. Plain socket errors correctly map to network. 
+Change: check TransportError (and requests, httplib2, ssl and timeout errors) first and map them to network. Keep invalid_grant as auth. Treat other RefreshErrors as transient with bounded retries. 
+Tests: each exception class through _execute and the batch-callback path. 
+3. Failures before anything is sent are recorded as uncertain writes (actions.py, _apply; gmail.py, modify; reproduced).
+modify() raises GmailError("permission") with status=None for local label validation, and may call labels() first. _apply only treats 4xx statuses as definite rejections, so this lands in the "uncertain" branch and leaves attempts stuck in sending. 
+Change: add an explicit "not sent" marker (a PreSendError subclass or a sent=False flag) for local validation, catalog fetch and quota-limiter failures. _apply should close the attempt as not sent and mark the action retry or conflict. 
+Also validate the label catalog before the transaction that creates attempts. 
+Tests: a label deleted between refresh and write, a catalog fetch failure, and no leftover sending or uncertain rows. 
+4. A short outage permanently fails in-flight items (jobs.py, fail; defaults max_retries=3, retry_base_seconds=2).
+Per-item delays are 4, 8 and 16 s, so about 30 s offline exhausts retries. The job ends "completed" with failures (headless exit code 2) until a later maintenance run re-queues them. 
+Change: handle network and transient errors like the existing rate-limit path. After N consecutive transport failures, pause the job with jittered backoff capped around 5 minutes, without consuming item attempts. Resume through the existing waiting path and reset on the first success. 
+Add poison-item protection: if the same item causes auth or permission pauses on K consecutive resumes, mark that item failed so the job can progress. 
+Tests: a simulated 10-minute outage ends with zero failed items, and one bad item doesn't block the job. 
+5. Adaptive batch size only shrinks (jobs.py, fail, batch_sizes). One rate-limit burst can leave retrieval at batch size 1 for the rest of the job. Change: after K clean batches, grow back toward the configured size, persist it in the job payload, and clear it at job end. Add a shrink-then-recover test.
+6. Stop and close can stall up to 60 s in the quota limiter (gmail.py, QuotaLimiter.acquire uses time.sleep). Change: take a cancel event or callable (from AppService._cancel_event and the abort event), wait with Event.wait, and raise a typed interruption that the job treats as a pause. Test with the fake clock.
+7. Every worker re-reads credentials and refreshes the access token (service.py, mailbox property; auth.py, restore).
+Each short GUI task does a keyring read, a token refresh, a discovery build and getProfile. Each is a failure point. 
+Change: keep one lock-protected credentials object per resource owner and refresh it once. Build a separate service per thread, since httplib2 isn't thread-safe. Persist only if the refresh token changes, and invalidate on disconnect or a new connection generation. 
+Test: N workers cause one refresh. 
+8. AI error handling is tied to one module's exception names (ai.py, _EXCEPTION_NAMES, AIError).
+Only classes exported under five exact names are classified. Anything else becomes UnknownProviderError, which fail() never retries, and AIError has no retry_after, so a provider's Retry-After is lost. 
+Change: add an optional hook, classify_exception(exc) -> {category, retry_after}. Carry retry_after through the IPC into AIError and use it in fail(). Unknown errors still don't auto-retry by default. Update the contract in docs/setup.md. 
+Tests: a module with the hook, and one that raises a plain RuntimeError. 
+B. Throughput and quota
+9. Quota cost is roughly 240 units per fully processed message (jobs.py; an estimate from the code and Google's published costs).
+The metadata stage, body preflight and classification preflight each re-fetch message metadata (20 units) and thread metadata (40 units), and the body fetch costs 60. That is about 25 messages per minute under the 6,000-unit budget, so a 50,000-message backlog takes about a day. 
+First, measure it: record units per message per stage from QuotaLimiter.consumed in the demo, and put the numbers in the validation docs. 
+Then: 
+(a) add a job-scoped metadata and thread cache with a short, configurable TTL. 
+(b) check freshness with history.list (2 units) from the stage's recorded history ID, and re-fetch only the IDs and threads that changed. 
+(c) leave the full live preflight right before any write unchanged. 
+Tests: a change between stages is still detected, and unchanged messages cost fewer units. 
+10. The quota budget isn't configurable and progress shows no ETA (gmail.py; service.py, _quota_limiter). Projects that used the API before May 2026 keep larger, older quotas, but the code always assumes 6,000 units per minute. Change: add a validated setting and CLI flag for units per minute (default 6,000), show consumed units and an ETA in progress, and keep honoring Retry-After.
+11. (Optional, do last) The execution lease is held for the whole job (service.py, run_job). Apply and undo are refused for hours while classification runs. Change: either auto-pause at a safe batch boundary so apply or undo can run and then resume, or split the lease into runner and writer. Either way, keep one writer per mailbox and add concurrency tests.
+C. Input handling and AI safety
+12. Prompt delimiters are static, and truncation flags are recovered by re-parsing the prompt (ai.py, build_prompt and assess).
+Email text can contain UNTRUSTED_JSON_DATA_END, and assess() splits the built prompt string to rediscover flags. 
+Change: use per-request random delimiters and neutralize look-alikes in the data. Have build_prompt return the structured payload and flags so assess doesn't re-parse. 
+Test with adversarial bodies. 
+13. Hidden text and cross-message influence (mime.py, _TextParser; AI batching).
+Text hidden with display:none, visibility:hidden, hidden, aria-hidden, zero font size, <template> or title reaches the model. 
+With ai_batch_size > 1, a hostile message can try to steer the assessments of other messages in the same prompt. Archive decisions depend only on the model's fields (domain.recommend). 
+Change: 
+Drop or flag hidden content, with a flag that forces review like missing_context does. 
+Add a cheap "instruction-like content" flag that also forces review. 
+Keep the default batch size at 1 and warn in Settings when it is raised. Exclude flagged messages from shared prompts. 
+Default behaviour stays the same. Add adversarial tests. 
+14. Stub text parts and unclosed tags (mime.py, parse_body). multipart/alternative returns the first non-empty text/plain, so a "view in browser" stub beats the real HTML. An unclosed <head>, <object> or <noscript> swallows the rest of the message; it is flagged truncated but the text is lost. Change: prefer the HTML when the plain part is a short stub relative to it, and recover from unclosed blocked tags. Add tests.
+15. Dead HTML sanitizer and an unused dependency (gui_preview.py, sanitize_preview_html; mime.py, sanitize_html; gui.py imports; beautifulsoup4 in pyproject.toml). The preview always uses plain text, and only tests call the sanitizers. Decide and do one of two things: remove the dead code and the dependency (updating the facade and tests), or expose a sanitized HTML preview as an explicit option with resource loading still blocked, and test it.
+D. Packaging, CI and tests
+16. Coverage blind spots (coverage config and tests).
+Child-process code (_worker_main and _load_module, about ai.py lines 360–447) shows as uncovered because subprocesses aren't measured. 
+Per-module coverage is also low: app.py 54%, auth.py 63%, demo_ai.py 66%, gui_window.py 71%. 
+Change: enable multiprocessing coverage with parallel plus combine. Add tests for CLI restore, break-lease and live gating, AuthManager.restore error mapping, and TokenStore with fake keyring and DPAPI. Raise fail_under from 75 toward 85. 
+17. Pre-migration backups accumulate (storage.py, _migrate). Every schema upgrade writes *.pre-migration-vN-<uuid>.sqlite3, which contains mail, and nothing prunes them. Change: keep the newest N (default 2) and delete older ones after a successful migration, note it in docs/architecture.md, and add a test.
+E. Documentation
+18. Doc drift. docs/setup.md says Disconnect doesn't revoke Google consent, while the app and SECURITY.md describe "Disconnect and revoke". The install command in docs/setup.md omits -c constraints.txt. docs/history/reported-issues.txt lists items that are now fixed. Change: reconcile these, mark the history file as resolved with pointers to docs/reliability-fixes.md, and add a CHANGELOG entry for each item above. 

@@ -63,3 +63,33 @@ The supplied [second plan](history/reliability-plan-2.txt) is retained verbatim.
 | 28 | Final suite, lint, package build, fresh 3,000-message demo and 50,000-message measurements record implementation evidence. | [Final checks and before/after measurements](performance-2026-10-28.md). |
 
 CI-generated [validation](validation.md) reports counts/status without failure payloads. Earlier manual measurements remain in [history](history/validation-2026-10-28.md). Synthetic timings and request/query counts are not live Gmail performance or AI-billing guarantees. Native frozen packaging results are claimed only when the corresponding hosted job passes.
+
+## Third reliability review: 18-item plan
+
+The approved [source plan](history/reliability-plan-3.txt) is retained for provenance.
+
+The following follow-up uses the existing offline fakes. Each implementation
+item has its own commit and passed Ruff, mypy, and the complete CI test wrapper
+before completion. The combined coverage gate is 85%. Hosted platform checks
+remain separate from local synthetic evidence.
+
+| Item | Current behavior | Regression evidence |
+| --- | --- | --- |
+| 1 | Resolve secure keyring chainer members and platform-specific storage limits. | `tests/test_auth_backends.py` |
+| 2 | Retry transport/temporary refresh failures; preserve invalid-grant auth errors. | `tests/test_gmail.py` |
+| 3 | Mark local/catalog/quota failures unsent; close attempts durably. | `tests/test_actions.py`, `tests/test_gmail.py` |
+| 4 | Wait through outages, quarantine repeating auth/permission items, reject unsafe deadlines. | `tests/test_job_resilience.py` |
+| 5 | Restore throttled batch sizes after clean batches. | `tests/test_job_resilience.py` |
+| 6 | Interrupt quota waits on stop/close. | `tests/test_gmail.py` |
+| 7 | Share synchronized credentials with separate worker transports and session fencing. | `tests/test_auth_sessions.py` |
+| 8 | Classify provider errors through an optional hook with retry metadata. | `tests/test_ai_hook.py` |
+| 9 | Validate cached stage metadata through Gmail history; retain live write preflights. | `tests/test_stage_cache.py`, [quota measurements](quota-validation.md) |
+| 10 | Configure the quota budget and show consumption and ETA. | `tests/test_quota_preferences.py` |
+| 11 | Keep one runner and one writer; permit reviewed writes during provider calls. | Runner/writer concurrency and fencing tests. |
+| 12 | Use randomized boundaries and structured prompt flags. | `tests/test_ai_prompt.py` |
+| 13 | Require review for hidden/instruction-like content; isolate prompts and old automatic plans. | `tests/test_input_safety.py`, `tests/test_actions.py` |
+| 14 | Select substantive MIME alternatives and recover malformed blocked tags conservatively. | `tests/test_mime.py` |
+| 15 | Use literal plain text preview without unused HTML sanitizers or BeautifulSoup. | `tests/test_gui.py`, `tests/test_refactor_contract.py` |
+| 16 | Combine multiprocessing coverage, test CLI/auth/native protection, enforce 85%. | `tests/test_worker_coverage.py`, `tests/test_cli_recovery.py`, `tests/test_auth_boundaries.py`, `tests/test_demo_ai_scenarios.py` |
+| 17 | Prune old migration snapshots only after successful upgrade. | `tests/test_migration_retention.py` |
+| 18 | Align install, revocation, issue history, and operating instructions. | `tests/test_release_policy.py` |

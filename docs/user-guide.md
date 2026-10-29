@@ -18,7 +18,7 @@ Maintenance combines mailbox history with a rolling boundary sweep, local deadli
 
 ## Review workflow
 
-Use Review to inspect sender, subject, date, current/suggested labels, category, lasting importance, outstanding action, uncertainty, and the reason for the recommendation. Preview content is sanitized and does not load external resources or mark the Gmail message read. Open in Gmail is an explicit navigation action using the connected account context; the browser may still prompt you to select/sign into that account.
+Use Review to inspect sender, subject, date, current/suggested labels, category, lasting importance, outstanding action, uncertainty, and the reason for the recommendation. Preview shows literal plain text and does not load external resources or mark the Gmail message read. Open in Gmail is an explicit navigation action using the connected account context; the browser may still prompt you to select/sign into that account.
 
 - **Archive:** This item no longer needs inbox attention. Optional Completed, Expired, or Not relevant reasons preserve that distinction. Archival is not a judgment that future mail from the sender lacks importance.
 - **Keep / Needs attention:** Retain the current item/context. This does not create a permanent sender-wide protection.
@@ -80,7 +80,7 @@ Preferences are stored with QSettings under organization `GmailInboxCleaner`, se
 | AI content privacy | Sender/domain/label exclusion lists; target and historical examples both respect exclusions; bodies limited to 32,000 characters initially. |
 | Retrieval | HTTP multipart batches of 25 (1–50); metadata first; full eligible-body download off. |
 | Execution batching | 100 messages with identical deltas per `batchModify`, configurable up to 500. |
-| Retries | Maximum three retries; two-second base before exponential backoff and jitter; reliable Retry-After honored where available. |
+| Retries | Item errors retain the configured retry budget. Transport outages use durable job backoff without spending item attempts; usable Retry-After is honored. |
 | Context | Sent and archived context disabled; when enabled it remains read-only and subject to examination/privacy limits. |
 | Learning | Enabled; explicit decisions and audit/undo remain durable when learning is paused. |
 | Maintenance | 60-minute preference; periodic full inbox reconciliation every 24 hours; no OS/cloud service is installed. |
@@ -112,7 +112,7 @@ Undo uses the original explicit IDs and inverse app-owned deltas. It can restore
 | OAuth test access denied | Confirm External audience, add the exact Gmail address as a test user, select Desktop app credentials, enable Gmail API. |
 | Authorization expired / 401 | Reconnect. External Testing consent normally expires after seven days for this scope. |
 | 403 | Inspect the classified error: missing permission or account policy is different from a quota/rate reason. Repeated retries cannot fix consent or policy. |
-| 429 / transient 5xx / offline | Transient items retain a scheduled retry. The desktop resumes due waiting jobs when idle; headless runs wait and resume automatically. Explicit pauses/stops stay paused/stopped. Inspect exhausted failures in Errors. |
+| 429 / transient 5xx / offline | Transport outages retain a durable scheduled retry without exhausting item attempts. The desktop resumes due waiting jobs when idle; headless runs wait and resume automatically. Explicit pauses/stops stay paused/stopped. Inspect exhausted failures in Errors. |
 | Expired Gmail history | Run/resume reconciliation. Local audit and learning data are retained. |
 | Invalid pagination token | Safe re-enumeration deduplicates IDs; do not clear the database to repair it. |
 | Missing AI key / unsupported model | Configure the external module or exact model identifier; resume after correcting configuration. |
@@ -145,8 +145,26 @@ For headless use, `--approve-ai-module` explicitly approves the current source a
 
 ## Operational retries and AI spending
 
-A user pause remains paused until Resume. System pauses include a reason: authentication, permission, account, and AI configuration blocks need correction; quota blocks retain their reset deadline. Temporary discovery failures resume with bounded exponential backoff. Headless execution waits in interruptible slices for at most five minutes per invocation, then retains its retry deadline for a later resume. Rate limits share one job backoff and reduce the next stage batch size without spending each item's retry attempts. Retrying errors requires a selected job or explicit work-item selection; it resets those attempts and preserves user pauses and completed work.
+A user pause remains paused until Resume. System pauses include a reason: authentication, permission, account, and AI configuration blocks need correction; quota blocks retain their reset deadline. Temporary transport/discovery failures retain jittered job backoff capped around five minutes without consuming item attempts; unexpected errors retain a bounded retry budget. Headless execution waits in interruptible slices for at most five minutes per invocation, then retains its retry deadline for a later resume. Rate limits share one job backoff and reduce the next stage batch size without spending item attempts; three clean batches grow it back toward the configured size. Repeated auth/permission pauses from the same item quarantine it after three resumes. Invalid or unusable Retry-After metadata requires inspection rather than an early retry. Retrying errors requires a selected job or explicit work-item selection; it resets those attempts and preserves user pauses and completed work.
 
 Settings includes AI call caps of 5,000 per job and 10,000 per UTC day by default. A cap of zero disables that individual limit. Optional estimated-cost caps require a positive configured cost per attempted call; the application pauses before a request would exceed a call or estimated-cost cap. Failed and interrupted requests remain charged against these local reservations because remote billing cannot be ruled out. Per-job caps require an explicit cap increase or a new job; a daily cap resets at the next UTC midnight. Cost figures are estimates rather than provider invoices. The job status shows reserved calls, estimated spend, and the blocking reason.
 
 Periodic inbox reconciliation lists IDs and uses valid Gmail history to fetch metadata only for newly discovered IDs, changed IDs, and locally due policy transitions. Expired or uncovered history forces a full metadata refresh. Conversation fingerprints deliberately retain INBOX membership: the regression measurement used two sibling assessments, then observed one additional assessment when the remaining sibling was revisited after the other was archived. This preserves conservative context invalidation; archival alone does not immediately submit every sibling to AI.
+
+### Quota and progress
+
+The quota budget defaults to **6,000 units per minute**. Set the actual per-user
+allocation for your Google project in Settings; older projects may have a higher
+budget. `--quota-units-per-minute N` applies only to the current invocation.
+Progress shows consumed units and an approximate ETA. History-validated metadata
+reuse reduces repeat reads; execution still performs live checks before writes.
+See [the synthetic quota measurement](quota-validation.md) for stage costs and
+estimation limits.
+
+### Content requiring review
+
+Hidden HTML and instruction-like text are flagged for review. Flagged messages
+and examples do not enter shared AI prompts, and omitted context makes the
+related assessment incomplete. The default remains one target per prompt;
+Settings warns before larger batches. Short browser-view stubs may use a
+substantive HTML alternative. Recovered malformed HTML remains marked incomplete.

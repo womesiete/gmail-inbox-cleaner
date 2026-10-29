@@ -44,3 +44,15 @@ def test_generated_validation_excludes_test_failure_content(tmp_path):
 	text = render(junit, coverage, status="failure", revision="abc123")
 	assert "82.00%" in text and "4" in text and "failure" in text
 	assert "PRIVATE EMAIL CONTENT" not in text
+
+
+def test_setup_and_historical_reports_match_current_operations():
+	setup = (ROOT / "docs/setup.md").read_text()
+	installs = [line for line in setup.splitlines() if "-m pip install" in line and "-e " in line]
+	assert installs and all("-c constraints.txt" in line for line in installs)
+	assert "**Disconnect**" in setup and "**Disconnect and revoke**" in setup
+	assert "Local databases and backups remain" in setup
+	history = (ROOT / "docs/history/reported-issues.txt").read_text()
+	assert history.startswith("HISTORICAL ISSUE REPORT — RESOLVED")
+	assert "docs/reliability-fixes.md" in history
+	assert (ROOT / "docs/reliability-fixes.md").is_file()
