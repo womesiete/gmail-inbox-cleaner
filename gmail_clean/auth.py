@@ -32,10 +32,13 @@ def _serialized_credentials(method):
 class AuthenticationError(RuntimeError):
 	"""Authentication/configuration needs the user's intervention."""
 
-	def __init__(self, message: str) -> None:
+	def __init__(self, message: str, *, backend_name: str = "") -> None:
+		if backend_name:
+			message += f" Resolved credential backend: {backend_name}."
 		super().__init__(message)
 		self.safe_message = message
 		self.kind = "auth"
+		self.backend_name = backend_name
 
 
 class TokenStore:
@@ -52,10 +55,45 @@ class TokenStore:
 	def _keyring() -> Any:
 		import keyring
 		backend = keyring.get_keyring()
-		name = type(backend).__module__.lower()
-		if not any(secure in name for secure in ("windows", "macos", "secretservice", "kwallet")):
-			raise AuthenticationError("No supported OS-protected credential backend is available.")
-		return keyring
+		candidates = []
+		visited = set()
+		def resolve(candidate):
+			if id(candidate) in visited:
+				return
+			visited.add(id(candidate))
+			name = type(candidate).__module__.lower()
+			if "chainer" in name or type(candidate).__name__ == "ChainerBackend":
+				for child in candidate.backends:
+					resolve(child)
+				return
+			if any(secure in name for secure in ("windows", "macos", "secretservice", "libsecret", "kwallet")):
+				try:
+					priority = float(candidate.priority)
+				except Exception:  # noqa: BLE001 - unavailable keyring backends can raise while probing priority.
+					return
+				if priority > 0:
+					candidates.append((priority, candidate))
+		resolve(backend)
+		if not candidates:
+			raise AuthenticationError("No supported OS-protected credential backend is available.",
+				backend_name=TokenStore._backend_name(backend))
+		# Use the selected backend directly: the chainer can otherwise route to a
+		# disallowed member even when it contains a secure candidate.
+		return max(candidates, key=lambda candidate: candidate[0])[1]
+
+	@staticmethod
+	def _backend_name(backend: Any) -> str:
+		return f"{type(backend).__module__}.{type(backend).__name__}"
+
+	@staticmethod
+	def backend_name() -> str:
+		"""Describe the resolved protected backend without accessing credentials."""
+		try:
+			return TokenStore._backend_name(TokenStore._keyring())
+		except AuthenticationError as exc:
+			return f"Unavailable ({exc.backend_name or 'protected keyring'})"
+		except Exception as exc:  # noqa: BLE001 - preferences must survive absent or locked OS integration.
+			return f"Unavailable ({type(exc).__name__})"
 
 	@staticmethod
 	def _dpapi(data: bytes, encrypt: bool) -> bytes:
@@ -108,16 +146,19 @@ class TokenStore:
 		if not payload["refresh_token"]:
 			raise AuthenticationError("Google did not return a refresh token; reconnect with consent.")
 		value = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+		backend = None
 		try:
-			if len(value.encode("utf-16-le")) > 2560:
+			backend = self._keyring()
+			if os.name == "nt" and len(value.encode("utf-16-le")) > 2560:
 				raise AuthenticationError("Credential exceeds Windows Credential Manager's compact payload limit.")
-			self._keyring().set_password(self.SERVICE, self.user, value)
+			backend.set_password(self.SERVICE, self.user, value)
 		except Exception as keyring_error:  # noqa: BLE001 - OS keyring backends expose different exception types.
 			# There is deliberately no unencrypted-file fallback.
 			try:
 				protected = self._dpapi(value.encode(), encrypt=True)
 			except Exception:  # noqa: BLE001 - Preserve the original keyring failure when encrypted fallback fails.
-				raise AuthenticationError("The OS credential backend could not save authorization. Unlock or configure the protected keyring and reconnect.") from keyring_error
+				raise AuthenticationError("The OS credential backend could not save authorization. Unlock or configure the protected keyring and reconnect.",
+					backend_name=self._backend_name(backend) if backend is not None else getattr(keyring_error, "backend_name", "unavailable")) from keyring_error
 			temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
 			try:
 				with temporary.open("xb") as stream:
@@ -128,9 +169,15 @@ class TokenStore:
 				os.replace(temporary, self.path)
 			finally:
 				temporary.unlink(missing_ok=True)
-			self._select_backend("dpapi")
+			try:
+				self._select_backend("dpapi")
+			except OSError as exc:
+				raise AuthenticationError("Authorization was protected, but its backend marker could not be updated. Check local file access and reconnect.", backend_name="Windows DPAPI") from exc
 		else:
-			self._select_backend("keyring")
+			try:
+				self._select_backend("keyring")
+			except OSError as exc:
+				raise AuthenticationError("Authorization was protected, but its backend marker could not be updated. Check local file access and reconnect.", backend_name=self._backend_name(backend)) from exc
 			self.path.unlink(missing_ok=True)
 
 	@_serialized_credentials
@@ -165,7 +212,7 @@ class TokenStore:
 			except (OSError, UnicodeError, ValueError) as exc:
 				raise AuthenticationError("Protected credentials could not be read. Reconnect this account.") from exc
 		if backend == "keyring" and keyring_error is not None:
-			raise AuthenticationError("The OS credential backend could not read authorization. Unlock the protected keyring and retry.") from keyring_error
+			raise AuthenticationError("The OS credential backend could not read authorization. Unlock the protected keyring and retry.", backend_name=self.backend_name()) from keyring_error
 		return None
 
 	@_serialized_credentials

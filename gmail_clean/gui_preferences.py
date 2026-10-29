@@ -107,6 +107,10 @@ class SettingsEditor(QWidget):
 		outer.addWidget(help_text)
 		if demo:
 			outer.addWidget(QLabel("Offline demo uses synthetic AI only. Personal mode supports your external module; demo data never enters it.", wordWrap=True))
+		else:
+			from .auth import TokenStore
+			self.credential_backend = QLabel(f"Protected OAuth storage: {TokenStore.backend_name()}", wordWrap=True)
+			outer.addWidget(self.credential_backend)
 		self.resolved = QLabel("", wordWrap=True)
 		outer.addWidget(self.resolved)
 		scroll = QScrollArea()
