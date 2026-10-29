@@ -11,6 +11,9 @@ from typing import Callable
 
 MAX_TEXT_CHARS = 100_000
 MAX_PART_BYTES = 1_000_000
+# Bump when visible-text extraction or its safety flags change incompatibly.
+# Normalized legacy text cannot be reparsed without retrieving the original MIME.
+BODY_PARSER_VERSION = 2
 
 
 class _TextParser(HTMLParser):

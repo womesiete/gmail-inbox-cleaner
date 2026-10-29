@@ -271,6 +271,7 @@ class Store:
 			self.conn.execute("PRAGMA secure_delete=ON")
 			self._migrate()
 			self._bind_account()
+			self._upgrade_body_parser_cache()
 		except sqlite3.DatabaseError as exc:
 			self.conn.close()
 			if getattr(exc, "sqlite_errorcode", 0) & 255 not in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}:
@@ -286,6 +287,48 @@ class Store:
 	def _check_thread(self) -> None:
 		if threading.get_ident() != self._thread_id:
 			raise RuntimeError("Store connection belongs to another thread; open a separate Store")
+
+	def _upgrade_body_parser_cache(self) -> None:
+		"""Discard unprovable legacy extraction once, without rewriting audit intent.
+
+		Old normalized bodies contain neither original HTML nor reliable hidden-text
+		flags. A prompt revision alone cannot make those strings safe to reuse.
+		Concurrent openers recheck the version under the same transaction as every
+		invalidation, so a failed or interrupted upgrade is retried atomically.
+		"""
+		from .mime import BODY_PARSER_VERSION
+		if self.checkpoint("body_parser_version") == BODY_PARSER_VERSION:
+			return
+		with self.transaction():
+			if self.checkpoint("body_parser_version") == BODY_PARSER_VERSION:
+				return
+			self.execute("""UPDATE messages SET body='',missing_content=1,content_hash='',body_cached_at='',
+				decision=CASE WHEN id IN (SELECT message_id FROM manual_overrides) THEN decision ELSE 'pending' END,
+				payload_json=json_set(json_remove(payload_json,'$.body'),'$.missing_content',json('true'),'$.content_hash','')""")
+			self.execute("UPDATE examples SET body='',payload_json=json_remove(payload_json,'$.body')")
+			self.execute("UPDATE predictions SET valid=0 WHERE valid=1")
+			self.execute("""UPDATE actions SET state='stale',reason='Body parser changed; refresh content and assessment before automatic execution',updated_at=?
+				WHERE approval!='manual' AND undo_of IS NULL AND state IN ('queued','proposed','retry')""", (utc_now(),))
+			# An already-discovered job may be paused after its old body stage.
+			# Revisit metadata first so its frozen scope/current privacy checks queue
+			# the required fresh MIME read, rather than completing from missing text.
+			self.execute("""UPDATE work_items SET state='pending',input_version=''
+				WHERE job_id IN (SELECT id FROM jobs WHERE state!='completed')
+				AND stage IN ('metadata','body','classification')""")
+			# Requeued metadata must not bypass a later-stage provider wait for the
+			# same item. Job pause/stop/backoff payloads remain entirely unchanged.
+			self.execute("""UPDATE work_items SET next_attempt_utc=(SELECT MAX(source.next_attempt_utc)
+				FROM work_items source WHERE source.job_id=work_items.job_id AND source.message_id=work_items.message_id)
+				WHERE job_id IN (SELECT id FROM jobs WHERE state!='completed')
+				AND stage IN ('metadata','body','classification')""")
+			self.execute("""UPDATE work_items SET state='retry' WHERE next_attempt_utc IS NOT NULL
+				AND job_id IN (SELECT id FROM jobs WHERE state!='completed')
+				AND stage IN ('metadata','body','classification')""")
+			self.execute("""INSERT OR IGNORE INTO work_items(job_id,message_id,stage,state,next_attempt_utc)
+				SELECT w.job_id,w.message_id,'metadata',CASE WHEN MAX(w.next_attempt_utc) IS NULL THEN 'pending' ELSE 'retry' END,
+				MAX(w.next_attempt_utc) FROM work_items w JOIN jobs j ON j.id=w.job_id
+				WHERE j.state!='completed' GROUP BY w.job_id,w.message_id""")
+			self.set_checkpoint("body_parser_version", BODY_PARSER_VERSION)
 
 	def _migrate(self) -> None:
 		# Back up an older schema before taking the migration write lock. Re-read
