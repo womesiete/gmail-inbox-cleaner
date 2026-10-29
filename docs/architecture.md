@@ -37,7 +37,7 @@ A database binds to one authenticated account. Operational tables retain the acc
 
 ## Schema
 
-Schema migrations use `PRAGMA user_version`; the current schema is version 7. Version 4 indexes normalized List-ID, version 5 adds process creation identity, version 6 installs account triggers once, and version 7 removes duplicate body JSON and adds independent body-cache age. Existing databases receive a verified pre-migration backup before a transactional upgrade. Newer unsupported schemas are rejected. The body column is authoritative; other structured/versioned details remain in JSON beside indexed queue/UI fields.
+Schema migrations use `PRAGMA user_version`; the current schema is version 7. Version 4 indexes normalized List-ID, version 5 adds process creation identity, version 6 installs account triggers once, and version 7 removes duplicate body JSON and adds independent body-cache age. Existing databases receive a verified pre-migration backup before a transactional upgrade. After a successful upgrade, only the newest two pre-migration snapshots for that database are retained; `Store(migration_backup_count=N)` can set another positive retention count. Failed upgrades retain every recovery snapshot, and manual/pre-restore backups are never pruned by this policy. These snapshots contain cached mail and require the same private storage as the database. Newer unsupported schemas are rejected. The body column is authoritative; other structured/versioned details remain in JSON beside indexed queue/UI fields.
 
 | Table | Purpose / indexed relationships |
 | --- | --- |

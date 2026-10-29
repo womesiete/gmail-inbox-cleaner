@@ -237,9 +237,13 @@ class Store:
 	by database triggers, including for direct SQL inserts by core services.
 	"""
 
-	def __init__(self, path: str | Path, account_id: str, *, check_integrity: bool = True):
+	def __init__(self, path: str | Path, account_id: str, *, check_integrity: bool = True,
+			migration_backup_count: int = 2):
 		if not account_id or not account_id.strip():
 			raise ValueError("An authenticated account identity is required")
+		if isinstance(migration_backup_count, bool) or not isinstance(migration_backup_count, int) or migration_backup_count < 1:
+			raise ValueError("Keep at least one pre-migration backup")
+		self.migration_backup_count = migration_backup_count
 		self.path = Path(path) if str(path) != ":memory:" else ":memory:"
 		self.account_id = account_id.strip().casefold()
 		self._thread_id = threading.get_ident()
@@ -285,6 +289,7 @@ class Store:
 		self.conn.execute("BEGIN IMMEDIATE")
 		try:
 			version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+			migrated = 0 < version < SCHEMA_VERSION
 			if version > SCHEMA_VERSION:
 				raise RuntimeError("Database schema is newer than this application; use a matching version")
 			for number in range(version, SCHEMA_VERSION):
@@ -306,6 +311,19 @@ class Store:
 			if self.conn.in_transaction:
 				self.conn.rollback()
 			raise
+		if migrated:
+			self._prune_migration_backups()
+
+	def _prune_migration_backups(self) -> None:
+		"""Bound sensitive migration snapshots after a successful upgrade only."""
+		if not isinstance(self.path, Path):
+			return
+		prefix = self.path.name + ".pre-migration-v"
+		backups = [path for path in self.path.parent.iterdir()
+			if path.name.startswith(prefix) and path.name.endswith(".sqlite3") and path.is_file()]
+		backups.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+		for path in backups[self.migration_backup_count:]:
+			path.unlink(missing_ok=True)
 
 	def _bind_account(self) -> None:
 		with self.transaction():
