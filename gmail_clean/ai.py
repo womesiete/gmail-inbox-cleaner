@@ -90,13 +90,14 @@ def _retry_after(value: Any) -> float | None:
 class AIError(RuntimeError):
 	"""Serializable failure with real exception identity and a privacy-safe summary."""
 
-	def __init__(self, category: str, summary: str | None = None, *, exception_class: str = "", exception_module: str = "", request_id: str = "", retry_after: float | None = None):
+	def __init__(self, category: str, summary: str | None = None, *, exception_class: str = "", exception_module: str = "", request_id: str = "", retry_after: float | None = None, retry_after_invalid: bool = False):
 		self.category = category
 		self.summary = summary or _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"])
 		self.exception_class = exception_class
 		self.exception_module = exception_module
 		self.request_id = request_id
 		self.retry_after = _retry_after(retry_after)
+		self.retry_after_invalid = retry_after_invalid or (retry_after is not None and self.retry_after is None)
 		self.kind = _ERROR_KINDS.get(category, "")
 		self.configuration = category in {"UnsupportedModelError", "MissingAPIKeyError", "ImportInitializationError", "ConfigurationError", "ProviderAuthenticationError", "ProviderPermissionError"}
 		self.transient = bool(self.kind)
@@ -104,7 +105,7 @@ class AIError(RuntimeError):
 		super().__init__(self.summary)
 
 	def to_dict(self) -> dict[str, Any]:
-		return {"category": self.category, "summary": self.summary, "exception_class": self.exception_class, "exception_module": self.exception_module, "request_id": self.request_id, "retry_after": self.retry_after, "configuration": self.configuration, "transient": self.transient, "interrupted": self.interrupted}
+		return {"category": self.category, "summary": self.summary, "exception_class": self.exception_class, "exception_module": self.exception_module, "request_id": self.request_id, "retry_after": self.retry_after, "retry_after_invalid": self.retry_after_invalid, "configuration": self.configuration, "transient": self.transient, "interrupted": self.interrupted}
 
 
 def module_trust_details(location: str) -> dict[str, Any]:
@@ -418,9 +419,12 @@ def _exception_exports(module: Any) -> dict[str, type[BaseException] | tuple]:
 
 def _error_packet(exc: BaseException, exports: dict[str, Any] | None = None, category: str | None = None, classifier: Any = None) -> dict[str, Any]:
 	delay = None
+	invalid_delay = False
 	if category is None:
 		category = next((name for name in _EXCEPTION_NAMES if isinstance(exc, (exports or {}).get(name, ()))), "UnknownProviderError")
-		delay = _retry_after(getattr(exc, "retry_after", None))
+		provided_delay = getattr(exc, "retry_after", None)
+		delay = _retry_after(provided_delay)
+		invalid_delay = provided_delay is not None and delay is None
 		if callable(classifier):
 			try:
 				classification = classifier(exc)
@@ -429,12 +433,14 @@ def _error_packet(exc: BaseException, exports: dict[str, Any] | None = None, cat
 					resolved = _HOOK_CATEGORIES.get(selected, selected) if isinstance(selected, str) else None
 					if resolved in set(_HOOK_CATEGORIES.values()) | set(_EXCEPTION_NAMES):
 						category = resolved
-						delay = _retry_after(classification.get("retry_after"))
+						provided_delay = classification.get("retry_after")
+						delay = _retry_after(provided_delay)
+						invalid_delay = provided_delay is not None and delay is None
 			except Exception:  # noqa: BLE001, S110 - A provider's optional classifier must not expose its raw exception or mask the original error.
 				pass
 	# Arbitrary provider messages may echo entire prompts, access tokens or keys.
 	# A useful category and true class/module identity survive without raw payloads.
-	return {"category": category, "summary": _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"]), "exception_class": type(exc).__name__, "exception_module": type(exc).__module__, "retry_after": delay}
+	return {"category": category, "summary": _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"]), "exception_class": type(exc).__name__, "exception_module": type(exc).__module__, "retry_after": delay, "retry_after_invalid": invalid_delay}
 
 
 def _load_module(location: str, expected_sha256: str = "") -> Any:

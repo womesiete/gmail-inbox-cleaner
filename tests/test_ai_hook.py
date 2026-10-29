@@ -45,6 +45,7 @@ def test_invalid_retry_after_is_discarded(delay):
 	packet = _error_packet(RuntimeError("private"), classifier=lambda exc: {"category": "network", "retry_after": delay})
 	assert packet["category"] == "NetworkError"
 	assert packet["retry_after"] is None
+	assert packet["retry_after_invalid"] is (delay is not None)
 
 
 def test_classifier_failures_and_unknown_categories_remain_unknown():
@@ -62,3 +63,18 @@ def test_legacy_exported_rate_limit_preserves_numeric_retry_after():
 	packet = _error_packet(RateLimitError("private"), {"RateLimitError": RateLimitError})
 	assert packet["category"] == "RateLimitError"
 	assert packet["retry_after"] == 95
+
+
+@pytest.mark.parametrize("value,invalid", [("float('inf')", True), ("1e308", False)])
+def test_extreme_retry_after_crosses_ipc_without_losing_invalid_delay_signal(tmp_path, value, invalid):
+	module = tmp_path / "delay_provider.py"
+	module.write_text(
+		"def call_api(prompt):\n\traise RuntimeError('PRIVATE CONTENT')\n"
+		f"def classify_exception(exc):\n\treturn {{'category': 'network', 'retry_after': {value}}}\n"
+	)
+	with AIClient(str(module)) as client, pytest.raises(AIError) as captured:
+		client.call("private prompt")
+	error = captured.value
+	assert error.retry_after_invalid is invalid
+	assert error.to_dict()["retry_after_invalid"] is invalid
+	assert error.retry_after == (None if invalid else 1e308)
