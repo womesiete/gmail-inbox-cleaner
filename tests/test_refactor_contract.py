@@ -19,7 +19,7 @@ def test_desktop_public_facade_keeps_preferences_preview_and_signal_contract(qap
 	caption = format_window(resolve_window(loaded, datetime(2026, 10, 28, 12, tzinfo=UTC)))
 	assert 'America/New_York' in caption and 'UTC:' in caption
 	preview = SafePreview()
-	preview.set_message('<b>mail text</b>', html=False)
+	preview.set_message('<b>mail text</b>')
 	assert preview.toPlainText() == '<b>mail text</b>'
 	assert preview.loadResource(2, QUrl('https://example.invalid/pixel')).isEmpty()
 	signals = TaskSignals()

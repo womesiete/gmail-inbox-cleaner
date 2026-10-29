@@ -2,7 +2,6 @@
 # Use: python -m pip install -c constraints.txt -e '.[dev,package]'
 # Constraints pin resolution; platform-specific packages are installed only when needed.
 altgraph==0.17.5
-beautifulsoup4==4.15.0
 boolean.py==5.0
 build==1.6.1
 CacheControl==0.14.4
@@ -70,7 +69,6 @@ ruff==0.17.3
 SecretStorage==3.5.0
 setuptools==84.2.1
 sortedcontainers==2.4.0
-soupsieve==3.0.4
 tomli==2.5.0
 tomli_w==1.2.0
 typing_extensions==4.16.0

@@ -12,7 +12,7 @@ import pytest
 
 from gmail_clean.domain import Config, Message
 from gmail_clean.gui import (LabelPicker, MainWindow, RuleDialog, SafePreview, SettingsEditor,
-	acquire_instance_lock, load_preferences, sanitize_preview_html, save_preferences)
+	acquire_instance_lock, load_preferences, save_preferences)
 from gmail_clean.storage import Store
 from gmail_clean.table_model import Column, SqlTableModel
 
@@ -101,21 +101,15 @@ def test_settings_roundtrip_preserves_default_model_omission_and_dates(qapp, tmp
 	editor.deleteLater()
 
 
-def test_preview_strips_scripts_trackers_and_blocks_resources(qapp, qtbot):
+def test_preview_keeps_markup_literal_and_blocks_resources(qapp, qtbot):
 	html = '<p onclick="steal()">Hello<script>secret()</script><img src="https://tracker.invalid/x"><a href="javascript:bad()">Click</a></p>'
-	clean = sanitize_preview_html(html)
-	assert "script" not in clean
-	assert "tracker" not in clean
-	assert "onclick" not in clean
-	assert "secret()" not in clean
-	assert "javascript:" not in clean
 	preview = SafePreview()
 	qtbot.addWidget(preview)
-	preview.set_message(html, html=True)
-	assert "Hello" in preview.toPlainText()
+	preview.set_message(html)
+	assert preview.toPlainText() == html
 	from PyQt6.QtCore import QUrl
 	assert preview.loadResource(2, QUrl("https://tracker.invalid/x")).isEmpty()
-	assert not preview.openExternalLinks()
+	assert not preview.openLinks() and not preview.openExternalLinks()
 
 
 def test_label_picker_uses_existing_user_ids_and_multiple_additions(qapp, qtbot):
@@ -421,22 +415,15 @@ def test_finished_job_clears_running_flag_while_preview_remains_active(qapp, qtb
 		window.close()
 
 
-@pytest.mark.parametrize("scheme", ["javascript:alert(1)", "java\nscript:alert(1)", "data:text/html,bad", "file:///private", "//tracker.invalid/x", "/relative"])
-def test_preview_allowlist_rejects_active_or_relative_links_and_all_style_attributes(scheme):
-	from bs4 import BeautifulSoup
-	clean = sanitize_preview_html('<head><script>bad()</script><meta charset="utf-8"></head><!--private-->'
-		f'<div><p style="background:url(https://tracker.invalid)" class="x"><a href="{scheme}" onclick="bad()" title="Label">Text</a></p></div>')
-	soup = BeautifulSoup(clean, "html.parser")
-	assert not soup.find(["script", "head", "meta", "div"])
-	assert "private" not in clean and "bad()" not in clean
-	assert soup.p.attrs == {}
-	assert soup.a.attrs == {"title": "Label"}
-
-
-def test_preview_preserves_only_explicit_safe_link_attributes():
-	from bs4 import BeautifulSoup
-	clean = sanitize_preview_html('<a href="https://example.invalid/path" title="Open" target="_blank" style="color:red">Link</a>')
-	assert BeautifulSoup(clean, "html.parser").a.attrs == {"href": "https://example.invalid/path", "title": "Open"}
+@pytest.mark.parametrize("url", ["https://tracker.invalid/x", "file:///private", "data:text/html,bad", "javascript:alert(1)"])
+def test_plain_preview_never_loads_or_interprets_email_urls(qapp, url):
+	from PyQt6.QtCore import QUrl
+	preview = SafePreview()
+	value = f'<a href="{url}">Text</a><img src="{url}">'
+	preview.set_message(value)
+	assert preview.toPlainText() == value
+	assert preview.loadResource(2, QUrl(url)).isEmpty()
+	preview.close()
 
 
 def test_retry_refresh_resumes_due_system_pause_and_surfaces_block_reason(qapp, qtbot, service, tmp_path, monkeypatch):

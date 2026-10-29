@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from gmail_clean.mime import decode_base64url, html_to_text, parse_body, sanitize_html
+from gmail_clean.mime import decode_base64url, html_to_text, parse_body
 
 
 def part(mime, value, charset="utf-8", **extra):
@@ -45,9 +45,6 @@ def test_nested_inline_text_attachment_charset_and_truncation():
 def test_html_is_inert_and_tracks_missing_or_invalid_content():
 	value = "<html><head><style>secret-css</style></head><body><script>alert('bad')</script><p>Hello<img src='https://tracker.invalid/pixel'></p><iframe>hidden</iframe><a href='javascript:bad()'>there</a></body></html>"
 	assert html_to_text(value) == "Hello\nthere"
-	safe = sanitize_html(value)
-	assert "script" not in safe and "https:" not in safe and "javascript:" not in safe
-	assert safe == "<p>Hello<br>there</p>"
 	assert parse_body({"mimeType": "text/plain", "body": {"data": "!!!"}}).missing
 	assert parse_body({"mimeType": "text/plain", "body": {"size": 0}}).missing
 	assert parse_body({"mimeType": "text/plain", "body": {"attachmentId": "missing", "size": 5}}).missing

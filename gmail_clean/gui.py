@@ -10,7 +10,6 @@ import uuid
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup, Comment
 from PyQt6.QtCore import (QByteArray, QLockFile, QObject, QRunnable, QSettings,
 	Qt, QThreadPool, QTimer, QUrl, QItemSelectionModel, pyqtSignal, pyqtSlot)
 from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
@@ -30,7 +29,7 @@ from .table_model import Column, SqlTableModel
 
 
 from .gui_preferences import preferences, load_preferences, save_preferences, InstanceLockError, acquire_instance_lock, SettingsEditor, format_window
-from .gui_preview import sanitize_preview_html, SafePreview
+from .gui_preview import SafePreview
 from .gui_workers import _DrainingWork, TaskSignals, ServiceTask
 from .gui_dialogs import LabelPicker, RuleDialog
 from .gui_window import MainWindow
@@ -49,8 +48,6 @@ __all__ = [
 	'quote',
 	'urlsplit',
 	'ZoneInfo',
-	'BeautifulSoup',
-	'Comment',
 	'QByteArray',
 	'QLockFile',
 	'QObject',
@@ -112,7 +109,6 @@ __all__ = [
 	'save_preferences',
 	'InstanceLockError',
 	'acquire_instance_lock',
-	'sanitize_preview_html',
 	'SafePreview',
 	'TaskSignals',
 	'ServiceTask',

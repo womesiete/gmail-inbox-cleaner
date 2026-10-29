@@ -6,7 +6,6 @@ from bisect import bisect_left
 import re
 from dataclasses import dataclass, field
 from email.message import Message as HeaderMessage
-from html import escape
 from html.parser import HTMLParser
 from typing import Callable
 
@@ -145,14 +144,6 @@ def html_to_text(value: str) -> str:
 	parser, _ = _parse_html(value)
 	return normalize_text("".join(parser.output))
 
-
-def sanitize_html(value: str) -> str:
-	"""Return inert formatted text; all email markup/resources become plain text.
-
-	QTextBrowser receives escaped paragraphs rather than permissive email HTML.
-	This strict allowlist is intentionally just p/br, with no URLs or attributes.
-	"""
-	return "<p>" + escape(html_to_text(value)).replace("\n", "<br>") + "</p>"
 
 
 @dataclass
