@@ -918,7 +918,7 @@ def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_m
 	assert not app.store.one("SELECT id FROM attempts")
 
 
-@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict')])
+@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict'), ('interrupted', 'retry')])
 def test_unsent_write_failure_closes_attempt_without_uncertainty(app, kind, expected):
 	from gmail_clean.gmail import GmailError, PreSendError
 	aid = plan(app, seed(app), ['Label_added'])
@@ -932,7 +932,7 @@ def test_unsent_write_failure_closes_attempt_without_uncertainty(app, kind, expe
 	assert not app.store.one("SELECT id FROM actions WHERE state IN ('executing','uncertain')")
 
 
-@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict')])
+@pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict'), ('interrupted', 'retry')])
 def test_catalog_is_validated_before_attempt_transaction(app, kind, expected):
 	from gmail_clean.gmail import GmailError, PreSendError
 	aid = plan(app, seed(app), ['Label_added'])

@@ -351,7 +351,7 @@ class ActionExecutor:
 						validate(list(add), list(remove), refresh=True)
 				except Exception as exc:  # noqa: BLE001 - a failed live catalog check cannot create a sending attempt
 					for action, _ in ready:
-						self.mark(action["id"], "retry" if getattr(exc, "transient", False) else "conflict", safe_error(exc))
+						self.mark(action["id"], "retry" if getattr(exc, "transient", False) or getattr(exc, "kind", "") == "interrupted" else "conflict", safe_error(exc))
 						self.s.error("preflight", exc, job_id=action["job_id"], message_id=action["message_id"])
 					continue
 				before_write_history_id = self._checkpoint()

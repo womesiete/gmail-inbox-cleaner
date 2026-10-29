@@ -28,19 +28,28 @@ class QuotaLimiter:
 	https://developers.google.com/workspace/gmail/api/reference/quota
 	"""
 
-	def __init__(self, units_per_minute=6000, *, clock=time.monotonic, sleep=time.sleep):
+	def __init__(self, units_per_minute=6000, *, clock=time.monotonic, sleep=time.sleep, wait=None):
 		self.limit = max(1, int(units_per_minute))
 		self.clock = clock
 		self.sleep = sleep
+		self.wait = wait or threading.Event().wait
 		self._events: deque[tuple[float, int]] = deque()
 		self._lock = threading.Lock()
 		self.consumed = 0
 
-	def acquire(self, units):
+	def acquire(self, units, *, cancel=None):
+		"""Wait for budget while allowing the owning task to stop promptly.
+
+		A direct Event can wake this wait immediately; a callable can combine a
+		worker's stop signal and the owner's shutdown signal. The injectable wait
+		keeps fake-clock tests deterministic without real sleeps.
+		"""
 		units = int(units)
 		if not 0 < units <= self.limit:
 			raise ValueError("A request quota must fit the minute budget")
 		while True:
+			if cancel is not None and (cancel() if callable(cancel) else cancel.is_set()):
+				raise GmailInterrupted()
 			with self._lock:
 				now = self.clock()
 				while self._events and self._events[0][0] <= now - 60:
@@ -51,7 +60,11 @@ class QuotaLimiter:
 					self.consumed += units
 					return
 				delay = max(0.001, 60 - (now - self._events[0][0]))
-			self.sleep(delay)
+			if cancel is None:
+				self.sleep(delay)
+			else:
+				wait = getattr(cancel, "wait", self.wait)
+				wait(min(delay, 0.1))
 
 
 class GmailError(RuntimeError):
@@ -75,6 +88,13 @@ class PreSendError(GmailError):
 	def __init__(self, error: GmailError) -> None:
 		super().__init__(error.kind, error.safe_message, error.retry_after,
 			status=error.status, reason=error.reason, sent=False)
+
+
+class GmailInterrupted(PreSendError):
+	"""A local stop/shutdown cancelled a request before it was sent."""
+
+	def __init__(self) -> None:
+		super().__init__(GmailError("interrupted", "Gmail quota wait was interrupted; the job can resume safely."))
 
 
 class HistoryExpired(GmailError):
@@ -183,12 +203,21 @@ class GmailMailbox:
 		self._sleep = time.sleep
 		self._random = random.random  # noqa: S311 -- retry jitter is not security-sensitive randomness.
 		self.on_label_error: Callable[[], None] | None = None
+		self.cancelled: Callable[[], bool] | threading.Event | None = None
+
+	def _acquire(self, units: int) -> None:
+		if self.cancelled is None:
+			self.quota_limiter.acquire(units)
+		else:
+			self.quota_limiter.acquire(units, cancel=self.cancelled)
 
 	def _execute(self, request: Any, operation: str = "request", has_page: bool = False,
 			*, idempotent: bool = True, quota_units: int = 1) -> dict:
 		for attempt in range(3 if idempotent else 1):
 			try:
-				self.quota_limiter.acquire(quota_units)
+				self._acquire(quota_units)
+			except PreSendError:
+				raise
 			except Exception as exc:  # noqa: BLE001 - quota failures occur before the transport has sent a request
 				raise PreSendError(translate_error(exc)) from None
 			try:
@@ -282,7 +311,7 @@ class GmailMailbox:
 			for message_id in batch_ids:
 				batch.add(self._request(message_id, body), request_id=message_id)
 			try:
-				self.quota_limiter.acquire(len(batch_ids) * (60 if body else 20))
+				self._acquire(len(batch_ids) * (60 if body else 20))
 				batch.execute()
 			except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
 				for message_id in batch_ids:
@@ -316,6 +345,8 @@ class GmailMailbox:
 		"""Resolve and validate the live catalog before a write attempt is created."""
 		try:
 			catalog = self.labels() if refresh or self._catalog is None else self._catalog
+		except PreSendError:
+			raise
 		except Exception as exc:  # noqa: BLE001 - catalog retrieval is read-only and precedes the mutation
 			raise PreSendError(translate_error(exc)) from None
 		allowed = {item["id"] for item in catalog if item["type"] == "user"} | {"INBOX"}

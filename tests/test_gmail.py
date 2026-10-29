@@ -596,3 +596,55 @@ def test_quota_failure_before_write_is_definitely_unsent():
 	with pytest.raises(PreSendError) as caught:
 		box.modify(['a'], ['user1'], [])
 	assert caught.value.sent is False and caught.value.kind == 'network'
+
+
+def test_quota_wait_is_interruptible_by_event_with_a_fake_clock():
+	from gmail_clean.gmail import GmailInterrupted, QuotaLimiter
+	now = [0.0]
+	waits = []
+	class CancelEvent:
+		def is_set(self):
+			return now[0] >= 0.25
+		def wait(self, delay):
+			waits.append(delay)
+			now[0] += delay
+			return self.is_set()
+	limiter = QuotaLimiter(50, clock=lambda: now[0], sleep=lambda _: pytest.fail('blocking sleep used'))
+	limiter.acquire(50)
+	with pytest.raises(GmailInterrupted) as caught:
+		limiter.acquire(1, cancel=CancelEvent())
+	assert caught.value.kind == 'interrupted' and caught.value.sent is False
+	assert now[0] < 1 and waits and max(waits) <= 0.1
+	assert limiter.consumed == 50
+
+
+def test_quota_cancellation_reaches_execute_and_batch_without_sending():
+	from gmail_clean.gmail import GmailInterrupted, QuotaLimiter
+	now = [0.0]
+	def wait(delay):
+		now[0] += delay
+	limiter = QuotaLimiter(50, clock=lambda: now[0], wait=wait)
+	limiter.acquire(50)
+	box = GmailMailbox(FakeGoogle(), quota_limiter=limiter)
+	box.cancelled = lambda: now[0] >= 0.25
+	executed = []
+	class Request:
+		def execute(self, **kwargs):
+			executed.append(True)
+			return {}
+	with pytest.raises(GmailInterrupted):
+		box._execute(Request(), quota_units=1)
+	assert not executed and limiter.consumed == 50 and now[0] < 1
+	result = box.get_messages(['a'])['a']
+	assert isinstance(result, GmailInterrupted) and result.sent is False
+	assert not box.service.batches and limiter.consumed == 50
+
+
+def test_stopped_task_does_not_consume_available_quota():
+	from gmail_clean.gmail import GmailInterrupted, QuotaLimiter
+	limiter = QuotaLimiter()
+	cancel = threading.Event()
+	cancel.set()
+	with pytest.raises(GmailInterrupted):
+		limiter.acquire(20, cancel=cancel)
+	assert limiter.consumed == 0
