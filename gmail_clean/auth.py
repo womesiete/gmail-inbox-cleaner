@@ -9,6 +9,7 @@ import ctypes
 import hashlib
 import json
 import os
+import threading
 import uuid
 import warnings
 from functools import wraps
@@ -230,15 +231,129 @@ class TokenStore:
 		self._select_backend("none")
 
 
+class CredentialSession:
+	"""One protected credential lifetime, shared by thread-local Gmail transports."""
+
+	def __init__(self) -> None:
+		self.lock = threading.RLock()
+		self._persistence_lock = threading.Lock()
+		self.credentials: Any = None
+		self.account_id: str | None = None
+		self._invalidated = threading.Event()
+
+	@property
+	def active(self) -> bool:
+		return not self._invalidated.is_set()
+
+	def invalidate(self) -> None:
+		# Do not make Disconnect/close wait for a remote refresh already holding
+		# the refresh lock. Wait only for a local save that had already begun so
+		# a reconnect/save or disconnect/delete can safely become authoritative.
+		self._invalidated.set()
+		with self._persistence_lock:
+			pass
+
+	def install(self, source: Any, store: TokenStore, refresh_token: str | None) -> Any:
+		"""Serialize provider auto-refresh as well as the initial explicit refresh."""
+		from google.auth.credentials import Credentials
+		session = self
+		observed_refresh_token = refresh_token
+
+		def invoke(method, *args, **kwargs):
+			nonlocal observed_refresh_token
+			with session.lock:
+				if not session.active:
+					from .gmail import GmailError
+					raise GmailError("auth", "The Gmail connection was disconnected or changed. Connect again or open a fresh worker.")
+				result = method(*args, **kwargs)
+				with session._persistence_lock:
+					if not session.active:
+						from .gmail import GmailError
+						raise GmailError("auth", "The Gmail connection changed while authorization was refreshed. Open a fresh worker.")
+					current_token = getattr(source, "refresh_token", None)
+					if current_token != observed_refresh_token:
+						observed_refresh_token = current_token
+						try:
+							store.save(source)
+						except Exception:  # noqa: BLE001 - failed persistence cannot invalidate a refreshed in-memory session.
+							warnings.warn("Gmail authorization refreshed, but changed credentials could not be saved. Unlock the credential backend or reconnect before restarting.", RuntimeWarning, stacklevel=3)
+				return result
+
+		class LockedCredentials(Credentials):
+			def __init__(self):
+				# Delegate token/expiry/provider properties to the one source object;
+				# initializing the base would create a second, stale token snapshot.
+				self._source = source
+
+			def __getattr__(self, name):
+				return getattr(self._source, name)
+
+			@property
+			def token(self):
+				return self._source.token
+
+			@token.setter
+			def token(self, value):
+				with session.lock:
+					self._source.token = value
+
+			@property
+			def expiry(self):
+				return self._source.expiry
+
+			@expiry.setter
+			def expiry(self, value):
+				with session.lock:
+					self._source.expiry = value
+
+			@property
+			def valid(self):
+				return self._source.valid
+
+			@property
+			def expired(self):
+				return self._source.expired
+
+			@property
+			def token_state(self):
+				return self._source.token_state
+
+			@property
+			def quota_project_id(self):
+				return self._source.quota_project_id
+
+			@property
+			def universe_domain(self):
+				return self._source.universe_domain
+
+			def refresh(self, request):
+				return invoke(self._source.refresh, request)
+
+			def before_request(self, request, method, url, headers):
+				return invoke(self._source.before_request, request, method, url, headers)
+
+			def apply(self, headers, token=None):
+				return invoke(self._source.apply, headers, token=token)
+
+		with self.lock:
+			if not self.active:
+				raise AuthenticationError("The Gmail credential session was invalidated; reconnect.")
+			self.credentials = LockedCredentials()
+			return self.credentials
+
+
 class AuthManager:
 	def __init__(self, data_dir: str | Path, retrieval_batch_size: int = 25,
-			execution_batch_size: int = 100, body_limit: int = 32_000, quota_limiter=None) -> None:
+			execution_batch_size: int = 100, body_limit: int = 32_000, quota_limiter=None,
+			credential_session: CredentialSession | None = None, cancelled=None) -> None:
 		self.quota_limiter = quota_limiter
 		self.tokens = TokenStore(data_dir)
 		self.retrieval_batch_size = retrieval_batch_size
 		self.execution_batch_size = execution_batch_size
 		self.body_limit = body_limit
 		self.credentials: Any = None
+		self.credential_session = credential_session or CredentialSession()
+		self.cancelled = cancelled
 
 	def _mailbox(self, credentials: Any) -> Any:
 		from googleapiclient.discovery import build
@@ -246,7 +361,15 @@ class AuthManager:
 		service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
 		box = GmailMailbox(service, retrieval_batch_size=self.retrieval_batch_size,
 			execution_batch_size=self.execution_batch_size, body_limit=self.body_limit, quota_limiter=self.quota_limiter)
-		box.identity()  # Verify the actually connected account, never trust a UI hint.
+		if hasattr(box, "cancelled"):
+			box.cancelled = self.cancelled
+		with self.credential_session.lock:
+			if self.credential_session.account_id is None:
+				# Verify the credential's account once per connection generation,
+				# rather than trusting the account hint written by the UI.
+				self.credential_session.account_id = box.identity()
+			else:
+				box.account_id = self.credential_session.account_id
 		self.credentials = credentials
 		return box
 
@@ -263,6 +386,9 @@ class AuthManager:
 			credentials = flow.run_local_server(port=0, access_type="offline", prompt="consent", timeout_seconds=180,
 				authorization_prompt_message="Open the browser to authorize Gmail Inbox Cleaner.",
 				success_message="Authorization complete. You may close this window.")
+			self.credential_session.invalidate()
+			self.credential_session = CredentialSession()
+			credentials = self.credential_session.install(credentials, self.tokens, credentials.refresh_token)
 			box = self._mailbox(credentials)
 			self.tokens.save(credentials)
 			return box
@@ -275,19 +401,20 @@ class AuthManager:
 		from google.oauth2.credentials import Credentials
 		from google.auth.transport.requests import Request
 		from google.auth.exceptions import RefreshError, TransportError
-		payload = self.tokens.load()
-		if not payload:
-			return None
 		try:
-			credentials = Credentials.from_authorized_user_info(payload, SCOPES)
-			if not credentials.valid:
-				credentials.refresh(Request())
+			with self.credential_session.lock:
+				if not self.credential_session.active:
+					raise AuthenticationError("The Gmail credential session was invalidated; reconnect.")
+				credentials = self.credential_session.credentials
+				if credentials is None:
+					payload = self.tokens.load()
+					if not payload:
+						return None
+					credentials = self.credential_session.install(
+						Credentials.from_authorized_user_info(payload, SCOPES), self.tokens, payload.get("refresh_token"))
+				if not credentials.valid:
+					credentials.refresh(Request())
 			box = self._mailbox(credentials)
-			if self.tokens.payload(credentials) != payload:
-				try:
-					self.tokens.save(credentials)
-				except Exception:  # noqa: BLE001 - A credential persistence failure cannot invalidate the refreshed in-memory session.
-					warnings.warn("Gmail authorization refreshed, but changed credentials could not be saved. Unlock the credential backend or reconnect before restarting.", RuntimeWarning, stacklevel=2)
 			return box
 		except AuthenticationError:
 			raise
@@ -298,8 +425,14 @@ class AuthManager:
 			if any((isinstance(value, dict) and value.get("error") == "invalid_grant")
 				or (isinstance(value, str) and "invalid_grant" in value) for value in exc.args):
 				raise AuthenticationError("Google rejected authorization (invalid_grant). Reconnect this account. External OAuth apps in Testing normally issue Gmail grants that expire after 7 days; revocation or account changes can also invalidate them.") from exc
-			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect and check your OAuth app configuration.") from exc
+			from .gmail import GmailError
+			raise GmailError("transient", "Google authorization refresh is temporarily unavailable. Retry shortly.", retry_after=getattr(exc, "retry_after", None)) from None
 		except Exception as exc:  # noqa: BLE001 - Unexpected credential errors cannot expose token/response details.
+			from .gmail import GmailError
+			if isinstance(exc, GmailError):
+				raise
+			if isinstance(exc, OSError):
+				raise GmailError("network", "The network is unavailable while refreshing Gmail authorization.") from None
 			raise AuthenticationError("Gmail authorization could not be refreshed. Reconnect; test-mode grants may expire.") from exc
 
 	def mailbox(self) -> Any:
@@ -321,5 +454,6 @@ class AuthManager:
 						raise AuthenticationError("Google could not revoke consent. Retry or remove access in your Google Account.")
 				except requests.RequestException as exc:
 					raise AuthenticationError("Consent revocation failed because of a network error.") from exc
+		self.credential_session.invalidate()
 		self.tokens.delete()
 		self.credentials = None

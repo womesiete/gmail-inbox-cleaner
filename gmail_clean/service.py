@@ -48,8 +48,8 @@ class AppService:
 		from .gmail import GmailMailbox
 		self._supplied_mailbox = mailbox is not None and not isinstance(mailbox, GmailMailbox)
 		self._ai_factory = ai_factory
-		# Only isolated AI processes are reused between Qt tasks. Each task still
-		# owns and closes its SQLite connection on the thread that opened it.
+		# Isolated AI processes and synchronized credentials outlive Qt tasks.
+		# SQLite and Gmail HTTP transports remain owned by their creating thread.
 		self._resource_owner = _worker_owner._resource_owner if _worker_owner is not None else self
 		if _worker_owner is None:
 			self._clients: dict[tuple[Any, ...], Any] = {}
@@ -60,6 +60,9 @@ class AppService:
 			self._label_cache = {}
 			self._quota_limiters = {}
 			self._label_cache_lock = threading.RLock()
+			self._credentials_lock = threading.RLock()
+			self._credential_cache = None
+			self._credential_generation = None
 		else:
 			self._clients = self._resource_owner._clients
 			self._clients_lock = self._resource_owner._clients_lock
@@ -160,10 +163,12 @@ class AppService:
 			self.reload_config()
 			if generation == self._connection_generation:
 				return False
+			self._clear_credentials(expected_generation=self._connection_generation)
 			self._close_ai()
 			self._mailbox = None
 			self._connection_generation = generation
 			return True
+		self._clear_credentials(expected_generation=self._connection_generation)
 		self._close_ai()
 		self.store.close()
 		self._mailbox = None
@@ -186,6 +191,38 @@ class AppService:
 				owner._quota_limiters[self.account_id] = QuotaLimiter()
 			return owner._quota_limiters[self.account_id]
 
+	def _clear_credentials(self, *, expected_generation=None):
+		owner = self._resource_owner
+		with owner._credentials_lock:
+			if expected_generation is not None and owner._credential_generation != expected_generation:
+				return
+			if owner._credential_cache is not None:
+				owner._credential_cache.invalidate()
+			owner._credential_cache = None
+			owner._credential_generation = None
+			from .gmail import GmailMailbox
+			for service in (self, owner):
+				if isinstance(service._mailbox, GmailMailbox):
+					service._mailbox = None
+
+	def _auth_manager(self, *, fresh=False):
+		"""Share credential refresh, never an httplib2 service, across workers."""
+		from .auth import AuthManager, CredentialSession
+		owner = self._resource_owner
+		with owner._credentials_lock:
+			if fresh:
+				session = CredentialSession()
+			else:
+				if owner._credential_cache is None or owner._credential_generation != self._connection_generation:
+					self._clear_credentials()
+					owner._credential_cache = CredentialSession()
+					owner._credential_generation = self._connection_generation
+				session = owner._credential_cache
+		return AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size,
+			execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit,
+			quota_limiter=self._quota_limiter(), credential_session=session,
+			cancelled=lambda: self._cancel_event.is_set() or owner._abort_event.is_set())
+
 	@property
 	def mailbox(self):
 		if self._closed:
@@ -194,14 +231,19 @@ class AppService:
 			state = self._connection_state()
 			if state and (not state.get("connected", True) or state.get("generation", "") != self._connection_generation or state.get("account_id", "").casefold() != self.account_id):
 				from .auth import AuthenticationError
+				self._clear_credentials(expected_generation=self._connection_generation)
 				raise AuthenticationError("The Gmail connection was disconnected or changed. Connect again or open a fresh worker.")
 		if self._mailbox is None:
-			from .auth import AuthManager
-			self._mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit, quota_limiter=self._quota_limiter()).mailbox()
-			self._check_identity()
+			mailbox = self._auth_manager().mailbox()
+			if mailbox.account_id.casefold() != self.account_id:
+				self._clear_credentials()
+				raise ValueError("The authenticated account differs from this database; reconnect explicitly")
+			self._mailbox = mailbox
 		from .gmail import GmailMailbox
 		if isinstance(self._mailbox, GmailMailbox):
 			self._mailbox.quota_limiter = self._quota_limiter()
+			if hasattr(self._mailbox, "cancelled"):
+				self._mailbox.cancelled = lambda: self._cancel_event.is_set() or self._resource_owner._abort_event.is_set()
 			self._mailbox.on_label_error = self.invalidate_labels
 			owner = self._resource_owner
 			with owner._label_cache_lock:
@@ -718,11 +760,13 @@ class AppService:
 	def connect(self, credentials_path):
 		if self.demo:
 			raise ValueError("Demo cannot authenticate to Gmail; launch Personal mode")
-		from .auth import AuthManager
 		previous_store = self.store
 		previous_account = self.account_id
 		with self.execution_lease():
-			mailbox = AuthManager(self.data_dir, retrieval_batch_size=self.config.retrieval_batch_size, execution_batch_size=self.config.execution_batch_size, body_limit=self.config.body_limit).connect(credentials_path)
+			# Fence old refreshes before a new OAuth flow can persist credentials.
+			self._clear_credentials()
+			manager = self._auth_manager(fresh=True)
+			mailbox = manager.connect(credentials_path)
 			identity = mailbox.identity().casefold()
 			new_store = Store(self._database(identity), identity)
 			saved = new_store.checkpoint("effective_preferences")
@@ -740,6 +784,11 @@ class AppService:
 			self._mailbox = mailbox
 			self._supplied_mailbox = False
 			self._write_identity()
+			owner = self._resource_owner
+			with owner._credentials_lock:
+				self._clear_credentials()
+				owner._credential_cache = manager.credential_session
+				owner._credential_generation = self._connection_generation
 		previous_store.close()
 		self.store = new_store
 		self._configure_services()
@@ -749,9 +798,9 @@ class AppService:
 	def disconnect(self, revoke=False):
 		if self.demo:
 			return {"message": "Demo has no OAuth credentials"}
-		from .auth import AuthManager
 		with self.execution_lease():
-			AuthManager(self.data_dir).disconnect(revoke=revoke)
+			self._auth_manager().disconnect(revoke=revoke)
+			self._clear_credentials()
 			self._write_identity(connected=False)
 			self._mailbox = None
 			self._close_ai()
@@ -827,6 +876,7 @@ class AppService:
 		try:
 			if self._resource_owner is self:
 				self.abort_workers()
+				self._clear_credentials()
 				self._close_ai(grace_s=0.1)
 		finally:
 			self.store.close()
