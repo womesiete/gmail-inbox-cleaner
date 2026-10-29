@@ -33,3 +33,19 @@ transitions; the TTL bounds reuse without that proof. The demo uses the same
 simulated clock for its quota limiter and cache, and a regression advances it ten
 minutes between stages. An expired history-page cursor also forces a fresh read.
 No execution or undo preflight uses this cache.
+
+## Quota preference and progress
+
+`quota_units_per_minute` defaults to 6,000 and accepts integers from 60 to
+1,000,000. Set it to the actual per-user budget assigned to your Google project;
+older projects can have a different allocation. The Settings editor persists it,
+and `--quota-units-per-minute 15000` overrides it for one invocation. All workers
+for an account share the same rolling budget. Changing the setting retains prior
+spending, and small budgets automatically split retrieval batches to fit.
+
+Progress displays consumed units and an approximate ETA; job JSON includes
+`quota_units_consumed`, `quota_usage`, and `eta_seconds`. ETA uses remaining
+stage work, the configured budget, and observed processing pace. It is an
+estimate and can increase with new discoveries, retries, provider latency, or
+changed content. Counter deltas can include concurrent worker traffic sharing
+the account budget. Provider Retry-After still governs retry deadlines.

@@ -29,6 +29,7 @@ def parser():
 	result.add_argument("--ai-module", help="External package name or standalone Python file")
 	result.add_argument("--approve-ai-module", action="store_true", help="Explicitly approve the current AI source SHA-256 after reviewing its code")
 	result.add_argument("--model", help="Exact external model identifier; empty uses the module default")
+	result.add_argument("--quota-units-per-minute", type=int, help="Gmail quota budget (60–1000000 units/minute; default 6000)")
 	result.add_argument("--credentials", type=Path, help="Installed-desktop OAuth client JSON for explicit connection")
 	result.add_argument("--live", action="store_true", help="Explicitly enable mailbox writes for this invocation")
 	result.add_argument("--max-actions", type=int, help="Maximum mailbox actions authorized for this invocation")
@@ -170,6 +171,8 @@ def _restore_before_open(args, directory):
 def main(argv=None) -> int:
 	multiprocessing.freeze_support()
 	args = parser().parse_args(argv)
+	if args.quota_units_per_minute is not None and not 60 <= args.quota_units_per_minute <= 1_000_000:
+		parser().error("--quota-units-per-minute must be 60–1000000")
 	if args.count < 1 or (args.benchmark is not None and args.benchmark < 1) or (args.max_actions is not None and args.max_actions < 1):
 		parser().error("Counts must be positive")
 	if args.headless and args.live and args.max_actions is None and not args.yes:
@@ -237,6 +240,8 @@ def main(argv=None) -> int:
 			overrides["ai_module"] = args.ai_module
 		if args.model is not None:
 			overrides["ai_model"] = args.model
+		if args.quota_units_per_minute is not None:
+			overrides["quota_units_per_minute"] = args.quota_units_per_minute
 		if overrides or args.approve_ai_module:
 			service.set_session_config(approve_ai_module=args.approve_ai_module, **overrides)
 		if args.credentials:

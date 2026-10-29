@@ -70,7 +70,7 @@ class SettingsEditor(QWidget):
 		("Execution and learning", ["dry_run", "auto_execute", "auto_label", "learning_enabled"]),
 		("External AI", ["ai_module", "ai_model", "ai_use_call_api_result", "ai_batch_size", "ai_timeout_seconds", "optional_model_routes", "estimated_cost_per_call", "max_ai_calls_per_job", "max_ai_calls_per_day", "max_ai_cost_per_job", "max_ai_cost_per_day"]),
 		("Content sharing and context", ["excluded_senders", "excluded_domains", "excluded_label_ids", "sent_context_enabled", "archived_context_enabled", "download_all_bodies", "body_limit"]),
-		("Jobs and local data", ["retrieval_batch_size", "execution_batch_size", "max_retries", "retry_base_seconds", "maintenance_interval_minutes", "reconciliation_interval_hours", "retention_days", "log_level", "shortcuts"]),
+		("Jobs and local data", ["retrieval_batch_size", "quota_units_per_minute", "metadata_cache_ttl_seconds", "execution_batch_size", "max_retries", "retry_base_seconds", "maintenance_interval_minutes", "reconciliation_interval_hours", "retention_days", "log_level", "shortcuts"]),
 	]
 
 	LABELS = {
@@ -94,6 +94,8 @@ class SettingsEditor(QWidget):
 		"max_ai_cost_per_job": "Estimated AI cost per job cap · 0 = unlimited",
 		"max_ai_cost_per_day": "Estimated AI cost per UTC day cap · 0 = unlimited",
 		"estimated_cost_per_call": "Estimated cost per attempted AI call",
+		"quota_units_per_minute": "Gmail quota budget · units per minute",
+		"metadata_cache_ttl_seconds": "Metadata cache validity · seconds (0 = disabled)",
 		"body_limit": "Maximum normalized body characters", "retention_days": "Body-cache retention · days",
 	}
 
@@ -167,7 +169,8 @@ class SettingsEditor(QWidget):
 		elif isinstance(value, int):
 			widget = QSpinBox()
 			limits = {"ai_batch_size": (1, 10), "retrieval_batch_size": (1, 50),
-				"execution_batch_size": (1, 500), "archive_threshold": (0, 100),
+				"execution_batch_size": (1, 500), "quota_units_per_minute": (60, 1_000_000),
+				"metadata_cache_ttl_seconds": (0, 300), "archive_threshold": (0, 100),
 				"keep_threshold": (0, 100), "age_archive_max_score": (0, 100)}
 			widget.setRange(*limits.get(key, (0, 10_000_000)))
 			widget.setValue(value)

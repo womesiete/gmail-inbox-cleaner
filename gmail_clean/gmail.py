@@ -37,6 +37,11 @@ class QuotaLimiter:
 		self._lock = threading.Lock()
 		self.consumed = 0
 
+	def configure(self, units_per_minute):
+		"""Change the budget without erasing quota already spent by other workers."""
+		with self._lock:
+			self.limit = int(units_per_minute)
+
 	def acquire(self, units, *, cancel=None):
 		"""Wait for budget while allowing the owning task to stop promptly.
 
@@ -302,8 +307,10 @@ class GmailMailbox:
 		"""HTTP multipart batches have per-part results; transport success is not item success."""
 		ids = list(dict.fromkeys(ids))
 		results: dict[str, Message | Exception] = {}
-		for offset in range(0, len(ids), self.retrieval_batch_size):
-			batch_ids = ids[offset:offset + self.retrieval_batch_size]
+		units = 60 if body else 20
+		batch_size = min(self.retrieval_batch_size, max(1, self.quota_limiter.limit // units))
+		for offset in range(0, len(ids), batch_size):
+			batch_ids = ids[offset:offset + batch_size]
 			raw: dict[str, dict | Exception] = {}
 			def callback(request_id: str, response: dict | None, exception: Exception | None, raw=raw) -> None:
 				raw[request_id] = translate_error(exception) if exception is not None else (response or {})

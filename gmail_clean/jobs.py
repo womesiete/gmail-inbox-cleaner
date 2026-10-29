@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import random
+import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
@@ -35,6 +36,8 @@ class JobRunner:
 		self._auth_paused_items: set[tuple[str, str, str]] = set()
 		self._metadata_caches: dict[str, StageMetadataCache] = {}
 		self._stage_cache: StageMetadataCache | None = None
+		self._quota_active: tuple[str, int] | None = None
+		self._run_started = time.monotonic()
 
 	def new(self) -> str:
 		config = self.s.config
@@ -313,7 +316,7 @@ class JobRunner:
 					self.save_payload(job, payload)
 				if progress:
 					count = self.db.one("SELECT count(*) n FROM work_items WHERE job_id=?", (job,))["n"]
-					progress(f"Discovery: {count:,} durable candidate IDs")
+					progress(self.progress_text(job, f"Discovery: {count:,} durable candidate IDs"))
 				if payload["enumerated"]:
 					break
 		# Reconcile arrivals/removals DURING non-atomic enumeration before any mutations.
@@ -398,10 +401,12 @@ class JobRunner:
 	def record_quota(self, job, stage):
 		limiter = getattr(self.s.mailbox, "quota_limiter", None)
 		before = getattr(limiter, "consumed", 0)
+		self._quota_active = (stage, before)
 		try:
 			yield
 		finally:
 			used = getattr(limiter, "consumed", 0) - before
+			self._quota_active = None
 			payload = self.payload(job)
 			usage = payload.setdefault("quota_usage", {})
 			usage[stage] = usage.get(stage, 0) + used
@@ -474,7 +479,7 @@ class JobRunner:
 					continue
 			if progress:
 				counts = self.summary(job)
-				progress(f"{stage.title()}: {counts['completed']:,} stages completed; {counts['failed']:,} errors")
+				progress(self.progress_text(job, f"{stage.title()}: {counts['completed']:,} stages completed; {counts['failed']:,} errors"))
 
 	def _record_batch_result(self, job: str, stage: str, rows: list[dict], config: Config) -> None:
 		"""Recover a throttled batch size only after durable, consecutive clean batches."""
@@ -1085,6 +1090,12 @@ class JobRunner:
 		self.db.execute("UPDATE messages SET decision='review' WHERE id=? AND (decision IS NULL OR decision='pending')", (row["message_id"],))
 		self.s.error(row["stage"], exc, job_id=job, message_id=row["message_id"])
 
+	def progress_text(self, job: str, text: str) -> str:
+		status = self.summary(job)
+		eta = status["eta_seconds"]
+		duration = f"{eta // 3600}h {(eta % 3600) // 60}m" if eta >= 3600 else f"{eta // 60}m {eta % 60}s"
+		return f"{text}; quota {status['quota_units_consumed']:,} units; ETA ~{duration}"
+
 	def summary(self, job: str) -> dict:
 		result = {"id": job, "completed": 0, "failed": 0, "pending": 0, "retry": 0}
 		for row in self.db.query("SELECT state,count(*) n FROM work_items WHERE job_id=? GROUP BY state", (job,)):
@@ -1094,8 +1105,21 @@ class JobRunner:
 		payload = self.payload(job)
 		if payload.get("ai_usage"):
 			result["ai_usage"] = payload["ai_usage"]
-		if payload.get("quota_usage"):
-			result["quota_usage"] = {**payload["quota_usage"], "total": sum(payload["quota_usage"].values())}
+		usage = dict(payload.get("quota_usage", {}))
+		if self._quota_active is not None:
+			stage, before = self._quota_active
+			limiter = getattr(self.s.mailbox, "quota_limiter", None)
+			usage[stage] = usage.get(stage, 0) + max(0, getattr(limiter, "consumed", 0) - before)
+		if usage:
+			result["quota_usage"] = {**usage, "total": sum(usage.values())}
+		result["quota_units_consumed"] = sum(usage.values())
+		remaining = self.db.query("SELECT stage,count(*) n FROM work_items WHERE job_id=? AND state IN ('pending','retry','running') GROUP BY stage", (job,))
+		weights = {"metadata": 124, "body": 62, "classification": 2} if self.s.config.metadata_cache_ttl_seconds else {"metadata": 240, "body": 180, "classification": 60}
+		units_left = sum(row["n"] * weights.get(row["stage"], 0) for row in remaining)
+		quota_eta = units_left * 60 / self.s.config.quota_units_per_minute
+		elapsed = max(0, time.monotonic() - self._run_started)
+		processing_eta = elapsed * sum(row["n"] for row in remaining) / result["completed"] if result["completed"] else 0
+		result["eta_seconds"] = round(max(quota_eta, processing_eta)) if remaining else 0
 		pause = payload.get("pause")
 		if pause:
 			result["pause"] = pause

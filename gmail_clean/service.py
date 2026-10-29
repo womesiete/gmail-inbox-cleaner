@@ -188,7 +188,9 @@ class AppService:
 		owner = self._resource_owner
 		with owner._label_cache_lock:
 			if self.account_id not in owner._quota_limiters:
-				owner._quota_limiters[self.account_id] = QuotaLimiter()
+				owner._quota_limiters[self.account_id] = QuotaLimiter(self.config.quota_units_per_minute)
+			else:
+				owner._quota_limiters[self.account_id].configure(self.config.quota_units_per_minute)
 			return owner._quota_limiters[self.account_id]
 
 	def _clear_credentials(self, *, expected_generation=None):
@@ -253,6 +255,8 @@ class AppService:
 			self._mailbox.body_limit = self.config.body_limit
 			self._mailbox.retrieval_batch_size = self.config.retrieval_batch_size
 			self._mailbox.execution_batch_size = self.config.execution_batch_size
+		if self.demo and getattr(self._mailbox, "quota_limiter", None) is not None:
+			self._mailbox.quota_limiter.configure(self.config.quota_units_per_minute)
 		return self._mailbox
 
 	def _check_identity(self):
