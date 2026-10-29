@@ -43,7 +43,7 @@ def test_ten_minute_transport_outage_never_exhausts_item_attempts(tmp_path, monk
 		service.store.close()
 
 
-@pytest.mark.parametrize("kind", ["auth", "permission"])
+@pytest.mark.parametrize("kind", ["auth", "permission", "alternating"])
 def test_repeated_poison_item_pauses_fail_only_that_item_after_explicit_resumes(tmp_path, kind):
 	service = PipelineService(tmp_path / "poison.sqlite", [mail("bad"), mail("good")])
 	try:
@@ -51,10 +51,14 @@ def test_repeated_poison_item_pauses_fail_only_that_item_after_explicit_resumes(
 		service.mailbox.retrieval_errors["bad"] = GmailError(kind, "Synthetic item-specific access problem")
 		runner = JobRunner(service)
 		job = runner.new()
-		for _ in range(runner.POISON_RESUME_LIMIT):
+		for resume in range(runner.POISON_RESUME_LIMIT):
+			current_kind = ("auth" if resume % 2 == 0 else "permission") if kind == "alternating" else kind
+			service.mailbox.retrieval_errors["bad"] = GmailError(current_kind, "Synthetic item-specific access problem")
 			result = runner.run(job)
 			assert result["state"] == "paused" and result["failed"] == 0
 			assert runner.retry_deadline(job) is None
+		if kind == "alternating":
+			service.mailbox.retrieval_errors["bad"] = GmailError("permission", "Synthetic item-specific access problem")
 		result = runner.run(job)
 		assert result["state"] == "completed" and result["failed"] == 1
 		assert service.store.one("SELECT state FROM work_items WHERE message_id='bad'")["state"] == "failed"
@@ -138,5 +142,67 @@ def test_rate_limit_shrink_recovers_after_clean_batches_and_survives_runner_rest
 		assert max(metadata_sizes) == service.config.retrieval_batch_size
 		assert "batch_sizes" not in runner.payload(job)
 		assert "batch_clean" not in runner.payload(job)
+	finally:
+		service.store.close()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, OverflowError])
+def test_untyped_discovery_failure_keeps_a_bounded_system_retry_budget(tmp_path, monkeypatch, error_type):
+	service = PipelineService(tmp_path / "unexpected.sqlite", [mail("target")])
+	try:
+		service.config.max_retries = 1
+		def fail_discovery(*args, **kwargs):
+			raise error_type("Synthetic local discovery failure")
+		monkeypatch.setattr(service.mailbox, "list_messages", fail_discovery)
+		runner = JobRunner(service)
+		job = runner.new()
+		first = runner.run(job)
+		assert first["state"] == "paused" and first["pause"]["kind"] == "unexpected"
+		service.now = runner.retry_deadline(job)
+		result = runner.run(job)
+		assert result["state"] == "paused"
+		assert result["pause"]["attempts"] == 2
+		assert runner.retry_deadline(job) is None
+		assert "transport_failures" not in runner.payload(job)
+	finally:
+		service.store.close()
+
+
+@pytest.mark.parametrize("stage", ["discovery", "metadata"])
+@pytest.mark.parametrize("kind,delay", [("network", float("inf")), ("transient", 1e308), ("rate_limit", float("nan")), ("quota", -1), ("network", "invalid"), ("network", True)])
+def test_unusable_provider_delay_requires_manual_resume_without_an_earlier_retry(tmp_path, monkeypatch, stage, kind, delay):
+	service = PipelineService(tmp_path / "bad-delay.sqlite", [mail("target")])
+	try:
+		error = GmailError(kind, "Synthetic provider delay failure", retry_after=delay)
+		if stage == "discovery":
+			def fail_discovery(*args, **kwargs):
+				raise error
+			monkeypatch.setattr(service.mailbox, "list_messages", fail_discovery)
+		else:
+			service.mailbox.retrieval_errors["target"] = error
+		runner = JobRunner(service)
+		job = runner.new()
+		result = runner.run(job)
+		assert result["state"] == "paused" and result["pause"]["kind"] == "retry_metadata"
+		assert result["pause"]["due"] is None
+		assert runner.retry_deadline(job) is None
+		assert not service.ai.calls
+		if stage == "metadata":
+			assert service.store.one("SELECT state,attempts FROM work_items WHERE job_id=?", (job,)) == {"state": "pending", "attempts": 0}
+	finally:
+		service.store.close()
+
+
+def test_invalid_delay_flag_survives_an_exception_boundary_that_removed_the_value(tmp_path):
+	service = PipelineService(tmp_path / "invalid-flag.sqlite", [mail("target")])
+	try:
+		error = GmailError("transient", "Synthetic invalid delay marker")
+		error.retry_after_invalid = True
+		service.mailbox.retrieval_errors["target"] = error
+		runner = JobRunner(service)
+		job = runner.new()
+		result = runner.run(job)
+		assert result["state"] == "paused" and result["pause"]["kind"] == "retry_metadata"
+		assert runner.retry_deadline(job) is None
 	finally:
 		service.store.close()

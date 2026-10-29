@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import random
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,7 @@ class JobRunner:
 	TRANSPORT_FAILURE_THRESHOLD = 3
 	POISON_RESUME_LIMIT = 3
 	CLEAN_BATCHES_FOR_GROWTH = 3
+	MAX_RETRY_AFTER_SECONDS = 366 * 24 * 3600
 
 	def __init__(self, service: AppService):
 		self.s = service
@@ -859,7 +861,7 @@ class JobRunner:
 		if changed:
 			self.save_payload(job, payload)
 
-	def _transport_wait(self, job: str, kind: str, exc: Exception, config: Config) -> str:
+	def _transport_wait(self, job: str, kind: str, retry_after: float, config: Config) -> str:
 		"""Outages use durable job waits, never an individual item's retry budget.
 
 		A multipart failure shares one backoff round. Brief failures allow other
@@ -872,7 +874,7 @@ class JobRunner:
 		if backoff.get("kind") not in {"network", "transient"} or not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
 			streak = int(payload.get("transport_failures", 0)) + 1
 			payload["transport_failures"] = streak
-			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(streak, 8) + random.random()))  # noqa: S311 - retry jitter affects scheduling only, never security decisions
+			delay = max(retry_after, min(300, config.retry_base_seconds * 2 ** min(streak, 8) + random.random()))  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 			backoff = {"kind": kind, "due": stamp(self.s.clock() + timedelta(seconds=delay)), "attempts": streak}
 			payload["backoff"] = backoff
 			self.save_payload(job, payload)
@@ -888,10 +890,30 @@ class JobRunner:
 		previous = item.get("auth_pauses", {})
 		if previous.get("generation") == generation:
 			return int(previous.get("resumes", 0)) >= self.POISON_RESUME_LIMIT
-		resumes = int(previous.get("resumes", 0)) + 1 if previous.get("generation") == generation - 1 and previous.get("kind") == kind else 0
+		resumes = int(previous.get("resumes", 0)) + 1 if previous.get("generation") == generation - 1 else 0
 		item["auth_pauses"] = {"kind": kind, "generation": generation, "resumes": resumes}
 		self.db.execute("UPDATE work_items SET payload_json=? WHERE id=?", (encode(item), row["id"]))
 		return resumes >= self.POISON_RESUME_LIMIT
+
+	def _checked_retry_after(self, job: str, exc: Exception) -> float | None:
+		"""Invalid provider timing requires explicit intervention, never an earlier retry.
+
+		A delay beyond a year is not actionable for this job's frozen mailbox
+		window. Preserve conservative behavior by pausing instead of clamping a
+		provider's requested delay or overflowing the durable deadline.
+		"""
+		value = getattr(exc, "retry_after", None)
+		try:
+			if getattr(exc, "retry_after_invalid", False) or isinstance(value, bool):
+				raise ValueError("Invalid provider delay metadata")
+			delay = 0.0 if value is None else float(value)
+			if not math.isfinite(delay) or not 0 <= delay <= self.MAX_RETRY_AFTER_SECONDS:
+				raise ValueError("Provider delay is outside the scheduling range")
+			self.s.clock() + timedelta(seconds=delay)
+		except (TypeError, ValueError, OverflowError):
+			self.pause_system(job, "retry_metadata", "The provider returned an invalid or excessively long retry delay. Check the provider and resume this job explicitly.")
+			return None
+		return delay
 
 	def _pause_interrupted(self, job: str, reason: str) -> None:
 		payload = self.payload(job)
@@ -920,15 +942,21 @@ class JobRunner:
 
 	def handle_exception(self, job: str, exc: Exception, config: Config) -> None:
 		"""Keep operational pauses distinct from the user's explicit pause."""
-		kind = getattr(exc, "kind", "") or ("rate_limit" if getattr(exc, "category", "") == "RateLimitError" else "network")
+		kind = getattr(exc, "kind", "") or ("rate_limit" if getattr(exc, "category", "") == "RateLimitError" else "unexpected")
 		if getattr(exc, "configuration", False):
 			kind = "configuration"
 		reason = safe_error(exc)
 		if kind == "interrupted":
 			self._pause_interrupted(job, reason)
 			return
+		if getattr(exc, "category", "") in {"AIAPIsError", "UnknownProviderError", "InterruptedRequest"}:
+			self.pause_system(job, "provider", reason)
+			return
+		retry_after = self._checked_retry_after(job, exc)
+		if retry_after is None:
+			return
 		if kind in {"network", "transient"}:
-			self._transport_wait(job, kind, exc, config)
+			self._transport_wait(job, kind, retry_after, config)
 			self.db.execute("UPDATE jobs SET state='waiting' WHERE id=?", (job,))
 			return
 		if kind in {"auth", "permission", "account", "configuration", "data"}:
@@ -936,7 +964,7 @@ class JobRunner:
 			return
 		if kind == "quota":
 			now = self.s.clock()
-			reset = float(getattr(exc, "retry_after", 0) or 0)
+			reset = retry_after
 			quota_due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
 			self.pause_system(job, kind, reason, due=quota_due)
 			return
@@ -944,7 +972,7 @@ class JobRunner:
 		attempt = int(payload.get("system_retries", 0)) + 1
 		payload["system_retries"] = attempt
 		self.save_payload(job, payload)
-		delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
+		delay = max(retry_after, min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 		due = stamp(self.s.clock() + timedelta(seconds=delay)) if attempt <= config.max_retries else None
 		self.pause_system(job, kind, reason, due=due, attempts=attempt)
 
@@ -966,19 +994,23 @@ class JobRunner:
 			self.done(job, row["message_id"], row["stage"])
 			return
 		reason = safe_error(exc)
+		retry_after = self._checked_retry_after(job, exc)
 		attempt = current["attempts"]
 		due = None
 		state = "pending"
-		if kind == "interrupted":
+		if retry_after is None:
+			# The checked scheduler has persisted a manual system pause.
+			pass
+		elif kind == "interrupted":
 			self._pause_interrupted(job, reason)
 		elif kind in {"network", "transient"}:
-			due = self._transport_wait(job, kind, exc, config)
+			due = self._transport_wait(job, kind, retry_after, config)
 			state = "retry"
 		elif kind in {"auth", "permission", "account", "configuration", "quota"}:
 			if kind in {"auth", "permission"} and self._poison_item(job, row, kind):
 				state = "failed"
 			elif kind == "quota":
-				reset = float(getattr(exc, "retry_after", 0) or 0)
+				reset = retry_after
 				now = self.s.clock()
 				due = stamp(now + timedelta(seconds=reset)) if reset else stamp((now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
 			if state != "failed":
@@ -989,7 +1021,7 @@ class JobRunner:
 			payload.setdefault("batch_clean", {})[row["stage"]] = 0
 			if backoff.get("kind") != "rate_limit" or not backoff.get("due") or datetime.fromisoformat(backoff["due"]) <= self.s.clock():
 				round_number = (int(backoff.get("attempts", 0)) if backoff.get("kind") == "rate_limit" else 0) + 1
-				delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
+				delay = max(retry_after, min(300, config.retry_base_seconds * 2 ** min(round_number, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 				batch_size = config.ai_batch_size if row["stage"] == "classification" else config.retrieval_batch_size
 				sizes = payload.setdefault("batch_sizes", {})
 				sizes[row["stage"]] = max(1, sizes.get(row["stage"], batch_size) // 2)
@@ -1006,7 +1038,7 @@ class JobRunner:
 			attempt += 1
 			unknown = getattr(exc, "category", "") in {"AIAPIsError", "UnknownProviderError", "InterruptedRequest"}
 			retry = kind != "data" and not unknown and attempt <= config.max_retries
-			delay = max(float(getattr(exc, "retry_after", 0) or 0), min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
+			delay = max(retry_after, min(300, config.retry_base_seconds * 2 ** min(attempt, 8)) + random.random())  # noqa: S311 - retry jitter affects scheduling only, never security decisions
 			due = stamp(self.s.clock() + timedelta(seconds=delay)) if retry else None
 			state = "retry" if retry else "failed"
 		self.db.execute("UPDATE work_items SET state=?,attempts=?,next_attempt_utc=?,error=? WHERE id=?", (state, attempt, due, reason, row["id"]))
