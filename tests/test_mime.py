@@ -111,3 +111,42 @@ def test_base64_normalization_still_rejects_malformed_transfer_data(value):
 		decode_base64url(value)
 	parsed = parse_body({"mimeType": "text/plain", "body": {"data": value}})
 	assert parsed.missing and not parsed.text
+
+
+def test_browser_view_plain_stub_uses_substantive_html_without_following_links():
+	text = "Your completed statement is available. " + "No reply is required. " * 8
+	payload = {"mimeType": "multipart/alternative", "parts": [
+		part("text/plain", "View this email in your browser: https://example.invalid/view"),
+		part("text/html", f"<p>{text}</p>"),
+	]}
+	parsed = parse_body(payload)
+	assert parsed.text == text.strip()
+	assert not parsed.missing
+
+
+def test_stub_does_not_replace_plain_with_an_even_less_informative_html_alternative():
+	payload = {"mimeType": "multipart/alternative", "parts": [
+		part("text/plain", "View in browser"), part("text/html", "<p>Hi</p>"),
+	]}
+	assert parse_body(payload).text == "View in browser"
+
+
+@pytest.mark.parametrize("tag", ["head", "object", "noscript"])
+def test_unclosed_non_executable_block_recovers_later_visible_body_with_review_flag(tag):
+	parsed = parse_body(part("text/html", f"<{tag}>not visible<p>Actual message</p><p>Reply tomorrow</p>"))
+	assert parsed.text == "Actual message\n\nReply tomorrow"
+	assert parsed.truncated and not parsed.missing
+	assert "not visible" not in parsed.text
+
+
+def test_unclosed_head_keeps_script_and_style_inert_while_recovering_body():
+	parsed = parse_body(part("text/html", "<head><style>p{color:red}</style><script>danger()</script><body><p>Visible</p>"))
+	assert parsed.text == "Visible"
+	assert parsed.truncated
+	assert "danger" not in parsed.text and "color" not in parsed.text
+
+
+def test_well_formed_block_fallback_is_not_recovered_or_misclassified_as_visible():
+	parsed = parse_body(part("text/html", "<object><p>Hidden fallback</p></object><p>Visible</p>"))
+	assert parsed.text == "Visible"
+	assert not parsed.truncated

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from bisect import bisect_left
 import re
 from dataclasses import dataclass, field
 from email.message import Message as HeaderMessage
@@ -89,6 +90,49 @@ class _TextParser(HTMLParser):
 			self.output.append(data)
 
 
+def _parse_html(value: str) -> tuple[_TextParser, bool]:
+	"""Recover visible body boundaries after unclosed non-executable blocks.
+
+	Only head/object/noscript are repaired. Script/style remain inert even when
+	malformed; guessed recovery is always incomplete evidence requiring review.
+	"""
+	pending: dict[str, list[re.Match[str]]] = {tag: [] for tag in ("head", "object", "noscript")}
+	for match in re.finditer(r"<\s*(/?)\s*(head|object|noscript)\b[^>]*>", value, re.IGNORECASE):
+		tag = match[2].casefold()
+		if match[1]:
+			if pending[tag]:
+				pending[tag].pop()
+		elif not match[0].rstrip().endswith("/>"):
+			pending[tag].append(match)
+	boundaries = [match.start() for match in re.finditer(r"<\s*(?:body|p|div|section|article|main|table|h[1-6]|ul|ol|blockquote)\b", value, re.IGNORECASE)]
+	insertions: dict[int, list[str]] = {}
+	for opening in sorted((match for matches in pending.values() for match in matches), key=lambda item: item.start(), reverse=True):
+		index = bisect_left(boundaries, opening.end())
+		if index < len(boundaries):
+			insertions.setdefault(boundaries[index], []).append(f"</{opening[2]}>")
+	if insertions:
+		pieces = []
+		previous = 0
+		for position, closings in sorted(insertions.items()):
+			pieces.append(value[previous:position])
+			pieces.extend(closings)
+			previous = position
+		pieces.append(value[previous:])
+		value = "".join(pieces)
+	parser = _TextParser()
+	parser.feed(value)
+	parser.close()
+	return parser, bool(insertions)
+
+
+def _plain_stub(value: str) -> bool:
+	"""Short HTML/browser-view notices are not substantive plain alternatives."""
+	return len(value) <= 240 and bool(re.search(
+		r"\b(?:view|read|open)\b.{0,50}\b(?:browser|online)\b"
+		r"|\b(?:html|rich.text)\b.{0,50}\b(?:version|only|support|client)\b"
+		r"|\b(?:does not|doesn't|cannot)\b.{0,30}\b(?:support|display)\b.{0,30}\bhtml\b", value, re.IGNORECASE))
+
+
 def normalize_text(value: str) -> str:
 	value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
 	value = value.translate(str.maketrans("", "", "\u200b\u200c\u200d\ufeff\u2060\u00ad"))
@@ -98,9 +142,7 @@ def normalize_text(value: str) -> str:
 
 
 def html_to_text(value: str) -> str:
-	parser = _TextParser()
-	parser.feed(value)
-	parser.close()
+	parser, _ = _parse_html(value)
 	return normalize_text("".join(parser.output))
 
 
@@ -160,13 +202,21 @@ def parse_body(payload: dict, fetch_text_attachment: Callable[[str], dict] | Non
 			return ""
 		children = part.get("parts") or []
 		if mime == "multipart/alternative":
-			# Do not download HTML tracking alternatives when useful plain text exists.
+			# Useful plain text still avoids HTML downloads. A browser-view stub
+			# may fall back to materially longer HTML, without following its URL.
 			ordered = sorted(children, key=lambda p: str(p.get("mimeType", "")) != "text/plain")
+			fallback = ""
 			for child in ordered:
 				text = walk(child, depth + 1)
-				if text.strip():
+				if not text.strip():
+					continue
+				if not fallback:
+					fallback = text
+					if str(child.get("mimeType", "")).casefold() != "text/plain" or not _plain_stub(text):
+						return text
+				elif str(child.get("mimeType", "")).casefold() == "text/html" and len(text) >= max(80, len(fallback) * 2):
 					return text
-			return ""
+			return fallback
 		if children:
 			return "\n\n".join(filter(None, (walk(child, depth + 1) for child in children)))
 		if mime not in {"text/plain", "text/html"}:
@@ -214,10 +264,8 @@ def parse_body(payload: dict, fetch_text_attachment: Callable[[str], dict] | Non
 				except UnicodeDecodeError:
 					continue
 		if mime == "text/html":
-			parser = _TextParser()
-			parser.feed(text)
-			parser.close()
-			result.truncated = result.truncated or bool(parser.blocked)
+			parser, recovered = _parse_html(text)
+			result.truncated = result.truncated or recovered or bool(parser.blocked)
 			if parser.hidden_content and "hidden_content" not in result.content_flags:
 				result.content_flags.append("hidden_content")
 			return normalize_text("".join(parser.output))
