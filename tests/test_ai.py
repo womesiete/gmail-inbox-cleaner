@@ -257,8 +257,8 @@ def test_demo_direct_contract_is_a_string():
 def test_read_only_context_is_distinct_and_never_becomes_a_target():
 	target = message()
 	context = message("sent-message", labels={"SENT"}, body="I already completed this task.")
-	prompt, _ = build_prompt([target], [], context_messages=[context])
-	data = json.loads(prompt.split("UNTRUSTED_JSON_DATA_START\n", 1)[1].rsplit("\nUNTRUSTED_JSON_DATA_END", 1)[0])
+	built = build_prompt([target], [], context_messages=[context])
+	data = built.payload
 	assert [m["message_id"] for m in data["messages"]] == ["a"]
 	assert [m["message_id"] for m in data["read_only_context"]] == ["sent-message"]
 	with AIClient("gmail_clean.demo_ai") as client:

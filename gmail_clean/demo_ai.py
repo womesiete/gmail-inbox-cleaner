@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 import time
 
 DEFAULT_MODEL = "demo-default"
@@ -43,10 +44,15 @@ class ModelResult:
 
 
 def _payload(prompt: str) -> dict:
-	start = "UNTRUSTED_JSON_DATA_START\n"
-	end = "\nUNTRUSTED_JSON_DATA_END"
-	if start in prompt and end in prompt:
-		return json.loads(prompt.split(start, 1)[1].rsplit(end, 1)[0])
+	# The demo decodes only the application's request-specific, anchored envelope.
+	boundary = re.search(r"\nUNTRUSTED_JSON_DATA_START_([0-9a-f]{32})\n", prompt)
+	if boundary:
+		end = "\nUNTRUSTED_JSON_DATA_END_" + boundary.group(1)
+		if prompt.endswith(end):
+			try:
+				return json.loads(prompt[boundary.end():-len(end)])
+			except (ValueError, TypeError):
+				return {"messages": []}
 	try:
 		return json.loads(prompt)
 	except (ValueError, TypeError):
