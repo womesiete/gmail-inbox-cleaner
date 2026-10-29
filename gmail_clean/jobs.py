@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
 from .ai import PROMPT_VERSION
-from .domain import Assessment, Config, Message, Window, content_excluded, content_hash, context_hash, epoch_ms, recommend, resolve_age_cutoff, resolve_window
+from .domain import Assessment, Config, Message, Window, content_excluded, content_hash, context_hash, epoch_ms, message_safety_flags, recommend, resolve_age_cutoff, resolve_window
 from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
@@ -510,6 +510,7 @@ class JobRunner:
 					continue
 				if old and old.headers == message.headers and old.internal_ms == message.internal_ms:
 					message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
+					message.content_flags = list(old.content_flags)
 					message.context_version = old.context_version
 					message.content_hash = old.content_hash
 				self.db.upsert_message(message)
@@ -551,7 +552,7 @@ class JobRunner:
 					self.fail(job, row, exc, config)
 					continue
 				direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-				if direct.action in {"keep", "skip", "archive"}:
+				if direct.action in {"keep", "skip", "archive"} or message_safety_flags(message):
 					self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
 					if config.download_all_bodies:
 						row["payload_json"] = encode({"download_only": True})
@@ -619,6 +620,7 @@ class JobRunner:
 		message.context_version = context_hash(members, config.sent_context_enabled)
 		if old and old.internal_ms == message.internal_ms and old.headers == message.headers:
 			message.body, message.truncated, message.missing_content = old.body, old.truncated, old.missing_content
+			message.content_flags = list(old.content_flags)
 		if len(message.body or "") > config.body_limit:
 			message.body = message.body[:config.body_limit]
 			message.truncated = True
@@ -638,7 +640,7 @@ class JobRunner:
 			return
 		override = self.s.override(message)
 		direct = recommend(message, None, config, window, manual_override=override, rules=self.s.rules())
-		if direct.action in {"keep", "skip", "archive"}:
+		if direct.action in {"keep", "skip", "archive"} or message_safety_flags(message):
 			self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
 			if config.download_all_bodies and not message.body and not self.excluded(message, config):
 				self.queue_body(job, message.id, download_only=True)
@@ -741,6 +743,7 @@ class JobRunner:
 			return None
 		if stored and stored.internal_ms == message.internal_ms and stored.headers == message.headers:
 			message.body, message.truncated, message.missing_content = stored.body, stored.truncated, stored.missing_content
+			message.content_flags = list(stored.content_flags)
 			message.context_version, message.content_hash = stored.context_version, stored.content_hash
 		self.db.upsert_message(message)
 		if not stored or not self.s.eligible(message, window) or self.excluded(message, config):
@@ -766,7 +769,7 @@ class JobRunner:
 			self.fail(job, row, exc, config)
 			return None
 		direct = recommend(message, None, config, window, manual_override=self.s.override(message), rules=self.s.rules())
-		if direct.action in {"keep", "skip", "archive"}:
+		if direct.action in {"keep", "skip", "archive"} or message_safety_flags(message):
 			self.save_recommendation(job, message, None, direct.action, direct.reason, window, label_ids=direct.label_ids, approval="manual" if direct.evidence_source == "manual" else "automatic")
 			self.done(job, message.id, "classification")
 			return None

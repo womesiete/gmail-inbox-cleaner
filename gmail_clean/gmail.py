@@ -293,7 +293,7 @@ class GmailMailbox:
 			snippet=str(item.get("snippet", "")), body=parsed.text if parsed else None,
 			truncated=parsed.truncated if parsed else False,
 			missing_content=parsed.missing if parsed else True, account_id=self.account_id or "",
-			attachments=parsed.attachments if parsed else [])
+			attachments=parsed.attachments if parsed else [], content_flags=parsed.content_flags if parsed else [])
 
 	def get_message(self, message_id: str, body: bool = False) -> Message:
 		return self._decode(self._execute(self._request(message_id, body), quota_units=60 if body else 20), body)

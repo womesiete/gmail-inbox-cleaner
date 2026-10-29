@@ -918,6 +918,7 @@ def test_simulation_flip_at_last_checkpoint_blocks_network_write(app, expected_m
 	assert not app.store.one("SELECT id FROM attempts")
 
 
+
 @pytest.mark.parametrize('kind, expected', [('network', 'retry'), ('permission', 'conflict'), ('interrupted', 'retry')])
 def test_unsent_write_failure_closes_attempt_without_uncertainty(app, kind, expected):
 	from gmail_clean.gmail import GmailError, PreSendError
@@ -963,3 +964,24 @@ def test_rejected_write_catalog_recovery_failure_does_not_leave_sending_attempt(
 	assert state(app, aid)['state'] == 'retry'
 	assert app.store.one('SELECT state FROM attempts')['state'] == 'not_applied'
 	assert not app.store.one("SELECT id FROM attempts WHERE state='sending'")
+
+@pytest.mark.parametrize("flag", ["hidden_content", "instruction_like_content"])
+def test_content_safety_guard_blocks_older_automatic_plans_before_attempts(app, flag):
+	message = seed(app)
+	aid = plan(app, message)
+	message.content_flags = [flag]
+	app.store.upsert_message(message)
+	app.actions.apply([aid])
+	assert state(app, aid)["state"] == "stale"
+	assert app.mailbox.calls == []
+	assert app.store.one("SELECT count(*) n FROM attempts")["n"] == 0
+
+
+def test_deliberate_current_item_manual_choice_can_override_content_review(app):
+	message = seed(app)
+	message.content_flags = ["hidden_content"]
+	app.store.upsert_message(message)
+	aid = plan(app, message, approval="manual")
+	assert app.actions.apply([aid])["applied"] == 1
+	assert app.store.get_message(message.id).content_flags == ["hidden_content"]
+

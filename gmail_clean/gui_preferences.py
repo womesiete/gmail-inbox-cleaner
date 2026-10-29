@@ -150,7 +150,15 @@ class SettingsEditor(QWidget):
 		save.clicked.connect(self._save)
 		buttons.addWidget(save)
 		outer.addLayout(buttons)
+		self.batch_warning = QLabel("Sharing multiple messages in one AI prompt can let one message influence another. Keep this at 1 for strongest isolation; flagged content is never shared.", wordWrap=True)
+		outer.insertWidget(2, self.batch_warning)
+		batch_control = self.controls["ai_batch_size"][0]
+		batch_control.valueChanged.connect(self._update_batch_warning)
+		self._update_batch_warning(batch_control.value())
 		self._preview()
+
+	def _update_batch_warning(self, value):
+		self.batch_warning.setVisible(value > 1)
 
 	def _control(self, key, value):
 		if isinstance(value, bool):

@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Any, Iterable, cast
 from uuid import uuid4
 
-from .domain import Assessment, domain_matches
+from .domain import Assessment, domain_matches, message_safety_flags
 
 if sys.platform == "win32":
 	from multiprocessing.connection import PipeConnection as WorkerConnection
@@ -326,6 +326,8 @@ def build_prompt(messages: list[Any], labels: list[dict[str, Any]], examples: li
 	"""
 	if not 1 <= len(messages) <= 10:
 		raise ValueError("AI prompt batch size must be between 1 and 10")
+	if len(messages) > 1 and any(message_safety_flags(message) for message in messages):
+		raise ValueError("Flagged content requires isolated review before prompt construction")
 	exclusions = exclusions or {}
 	payload_messages = []
 	excluded_ids = []
@@ -340,7 +342,7 @@ def build_prompt(messages: list[Any], labels: list[dict[str, Any]], examples: li
 		payload_messages.append({"message_id": mid, "thread_id": str(_attr(message, "thread_id", "") or ""), "internal_date_ms": _attr(message, "internal_ms", 0), "headers": headers, "label_ids": sorted(_attr(message, "labels", []) or []), "body": body[:MAX_BODY_CHARS], "body_truncated": bool(_attr(message, "truncated", False)) or len(body) > MAX_BODY_CHARS, "missing_content": bool(_attr(message, "missing_content", False)), "context_version": _attr(message, "context_version", "")})
 	filtered_examples = []
 	for example in examples or []:
-		if _excluded(example, exclusions):
+		if _excluded(example, exclusions) or message_safety_flags(example):
 			continue
 		# The learning layer selects relevance. Only explicit reviewed semantics are
 		# included, never arbitrary hidden fields from the operational database.
@@ -366,7 +368,7 @@ def build_prompt(messages: list[Any], labels: list[dict[str, Any]], examples: li
 		if context_id in target_ids:
 			# A target's own content is already represented and is not omitted context.
 			continue
-		if index >= 20 or not context_id or _excluded(context, exclusions):
+		if index >= 20 or not context_id or _excluded(context, exclusions) or message_safety_flags(context):
 			mark_context_incomplete(context)
 			continue
 		body = _attr(context, "body", "") or ""
@@ -657,6 +659,27 @@ class AIClient:
 			return AIResponse(packet["text"], metadata)
 
 	def assess(self, messages: list[Any], labels: list[dict[str, Any]], examples: list[dict[str, Any]] | None = None, *, exclusions: dict[str, Any] | None = None, sent_context_enabled: bool = False, context_messages: list[Any] | None = None) -> AssessmentBatch:
+		if not 1 <= len(messages) <= 10:
+			raise ValueError("AI prompt batch size must be between 1 and 10")
+		flagged = [message for message in messages if message_safety_flags(message)]
+		if flagged:
+			# Known unsafe input needs review regardless of a provider's answer.
+			# Do not spend extra unbudgeted calls or share it with unrelated targets.
+			safe = [message for message in messages if not message_safety_flags(message)]
+			batch = self.assess(safe, labels, examples, exclusions=exclusions,
+				sent_context_enabled=sent_context_enabled,
+				context_messages=[*(context_messages or []), *flagged]) if safe else AssessmentBatch()
+			for message in flagged:
+				mid = str(_attr(message, "id", _attr(message, "message_id", "")))
+				if _excluded(message, exclusions or {}):
+					batch.errors[mid] = "Content sharing is excluded by current privacy settings"
+					continue
+				batch.assessments[mid] = Assessment(message_id=mid, category="other", suggested_label_ids=[],
+					importance="medium", outstanding_action="uncertain", urgency="none", deadline_utc=None,
+					keep_in_inbox_score=50, uncertainty="high", missing_context=True,
+					evidence_reason="Content safety flags require manual review: " + ", ".join(sorted(message_safety_flags(message))))
+			batch.telemetry = {**batch.telemetry, "content_safety_reviews": len(flagged)}
+			return batch
 		built = build_prompt(messages, labels, examples, exclusions=exclusions, sent_context_enabled=sent_context_enabled, context_messages=context_messages)
 		excluded = built.excluded_ids
 		targets = [item["message_id"] for item in built.payload["messages"]]

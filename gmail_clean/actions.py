@@ -10,7 +10,7 @@ import json
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Callable
 
-from .domain import Message, Window, context_hash, precondition_hash, protections
+from .domain import Message, Window, context_hash, message_safety_flags, precondition_hash, protections
 from .runtime import chunks, placeholders, digest, encode, identifier, insert, safe_error, stamp
 
 if TYPE_CHECKING:
@@ -144,6 +144,10 @@ class ActionExecutor:
 			return None
 		if action["undo_of"]:
 			return self.preflight_undo(action, message, payload, add, remove)
+		stored = self.db.get_message(message.id)
+		if action["approval"] != "manual" and stored and message_safety_flags(stored):
+			self.mark(action["id"], "stale", "Content safety flags require current-item review before automatic execution")
+			return None
 		if add <= message.labels and not (remove & message.labels):
 			# Existing effects can come from another Gmail client. Reconcile them
 			# without claiming ownership or making an unnecessary network write.
@@ -551,6 +555,7 @@ class ActionExecutor:
 			old = self.db.get_message(after.id)
 			if old:
 				after.body, after.context_version = old.body, old.context_version
+				after.content_flags = list(old.content_flags)
 				after.content_hash = old.content_hash
 			self.db.upsert_message(after)
 			if action["undo_of"]:

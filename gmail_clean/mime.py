@@ -14,25 +14,78 @@ MAX_PART_BYTES = 1_000_000
 
 
 class _TextParser(HTMLParser):
+	"""Extract visible text while remembering omitted, potentially material content."""
+	BLOCKED = {"script", "style", "iframe", "object", "noscript", "svg", "math", "head", "template", "title"}
+	VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
 	def __init__(self) -> None:
 		super().__init__(convert_charrefs=True)
 		self.output: list[str] = []
-		self.blocked = 0
+		self.stack: list[tuple[str, bool, bool]] = []
+		self._blocked_depth = 0
+		self._hidden_depth = 0
+		self.hidden_content = False
+
+	@property
+	def blocked(self) -> bool:
+		return self._blocked_depth > 0
+
+	@staticmethod
+	def _css(value: str) -> str:
+		# Resolve simple CSS escapes/comments before testing visibility declarations.
+		value = re.sub(r"/\*.*?\*/", "", value, flags=re.DOTALL)
+		def unescape(match):
+			if match[1]:
+				codepoint = int(match[1], 16)
+				return chr(codepoint) if 0 < codepoint <= 0x10FFFF else "\ufffd"
+			return match[2] or ""
+		value = re.sub(r"\\(?:([0-9a-fA-F]{1,6})\s?|(.))", unescape, value)
+		return re.sub(r"!\s*important\b", "", value, flags=re.IGNORECASE).casefold()
+
+	@classmethod
+	def _hidden(cls, attrs: list[tuple[str, str | None]]) -> bool:
+		values = {name.casefold(): value or "" for name, value in attrs}
+		if "hidden" in values or values.get("aria-hidden", "").strip().casefold() == "true":
+			return True
+		style = dict(piece.split(":", 1) for piece in cls._css(values.get("style", "")).split(";") if ":" in piece)
+		style = {key.strip(): value.strip() for key, value in style.items()}
+		return (style.get("display") == "none" or style.get("visibility") == "hidden"
+			or bool(re.fullmatch(r"[+-]?(?:0+(?:\.0*)?|\.0+)(?:e[+-]?\d+)?(?:px|pt|pc|in|cm|mm|q|em|rem|%|ex|ch|vw|vh|vmin|vmax)?", style.get("font-size", ""))))
 
 	def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-		if tag in {"script", "style", "iframe", "object", "noscript", "svg", "math", "head"}:
-			self.blocked += 1
+		hidden = tag in {"template", "title"} or self._hidden(attrs)
+		if tag not in self.VOID:
+			blocked = hidden or tag in self.BLOCKED
+			self.stack.append((tag, blocked, hidden))
+			self._blocked_depth += int(blocked)
+			self._hidden_depth += int(hidden)
 		if not self.blocked and tag in {"br", "p", "div", "li", "tr", "h1", "h2", "h3", "blockquote"}:
 			self.output.append("\n")
 
+	def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+		self.handle_starttag(tag, attrs)
+		self.handle_endtag(tag)
+
 	def handle_endtag(self, tag: str) -> None:
-		if tag in {"script", "style", "iframe", "object", "noscript", "svg", "math", "head"}:
-			self.blocked = max(0, self.blocked - 1)
+		for index in range(len(self.stack) - 1, -1, -1):
+			if self.stack[index][0] == tag:
+				closed = self.stack[index:]
+				self._blocked_depth -= sum(blocked for _, blocked, _ in closed)
+				self._hidden_depth -= sum(hidden for _, _, hidden in closed)
+				del self.stack[index:]
+				break
 		if not self.blocked and tag in {"p", "div", "li", "tr", "blockquote"}:
 			self.output.append("\n")
 
 	def handle_data(self, data: str) -> None:
-		if not self.blocked:
+		if self.blocked:
+			# Stylesheet selectors are not evaluated. Flag hidden-style declarations
+			# conservatively so class-based hidden text never reaches a shared prompt.
+			if any(tag == "style" for tag, _, _ in self.stack) and any(self._hidden([("style", declaration)]) for declaration in re.split(r"[{}]", data)):
+				self.hidden_content = True
+			if data.strip() and self._hidden_depth:
+				self.hidden_content = True
+		else:
 			self.output.append(data)
 
 
@@ -66,6 +119,7 @@ class ParsedBody:
 	truncated: bool = False
 	missing: bool = False
 	attachments: list[dict[str, str | int]] = field(default_factory=list)
+	content_flags: list[str] = field(default_factory=list)
 
 
 def decode_base64url(data: str) -> bytes:
@@ -164,6 +218,8 @@ def parse_body(payload: dict, fetch_text_attachment: Callable[[str], dict] | Non
 			parser.feed(text)
 			parser.close()
 			result.truncated = result.truncated or bool(parser.blocked)
+			if parser.hidden_content and "hidden_content" not in result.content_flags:
+				result.content_flags.append("hidden_content")
 			return normalize_text("".join(parser.output))
 		return normalize_text(text)
 

@@ -413,10 +413,11 @@ class Store:
 		headers = data.get("headers", {})
 		lower = {str(key).lower(): value for key, value in headers.items()}
 		labels = sorted(data.get("labels", []))
-		old = self.one("SELECT content_hash,body,truncated,missing_content,body_cached_at FROM messages WHERE id=?", (data["id"],))
+		old = self.one("SELECT content_hash,body,truncated,missing_content,body_cached_at,payload_json FROM messages WHERE id=?", (data["id"],))
 		# Metadata refreshes must not silently destroy an already cached body.
 		if old and not data.get("body") and data.get("missing_content", True):
 			previous = old
+			data["content_flags"] = sorted(set(data.get("content_flags") or []) | set(json.loads(previous["payload_json"] or "{}").get("content_flags", [])))
 			if previous.get("body"):
 				for field in ("body", "truncated", "missing_content", "content_hash"):
 					data[field] = previous.get(field, data.get(field))

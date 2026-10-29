@@ -204,6 +204,7 @@ class Message:
 	context_version: str = ""
 	account_id: str = ""
 	attachments: list[dict[str, Any]] = field(default_factory=list)
+	content_flags: list[str] = field(default_factory=list)
 
 	@property
 	def sender(self) -> str:
@@ -419,8 +420,39 @@ def normalize_text(value: str) -> str:
 	return " ".join(value.replace("\x00", "").split())
 
 
+_INSTRUCTION_LIKE = re.compile(
+	r"\b(?:ignore|disregard|override)\b.{0,100}\b(?:previous|prior|above|system|developer|all)\b.{0,60}\b(?:instructions?|prompts?|rules?)\b"
+	r"|\b(?:system|developer)\s+(?:message|prompt|instructions?)\b"
+	r"|\b(?:return|output|set|mark|classify|assess)\b.{0,100}\b(?:keep_in_inbox_score|missing_context|outstanding_action|assessments?|message_id)\b"
+	r"|\b(?:archive|label|classify|assess)\b.{0,80}\b(?:other|all|remaining|every)\s+(?:messages?|emails?)\b"
+	r"|UNTRUSTED_JSON_DATA_(?:START|END)",
+	re.IGNORECASE | re.DOTALL,
+)
+
+
+def instruction_like_content(value: str) -> bool:
+	"""Cheap conservative signal; this is a review guard, not an injection detector."""
+	return bool(_INSTRUCTION_LIKE.search(value))
+
+
+def message_safety_flags(message: Any) -> set[str]:
+	"""Keep safety independent from model output and durable with cached bodies."""
+	if isinstance(message, dict):
+		flags = set(message.get("content_flags") or [])
+		body, headers = message.get("body"), message.get("headers") or {}
+		extra = "\n".join(str(message.get(key) or "") for key in ("subject", "reason", "correction"))
+	else:
+		flags = set(getattr(message, "content_flags", []) or [])
+		body, headers = getattr(message, "body", ""), getattr(message, "headers", {}) or {}
+		extra = ""
+	text = str(body or "") + "\n" + "\n".join(str(value) for value in headers.values()) + "\n" + extra
+	if instruction_like_content(text):
+		flags.add("instruction_like_content")
+	return flags
+
+
 def message_content_hash(message: Message) -> str:
-	return canonical_hash({"message_id": message.id, "internalDate": message.internal_ms, "headers": {name.casefold(): normalize_text(message.header(name)).casefold() for name in ("From", "To", "Cc", "Subject", "List-ID")}, "body": normalize_text(message.body or ""), "is_truncated": message.truncated})
+	return canonical_hash({"message_id": message.id, "internalDate": message.internal_ms, "headers": {name.casefold(): normalize_text(message.header(name)).casefold() for name in ("From", "To", "Cc", "Subject", "List-ID")}, "body": normalize_text(message.body or ""), "is_truncated": message.truncated, "content_flags": sorted(message_safety_flags(message))})
 
 
 def thread_context_hash(messages: Iterable[Message | dict[str, Any]], sent_context_enabled: bool = False) -> str:
@@ -521,6 +553,9 @@ def recommend(message: Message, assessment: Assessment | None, config: Config, w
 				return Decision("keep", "Deferred locally until " + iso_utc(defer_until), evidence_source="manual")
 	if protected:
 		return Decision("keep", "Protected: " + ", ".join(sorted(protected)), evidence_source="protection")
+	flags = message_safety_flags(message)
+	if flags:
+		return Decision("review", "Content safety review: " + ", ".join(sorted(flags)))
 	matched = [rule for rule in (rules or []) if rule_matches(rule, message, assessment)]
 	actions = {rule.get("action") for rule in matched if rule.get("action") != "label"}
 	independent_labels = tuple(sorted({label for rule in matched if rule.get("action") == "label" for label in rule.get("label_ids", [])}))
