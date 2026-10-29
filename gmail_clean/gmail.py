@@ -50,12 +50,16 @@ class QuotaLimiter:
 		keeps fake-clock tests deterministic without real sleeps.
 		"""
 		units = int(units)
-		if not 0 < units <= self.limit:
-			raise ValueError("A request quota must fit the minute budget")
+		if units <= 0:
+			raise ValueError("A request quota must be positive")
 		while True:
 			if cancel is not None and (cancel() if callable(cancel) else cancel.is_set()):
 				raise GmailInterrupted()
 			with self._lock:
+				# A saved budget can be lowered while another worker is waiting.
+				# Recheck capacity before pruning/reserving, on every iteration.
+				if units > self.limit:
+					raise QuotaCapacityChanged(units, self.limit)
 				now = self.clock()
 				while self._events and self._events[0][0] <= now - 60:
 					self._events.popleft()
@@ -100,6 +104,15 @@ class GmailInterrupted(PreSendError):
 
 	def __init__(self) -> None:
 		super().__init__(GmailError("interrupted", "Gmail quota wait was interrupted; the job can resume safely."))
+
+
+class QuotaCapacityChanged(PreSendError):
+	"""A changed budget cannot admit this request; nothing was reserved or sent."""
+
+	def __init__(self, units: int, limit: int) -> None:
+		super().__init__(GmailError("transient", "The quota budget changed before dispatch; split or retry the unsent request.", reason="quota_capacity_changed"))
+		self.units = units
+		self.limit = limit
 
 
 class HistoryExpired(GmailError):
@@ -308,8 +321,9 @@ class GmailMailbox:
 		ids = list(dict.fromkeys(ids))
 		results: dict[str, Message | Exception] = {}
 		units = 60 if body else 20
-		batch_size = min(self.retrieval_batch_size, max(1, self.quota_limiter.limit // units))
-		for offset in range(0, len(ids), batch_size):
+		offset = 0
+		while offset < len(ids):
+			batch_size = min(self.retrieval_batch_size, max(1, self.quota_limiter.limit // units))
 			batch_ids = ids[offset:offset + batch_size]
 			raw: dict[str, dict | Exception] = {}
 			def callback(request_id: str, response: dict | None, exception: Exception | None, raw=raw) -> None:
@@ -318,8 +332,14 @@ class GmailMailbox:
 			for message_id in batch_ids:
 				batch.add(self._request(message_id, body), request_id=message_id)
 			try:
-				self._acquire(len(batch_ids) * (60 if body else 20))
+				self._acquire(len(batch_ids) * units)
 				batch.execute()
+			except QuotaCapacityChanged as exc:
+				if len(batch_ids) > 1 and exc.limit >= units:
+					# No part reached the wire. Rebuild only this unsent suffix
+					# against the latest capacity; completed parts are never replayed.
+					continue
+				raw.update({message_id: exc for message_id in batch_ids})
 			except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
 				for message_id in batch_ids:
 					if message_id not in raw:
@@ -333,6 +353,7 @@ class GmailMailbox:
 						results[message_id] = self._decode(value, body)
 					except Exception as exc:  # noqa: BLE001 -- transport/decode boundaries normalize arbitrary integration exceptions.
 						results[message_id] = translate_error(exc)
+			offset += len(batch_ids)
 		return results
 
 	def thread_metadata(self, thread_id: str) -> list[Message]:

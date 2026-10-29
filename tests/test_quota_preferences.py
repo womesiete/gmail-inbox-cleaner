@@ -1,4 +1,6 @@
 """User quota budgets retain shared rolling history and visible progress."""
+from dataclasses import replace
+
 import pytest
 
 from gmail_clean.app import main, parser
@@ -68,7 +70,7 @@ def test_resource_owner_reuses_limiter_when_budget_changes(tmp_path):
 	try:
 		first = service._quota_limiter()
 		first.acquire(20)
-		service.config.quota_units_per_minute = 15000
+		service.update_config(replace(service.config, quota_units_per_minute=15000))
 		assert service._quota_limiter() is first
 		assert first.limit == 15000 and first.consumed == 20
 	finally:

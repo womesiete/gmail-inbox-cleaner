@@ -184,15 +184,41 @@ class AppService:
 		self._configure_services()
 		return True
 
+	def _quota_budget(self) -> int:
+		"""Read current account settings, with the owner's invocation override.
+
+		Worker snapshots may predate Settings changes. Letting them reconfigure
+		a shared limiter would silently undo a newly lowered user budget.
+		"""
+		owner = self._resource_owner
+		saved = self.store.checkpoint("effective_preferences", {})
+		budget = owner._config_overrides.get("quota_units_per_minute",
+			saved.get("quota_units_per_minute", self.config.quota_units_per_minute))
+		if type(budget) is not int or not 60 <= budget <= 1_000_000:
+			raise ValueError("quota_units_per_minute must be an integer from 60 to 1000000")
+		return budget
+
 	def _quota_limiter(self):
 		from .gmail import QuotaLimiter
 		owner = self._resource_owner
 		with owner._label_cache_lock:
+			budget = self._quota_budget()
 			if self.account_id not in owner._quota_limiters:
-				owner._quota_limiters[self.account_id] = QuotaLimiter(self.config.quota_units_per_minute)
+				owner._quota_limiters[self.account_id] = QuotaLimiter(budget)
 			else:
-				owner._quota_limiters[self.account_id].configure(self.config.quota_units_per_minute)
+				owner._quota_limiters[self.account_id].configure(budget)
 			return owner._quota_limiters[self.account_id]
+
+	def _apply_quota_budget(self):
+		"""Update existing shared budgets as soon as a user changes preferences."""
+		owner = self._resource_owner
+		with owner._label_cache_lock:
+			budget = self._quota_budget()
+			limiter = owner._quota_limiters.get(self.account_id)
+			if limiter is not None:
+				limiter.configure(budget)
+			if self.demo and getattr(self._mailbox, "quota_limiter", None) is not None:
+				self._mailbox.quota_limiter.configure(budget)
 
 	def _clear_credentials(self, *, expected_generation=None):
 		owner = self._resource_owner
@@ -256,7 +282,7 @@ class AppService:
 			self._mailbox.retrieval_batch_size = self.config.retrieval_batch_size
 			self._mailbox.execution_batch_size = self.config.execution_batch_size
 		if self.demo and getattr(self._mailbox, "quota_limiter", None) is not None:
-			self._mailbox.quota_limiter.configure(self.config.quota_units_per_minute)
+			self._apply_quota_budget()
 		return self._mailbox
 
 	def _check_identity(self):
@@ -309,6 +335,8 @@ class AppService:
 			overrides["ai_module_sha256"] = candidate.ai_module_sha256
 		self._config_overrides.update(overrides)
 		self.reload_config()
+		if "quota_units_per_minute" in overrides:
+			self._apply_quota_budget()
 
 	def reload_config(self):
 		value = self.store.checkpoint("effective_preferences")
@@ -347,6 +375,7 @@ class AppService:
 			if previous.revision != config.revision:
 				self.store.execute("UPDATE actions SET state='stale',reason='Settings changed; replan',updated_at=? WHERE state IN ('queued','proposed','retry')", (stamp(),))
 		self.learning.enabled = config.learning_enabled
+		self._apply_quota_budget()
 		if (previous.ai_module, previous.ai_module_sha256, previous.ai_model, previous.ai_use_call_api_result, previous.ai_timeout_seconds, previous.optional_model_routes) != (config.ai_module, config.ai_module_sha256, config.ai_model, config.ai_use_call_api_result, config.ai_timeout_seconds, config.optional_model_routes):
 			self._close_ai()
 		return config.to_dict()
@@ -365,7 +394,9 @@ class AppService:
 			# DemoMailbox synchronizes its public API, so sharing it avoids parsing
 			# a 50,000-message state file for every short desktop operation.
 		if self.demo:
-			mailbox = self.mailbox
+			# The clone reads current quota preferences on its own SQLite thread.
+			# Fetching the owner's mailbox property here would read its Store.
+			mailbox = self._mailbox
 		clone = AppService(config=None, data_dir=self.data_dir, demo=self.demo, count=self.count, clock=self.clock, mailbox=mailbox, ai_factory=self._ai_factory, _worker_owner=owner)
 		with owner._workers_lock:
 			owner._active_workers.add(clone)

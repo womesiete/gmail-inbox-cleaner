@@ -48,7 +48,10 @@ class JobRunner:
 		self._metadata_caches: dict[str, StageMetadataCache] = {}
 		self._stage_cache: StageMetadataCache | None = None
 		self._quota_active: tuple[str, int] | None = None
-		self._run_started = time.monotonic()
+		self._run_started = 0.0
+		self._run_completed_start = 0
+		self._eta_job: str | None = None
+		self._eta_active = False
 
 	def new(self) -> str:
 		config = self.s.config
@@ -252,6 +255,10 @@ class JobRunner:
 			# Recovered running items were never acknowledged; stages are idempotent.
 			self.db.execute("UPDATE work_items SET state='pending' WHERE job_id=? AND state='running'", (job,))
 			self.db.execute("UPDATE jobs SET state='running',updated_at=? WHERE id=?", (stamp(), job))
+			self._run_started = time.monotonic()
+			self._run_completed_start = self.db.one("SELECT count(*) n FROM work_items WHERE job_id=? AND state='completed'", (job,))["n"]
+			self._eta_job = job
+			self._eta_active = True
 		try:
 			if not self.payload(job).get("discovered"):
 				with self.record_quota(job, "discovery"):
@@ -288,6 +295,8 @@ class JobRunner:
 			self.handle_exception(job, exc, config)
 			if progress:
 				progress("Paused: " + safe_error(exc))
+		finally:
+			self._eta_active = False
 		return self.summary(job)
 
 	def discover(self, job: str, window: Window, config: Config, progress, should_stop) -> bool:
@@ -1164,7 +1173,7 @@ class JobRunner:
 		return f"{text}; quota {status['quota_units_consumed']:,} units; ETA ~{duration}"
 
 	def summary(self, job: str) -> dict:
-		result = {"id": job, "completed": 0, "failed": 0, "pending": 0, "retry": 0}
+		result: dict[str, Any] = {"id": job, "completed": 0, "failed": 0, "pending": 0, "retry": 0}
 		for row in self.db.query("SELECT state,count(*) n FROM work_items WHERE job_id=? GROUP BY state", (job,)):
 			result[row["state"]] = row["n"]
 		state = self.db.one("SELECT state,stage FROM jobs WHERE id=?", (job,))
@@ -1183,9 +1192,13 @@ class JobRunner:
 		remaining = self.db.query("SELECT stage,count(*) n FROM work_items WHERE job_id=? AND state IN ('pending','retry','running') GROUP BY stage", (job,))
 		weights = {"metadata": 124, "body": 62, "classification": 2} if self.s.config.metadata_cache_ttl_seconds else {"metadata": 240, "body": 180, "classification": 60}
 		units_left = sum(row["n"] * weights.get(row["stage"], 0) for row in remaining)
-		quota_eta = units_left * 60 / self.s.config.quota_units_per_minute
+		budget = self.s._quota_budget() if hasattr(self.s, "_quota_budget") else self.s.config.quota_units_per_minute
+		quota_eta = units_left * 60 / budget
 		elapsed = max(0, time.monotonic() - self._run_started)
-		processing_eta = elapsed * sum(row["n"] for row in remaining) / result["completed"] if result["completed"] else 0
+		completed_here = result["completed"] - self._run_completed_start
+		processing_eta = 0.0
+		if self._eta_active and self._eta_job == job and result.get("state") == "running" and completed_here > 0:
+			processing_eta = elapsed * sum(row["n"] for row in remaining) / completed_here
 		result["eta_seconds"] = round(max(quota_eta, processing_eta)) if remaining else 0
 		pause = payload.get("pause")
 		if pause:
