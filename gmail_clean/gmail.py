@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import random
+import ssl
 import threading
 import time
 from collections import deque
@@ -135,7 +136,18 @@ def translate_error(exc: Exception, operation: str = "request", has_page: bool =
 	if status:
 		return GmailError("data", f"Gmail rejected the request (HTTP {status}).", status=status, reason=reasons[0] if reasons else None)
 	try:
-		from google.auth.exceptions import GoogleAuthError
+		from google.auth.exceptions import GoogleAuthError, RefreshError, TransportError
+		from requests.exceptions import RequestException
+		from httplib2 import HttpLib2Error
+		# TransportError is also a GoogleAuthError. Classify transport failures
+		# first so a temporary outage never asks the user to reconnect consent.
+		if isinstance(exc, (TransportError, RequestException, HttpLib2Error, ssl.SSLError, OSError, TimeoutError)):
+			return GmailError("network", "Gmail request failed. Check the network and retry.")
+		if isinstance(exc, RefreshError):
+			invalid_grant = any((isinstance(value, dict) and value.get("error") == "invalid_grant")
+				or (isinstance(value, str) and "invalid_grant" in value) for value in exc.args)
+			if not invalid_grant:
+				return GmailError("transient", "Google authorization refresh is temporarily unavailable. Retry shortly.")
 		if isinstance(exc, GoogleAuthError):
 			return GmailError("auth", "Google credentials could not be refreshed. Reconnect the account.")
 	except ImportError:

@@ -525,3 +525,46 @@ def test_idempotent_read_retries_with_jitter_but_modify_is_not_retried():
 	with pytest.raises(GmailError):
 		box._execute(request, "modify", idempotent=False, quota_units=50)
 	assert request.calls == 1
+
+
+def _refresh_transport_errors():
+	import socket
+	import ssl
+	from google.auth.exceptions import RefreshError, TransportError
+	from httplib2 import ServerNotFoundError
+	from requests.exceptions import ConnectionError, Timeout
+	return [TransportError('private'), ConnectionError('private'), Timeout('private'),
+		ServerNotFoundError('private'), ssl.SSLError('private'), socket.timeout('private'),
+		OSError('private'), RefreshError('temporary provider failure')]
+
+
+@pytest.mark.parametrize('failure', _refresh_transport_errors())
+def test_refresh_transport_errors_remain_retryable_through_execute_and_batch(failure):
+	service = FakeGoogle()
+	box = GmailMailbox(service)
+	delays = []
+	box._sleep = delays.append
+	with pytest.raises(GmailError) as caught:
+		box._execute(FakeRequest(failure))
+	assert caught.value.kind == ('transient' if type(failure).__name__ == 'RefreshError' else 'network')
+	assert caught.value.transient and len(delays) == 2
+	assert 'private' not in caught.value.safe_message
+	service.payloads['failed'] = failure
+	batch_error = box.get_messages(['failed'])['failed']
+	assert isinstance(batch_error, GmailError)
+	assert batch_error.kind == caught.value.kind and batch_error.transient
+
+
+@pytest.mark.parametrize('detail', ['invalid_grant: revoked', {'error': 'invalid_grant'}])
+def test_invalid_grant_remains_auth_failure_through_execute_and_batch(detail):
+	from google.auth.exceptions import RefreshError
+	failure = RefreshError(detail)
+	service = FakeGoogle()
+	box = GmailMailbox(service)
+	delays = []
+	box._sleep = delays.append
+	with pytest.raises(GmailError) as caught:
+		box._execute(FakeRequest(failure))
+	assert caught.value.kind == 'auth' and not caught.value.transient and not delays
+	service.payloads['failed'] = failure
+	assert box.get_messages(['failed'])['failed'].kind == 'auth'
