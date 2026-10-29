@@ -57,30 +57,53 @@ _SAFE_ERRORS = {
 	"RateLimitError": "The external AI module reports a rate limit. This request may be retried with bounded backoff.",
 	"APIResponseError": "The external AI module returned an empty or invalid provider response.",
 	"AIAPIsError": "The external AI module raised its base API exception. Inspect its configuration and retry explicitly.",
+	"NetworkError": "The external AI module reports a network interruption. This request may be retried with bounded backoff.",
+	"TransientProviderError": "The external AI provider is temporarily unavailable. This request may be retried with bounded backoff.",
+	"ProviderAuthenticationError": "The external AI provider rejected authorization. Check the module's credentials and reconnect.",
+	"ProviderPermissionError": "The external AI provider denied permission. Check the module's account and model access.",
 	"UnknownProviderError": "The external AI module raised an unrecognized provider exception. Raw details are withheld to protect email and credentials.",
 	"ImportInitializationError": "The configured AI module could not be loaded or initialized. Check its path and dependencies in this environment.",
 	"ConfigurationError": "The AI module configuration or selected optional function is invalid.",
 	"InterruptedRequest": "Local AI execution was interrupted. A remote request may still finish or be billed; it was not confirmed canceled.",
 	"Paused": "AI processing is paused. Resume before starting another request.",
 }
+_HOOK_CATEGORIES = {
+	"network": "NetworkError", "transient": "TransientProviderError", "rate_limit": "RateLimitError",
+	"auth": "ProviderAuthenticationError", "permission": "ProviderPermissionError",
+	"configuration": "ConfigurationError", "response": "APIResponseError", "unknown": "UnknownProviderError",
+}
+_ERROR_KINDS = {"NetworkError": "network", "TransientProviderError": "transient", "RateLimitError": "rate_limit"}
+
+
+def _retry_after(value: Any) -> float | None:
+	"""Only finite nonnegative numeric delays cross the provider IPC boundary."""
+	if type(value) not in (int, float):
+		return None
+	try:
+		delay = float(value)
+	except (OverflowError, ValueError):
+		return None
+	return delay if math.isfinite(delay) and delay >= 0 else None
 
 
 class AIError(RuntimeError):
 	"""Serializable failure with real exception identity and a privacy-safe summary."""
 
-	def __init__(self, category: str, summary: str | None = None, *, exception_class: str = "", exception_module: str = "", request_id: str = ""):
+	def __init__(self, category: str, summary: str | None = None, *, exception_class: str = "", exception_module: str = "", request_id: str = "", retry_after: float | None = None):
 		self.category = category
 		self.summary = summary or _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"])
 		self.exception_class = exception_class
 		self.exception_module = exception_module
 		self.request_id = request_id
-		self.configuration = category in {"UnsupportedModelError", "MissingAPIKeyError", "ImportInitializationError", "ConfigurationError"}
-		self.transient = category == "RateLimitError"
+		self.retry_after = _retry_after(retry_after)
+		self.kind = _ERROR_KINDS.get(category, "")
+		self.configuration = category in {"UnsupportedModelError", "MissingAPIKeyError", "ImportInitializationError", "ConfigurationError", "ProviderAuthenticationError", "ProviderPermissionError"}
+		self.transient = bool(self.kind)
 		self.interrupted = category == "InterruptedRequest"
 		super().__init__(self.summary)
 
 	def to_dict(self) -> dict[str, Any]:
-		return {"category": self.category, "summary": self.summary, "exception_class": self.exception_class, "exception_module": self.exception_module, "request_id": self.request_id, "configuration": self.configuration, "transient": self.transient, "interrupted": self.interrupted}
+		return {"category": self.category, "summary": self.summary, "exception_class": self.exception_class, "exception_module": self.exception_module, "request_id": self.request_id, "retry_after": self.retry_after, "configuration": self.configuration, "transient": self.transient, "interrupted": self.interrupted}
 
 
 def module_trust_details(location: str) -> dict[str, Any]:
@@ -352,12 +375,25 @@ def _exception_exports(module: Any) -> dict[str, type[BaseException] | tuple]:
 	return result
 
 
-def _error_packet(exc: BaseException, exports: dict[str, Any] | None = None, category: str | None = None) -> dict[str, Any]:
+def _error_packet(exc: BaseException, exports: dict[str, Any] | None = None, category: str | None = None, classifier: Any = None) -> dict[str, Any]:
+	delay = None
 	if category is None:
 		category = next((name for name in _EXCEPTION_NAMES if isinstance(exc, (exports or {}).get(name, ()))), "UnknownProviderError")
+		delay = _retry_after(getattr(exc, "retry_after", None))
+		if callable(classifier):
+			try:
+				classification = classifier(exc)
+				if isinstance(classification, dict):
+					selected = classification.get("category")
+					resolved = _HOOK_CATEGORIES.get(selected, selected) if isinstance(selected, str) else None
+					if resolved in set(_HOOK_CATEGORIES.values()) | set(_EXCEPTION_NAMES):
+						category = resolved
+						delay = _retry_after(classification.get("retry_after"))
+			except Exception:  # noqa: BLE001, S110 - A provider's optional classifier must not expose its raw exception or mask the original error.
+				pass
 	# Arbitrary provider messages may echo entire prompts, access tokens or keys.
 	# A useful category and true class/module identity survive without raw payloads.
-	return {"category": category, "summary": _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"]), "exception_class": type(exc).__name__, "exception_module": type(exc).__module__}
+	return {"category": category, "summary": _SAFE_ERRORS.get(category, _SAFE_ERRORS["UnknownProviderError"]), "exception_class": type(exc).__name__, "exception_module": type(exc).__module__, "retry_after": delay}
 
 
 def _load_module(location: str, expected_sha256: str = "") -> Any:
@@ -439,7 +475,7 @@ def _worker_main(connection: Any, location: str, environment: dict[str, str], ex
 					continue
 				connection.send({"kind": "response", "id": request_id, "text": text, "metadata": metadata})
 			except Exception as exc:  # noqa: BLE001 - Provider exception identities are classified and raw content is withheld.
-				connection.send({"kind": "error", "id": request_id, "error": _error_packet(exc, exports)})
+				connection.send({"kind": "error", "id": request_id, "error": _error_packet(exc, exports, classifier=getattr(module, "classify_exception", None))})
 	except (EOFError, BrokenPipeError, OSError):
 		# Parent shutdown is a normal local lifecycle event, not a provider success.
 		return

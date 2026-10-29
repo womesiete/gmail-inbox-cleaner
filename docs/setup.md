@@ -70,6 +70,17 @@ Optional `call_api_result` telemetry is disabled initially. Enable it only when 
 
 The module is loaded once inside a dedicated spawned worker process. Calls are serial and contain their own context. Changing module settings restarts the worker at a safe boundary. SQLite connections stay in the main application process. Named exported exception classes are matched by class identity. Missing/unsupported credentials or models pause AI work; rate limits and invalid responses have bounded retry handling. Unknown provider exceptions remain visible for inspection.
 
+Modules with other provider exception classes can optionally export a blocking classifier:
+
+```python
+def classify_exception(exc: Exception) -> dict:
+	if isinstance(exc, MyProviderTemporaryError):
+		return {"category": "transient", "retry_after": exc.retry_after}
+	return {"category": "unknown", "retry_after": None}
+```
+
+Supported categories are `network`, `transient`, `rate_limit`, `auth`, `permission`, `configuration`, `response`, and `unknown`; the existing named exported exception categories also remain accepted. Network, transient and rate-limit failures use the job's bounded backoff and honor a finite, nonnegative numeric `retry_after` in seconds. Authorization, permission and configuration failures pause for intervention. Unknown errors, including plain `RuntimeError` without a classifier, do not automatically retry. Invalid hook output or a hook failure falls back to the existing exported-class classification. The worker sends only the safe category, actual exception class/module, and validated delay across IPC; raw exception messages remain private. Named exported rate-limit exceptions may also provide a numeric `retry_after` attribute without a hook.
+
 Pause stops new calls and allows the current call to finish. A watchdog can stop the **local child process**, but cannot promise cancellation of a remote request; it may finish or be billed. Usage/cost without provider telemetry is an estimate, not a measured token bill. The app neither executes instructions in email nor grants the AI mailbox tools.
 
 ## Optional Windows distribution
